@@ -225,6 +225,43 @@
           </div>
         </div>
       </div>
+
+      <div class="advanced-section">
+        <div class="advanced-toggle" id="memory-toggle">
+          <span class="advanced-arrow">▶</span> 📝 长期记忆
+        </div>
+        <div id="memory-body" class="advanced-body">
+          <div class="form-row">
+            <label>记忆预算 (tokens)</label>
+            <select id="memory-budget" class="form-input">
+              <option value="0">自动（上下文的10%）</option>
+              <option value="256">256</option>
+              <option value="512">512</option>
+              <option value="1024" selected>1024</option>
+              <option value="2048">2048</option>
+              <option value="4096">4096</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>自动清理阈值（天）</label>
+            <input type="number" id="memory-clean-days" class="form-input" min="1" max="3650" value="90">
+            <div class="form-hint">超过此天数且重要性为低/Low 的记忆会被自动删除</div>
+          </div>
+          <div id="memory-list"></div>
+          <div class="memory-add-row">
+            <textarea id="memory-new-content" class="form-input form-textarea" rows="2" placeholder="添加新记忆..."></textarea>
+            <div class="memory-add-controls">
+              <select id="memory-new-importance" class="form-input" style="width:auto">
+                <option value="high">重要</option>
+                <option value="medium" selected>中等</option>
+                <option value="low">普通</option>
+              </select>
+              <button class="btn btn-sm btn-primary" id="btn-memory-add">添加</button>
+            </div>
+            <button class="btn btn-sm" id="btn-memory-extract" style="margin-top:6px">📝 从对话导入</button>
+          </div>
+        </div>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-primary" id="btn-agent-save">保存</button>
@@ -247,6 +284,40 @@
     <div class="modal-footer">
       <button class="btn btn-primary" id="btn-add-members-done">确认添加</button>
       <button class="btn modal-close" data-modal="add-member-modal">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="extract-memory-modal" class="modal" hidden>
+  <div class="modal-backdrop"></div>
+  <div class="modal-content modal-sm">
+    <div class="modal-header">
+      <h2>从对话导入记忆</h2>
+      <button class="btn btn-icon modal-close" data-modal="extract-memory-modal">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row">
+        <label>选择对话</label>
+        <select id="extract-conv-select" class="form-input"></select>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" id="extract-with-context" checked> 带入角色的系统设定作为背景</label>
+      </div>
+      <div class="form-row">
+        <label>提取轮数上限</label>
+        <select id="extract-max-rounds" class="form-input">
+          <option value="20">20 轮</option>
+          <option value="50" selected>50 轮</option>
+          <option value="100">100 轮</option>
+          <option value="0">全部</option>
+        </select>
+      </div>
+      <div id="extract-results" class="extract-results"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" id="btn-start-extract">开始提取</button>
+      <button class="btn" id="btn-save-extracted" hidden>保存已选</button>
+      <button class="btn modal-close" data-modal="extract-memory-modal">关闭</button>
     </div>
   </div>
 </div>

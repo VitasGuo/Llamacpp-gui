@@ -16,6 +16,7 @@ const state = {
   mentionFilter: '',
   mentionIdx: 0,
   editingAvatar: null,
+  editingMemory: [],
   maxContextRounds: 10,
   conversationBackground: '',
   scrollLocked: false,
@@ -157,6 +158,52 @@ async function deleteAgent(id) {
   await loadAgents();
 }
 
+/* ===== Memory ===== */
+async function getMemory(agentId) {
+  try {
+    const data = await api('GET', `agents/${agentId}/memory`);
+    return data.memory || [];
+  } catch { return []; }
+}
+
+async function addMemory(agentId, content, importance) {
+  await api('POST', `agents/${agentId}/memory`, { content, importance });
+}
+
+async function updateMemory(agentId, index, data) {
+  await api('PUT', `agents/${agentId}/memory/${index}`, data);
+}
+
+async function deleteMemory(agentId, index) {
+  await api('DELETE', `agents/${agentId}/memory/${index}`);
+}
+
+function estimateTokens(text) {
+  const cjk = (text.match(/[\u4e00-\u9fff]/g) || []).length;
+  const nonCjk = text.length - cjk;
+  return Math.ceil(cjk * 1.5 + nonCjk / 4);
+}
+
+function buildMemoryContext(memory, budget) {
+  if (!memory || memory.length === 0) return '';
+  const sorted = [...memory].sort((a, b) => {
+    const order = { high: 0, medium: 1, low: 2 };
+    const diff = (order[a.importance] || 2) - (order[b.importance] || 2);
+    if (diff !== 0) return diff;
+    return b.created_at.localeCompare(a.created_at);
+  });
+  const lines = [];
+  let total = 0;
+  for (const entry of sorted) {
+    const text = `- [${entry.importance}] ${entry.content}`;
+    const est = estimateTokens(text);
+    if (budget > 0 && total + est > budget) break;
+    lines.push(text);
+    total += est;
+  }
+  return lines.join('\n');
+}
+
 /* ===== Conversations ===== */
 async function loadConversations() {
   try {
@@ -286,8 +333,13 @@ async function sendMessage() {
   const streaming = state.streaming;
   const baseUrl = state.llamaUrl.replace(/\/+$/, '');
 
-  const promises = targetAgents.map(async (agent) => {
-    const messages = buildMessagesForAgent(agent);
+  const agentTasks = await Promise.all(targetAgents.map(async (agent) => {
+    const memory = await getMemory(agent.id);
+    const agentWithMemory = { ...agent, _memory: memory };
+    return { agent: agentWithMemory, messages: buildMessagesForAgent(agentWithMemory) };
+  }));
+
+  const promises = agentTasks.map(async ({ agent, messages }) => {
     const assistantMsg = { role: 'assistant', content: '', reasoning_content: '', agent_id: agent.id, agent_name: agent.name, started_at: Date.now() };
 
     if (streaming) {
@@ -368,6 +420,11 @@ function getRecentMessages(rounds) {
 function buildMessagesForAgent(agent) {
   const result = [];
   if (agent.system_prompt) result.push({ role: 'system', content: agent.system_prompt });
+  if (agent._memory && agent._memory.length > 0) {
+    const budget = agent.memory_budget || 1024;
+    const ctx = buildMemoryContext(agent._memory, budget);
+    if (ctx) result.push({ role: 'system', content: `[长期记忆]\n${ctx}` });
+  }
   if (state.conversationBackground) result.push({ role: 'system', content: `[对话背景]\n${state.conversationBackground}` });
   const msgs = getRecentMessages(state.maxContextRounds);
   for (const msg of msgs) {
@@ -912,6 +969,94 @@ function renderBackgroundBar() {
   }
 }
 
+function renderMemoryList() {
+  const list = document.getElementById('memory-list');
+  if (!state.editingMemory || state.editingMemory.length === 0) {
+    list.innerHTML = '<div class="memory-empty">暂无长期记忆。关闭此弹窗后记忆会自动保存。</div>';
+    return;
+  }
+  list.innerHTML = '';
+  const levels = ['high', 'medium', 'low'];
+  const labels = { high: '重要', medium: '中等', low: '普通' };
+  for (let i = 0; i < state.editingMemory.length; i++) {
+    const m = state.editingMemory[i];
+    const div = document.createElement('div'); div.className = 'memory-item';
+    const content = document.createElement('div'); content.className = 'memory-content';
+    content.textContent = m.content;
+    content.contentEditable = true;
+    content.addEventListener('blur', async () => {
+      const id = document.getElementById('agent-edit-modal').dataset.editingId;
+      if (content.textContent !== m.content) {
+        m.content = content.textContent;
+        await updateMemory(id, i, { content: m.content });
+      }
+    });
+    const badge = document.createElement('span');
+    badge.className = 'memory-badge ' + (m.importance || 'low');
+    badge.textContent = labels[m.importance] || '普通';
+    badge.style.cursor = 'pointer';
+    badge.title = '点击切换重要性';
+    badge.addEventListener('click', async () => {
+      const cur = levels.indexOf(m.importance || 'low');
+      m.importance = levels[(cur + 1) % 3];
+      const id = document.getElementById('agent-edit-modal').dataset.editingId;
+      await updateMemory(id, i, { importance: m.importance });
+      badge.className = 'memory-badge ' + m.importance;
+      badge.textContent = labels[m.importance];
+    });
+    const del = document.createElement('button'); del.className = 'memory-delete'; del.textContent = '×';
+    del.addEventListener('click', async () => {
+      const id = document.getElementById('agent-edit-modal').dataset.editingId;
+      await deleteMemory(id, i);
+      state.editingMemory = await getMemory(id);
+      renderMemoryList();
+    });
+    div.appendChild(content); div.appendChild(badge); div.appendChild(del);
+    list.appendChild(div);
+  }
+}
+
+function renderExtractedResults() {
+  const resultsDiv = document.getElementById('extract-results');
+  resultsDiv.innerHTML = '';
+  document.getElementById('btn-save-extracted').hidden = false;
+
+  const levels = ['high', 'medium', 'low'];
+  const labels = { high: '重要', medium: '中等', low: '普通' };
+
+  for (let i = 0; i < state.extractedMemories.length; i++) {
+    const m = state.extractedMemories[i];
+    const div = document.createElement('div'); div.className = 'memory-item';
+    div.dataset.index = i;
+
+    const checkbox = document.createElement('input'); checkbox.type = 'checkbox';
+    checkbox.checked = m.selected;
+    checkbox.addEventListener('change', () => { m.selected = checkbox.checked; });
+
+    const content = document.createElement('div'); content.className = 'memory-content';
+    content.textContent = m.content;
+    content.contentEditable = true;
+    content.style.borderBottom = '1px solid var(--border)';
+    content.style.padding = '2px 0';
+    content.addEventListener('blur', () => { m.content = content.textContent; });
+
+    const badge = document.createElement('span');
+    badge.className = 'memory-badge ' + m.importance;
+    badge.textContent = labels[m.importance] || '普通';
+    badge.style.cursor = 'pointer';
+    badge.title = '点击切换重要性';
+    badge.addEventListener('click', () => {
+      const cur = levels.indexOf(m.importance);
+      m.importance = levels[(cur + 1) % 3];
+      badge.className = 'memory-badge ' + m.importance;
+      badge.textContent = labels[m.importance];
+    });
+
+    div.appendChild(checkbox); div.appendChild(content); div.appendChild(badge);
+    resultsDiv.appendChild(div);
+  }
+}
+
 function enableInput(enabled) {
   const input = document.getElementById('input-box');
   const send = document.getElementById('btn-send');
@@ -933,7 +1078,7 @@ function scrollToBottom() {
 function openModal(id) { document.getElementById(id).hidden = false; }
 function closeModal(id) { document.getElementById(id).hidden = true; }
 
-function openAgentEditor(agent) {
+async function openAgentEditor(agent) {
   document.getElementById('agent-edit-title').textContent = agent ? '编辑角色' : '添加角色';
   document.getElementById('agent-edit-name').value = agent ? agent.name : '';
   document.getElementById('agent-edit-prompt').value = agent ? (agent.system_prompt || '') : '';
@@ -949,9 +1094,21 @@ function openAgentEditor(agent) {
     document.getElementById(`val-${sid}`).textContent = Number(val).toFixed(2);
   }
 
+  document.getElementById('memory-budget').value = String(agent && agent.memory_budget != null ? agent.memory_budget : 1024);
+  document.getElementById('memory-clean-days').value = agent && agent.memory_clean_days != null ? agent.memory_clean_days : 90;
+
   state.editingAvatar = agent ? (agent.avatar || null) : null;
   renderAvatarPreview(agent ? agent.name : '');
   highlightEmojiOption(state.editingAvatar);
+
+  if (agent && agent.id) {
+    state.editingMemory = await getMemory(agent.id);
+    renderMemoryList();
+  } else {
+    state.editingMemory = [];
+    renderMemoryList();
+  }
+
   openModal('agent-edit-modal');
 }
 
@@ -1047,6 +1204,8 @@ function bindEvents() {
       system_prompt: document.getElementById('agent-edit-prompt').value,
       temperature: parseFloat(document.getElementById('agent-edit-temp').value) || 0.8,
       avatar: state.editingAvatar || '',
+      memory_budget: parseInt(document.getElementById('memory-budget').value) || 1024,
+      memory_clean_days: parseInt(document.getElementById('memory-clean-days').value) || 90,
       ...extra,
     };
     await saveAgent(id, data);
@@ -1102,6 +1261,138 @@ function bindEvents() {
       document.getElementById(`val-${sid}`).textContent = Number(e.target.value).toFixed(2);
     });
   }
+
+  // Memory
+  document.getElementById('memory-toggle').addEventListener('click', () => {
+    const body = document.getElementById('memory-body');
+    const arrow = document.querySelector('#memory-toggle .advanced-arrow');
+    body.classList.toggle('open');
+    arrow.classList.toggle('open');
+  });
+  document.getElementById('btn-memory-add').addEventListener('click', async () => {
+    const id = document.getElementById('agent-edit-modal').dataset.editingId;
+    const content = document.getElementById('memory-new-content').value.trim();
+    const importance = document.getElementById('memory-new-importance').value;
+    if (!content || !id) return;
+    await addMemory(id, content, importance);
+    document.getElementById('memory-new-content').value = '';
+    state.editingMemory = await getMemory(id);
+    renderMemoryList();
+  });
+
+  // Memory extraction
+  document.getElementById('btn-memory-extract').addEventListener('click', async () => {
+    const select = document.getElementById('extract-conv-select');
+    select.innerHTML = '';
+    try {
+      const data = await api('GET', 'conversations');
+      for (const conv of data.conversations || []) {
+        const opt = document.createElement('option');
+        opt.value = conv.id;
+        opt.textContent = conv.title + (conv.message_count ? ` (${conv.message_count}条)` : '');
+        select.appendChild(opt);
+      }
+    } catch {}
+    document.getElementById('extract-results').innerHTML = '';
+    document.getElementById('btn-save-extracted').hidden = true;
+    document.getElementById('btn-start-extract').hidden = false;
+    openModal('extract-memory-modal');
+  });
+
+  document.getElementById('btn-start-extract').addEventListener('click', async () => {
+    if (!state.connOk) { openApiSetup(); return; }
+    const convId = document.getElementById('extract-conv-select').value;
+    const withContext = document.getElementById('extract-with-context').checked;
+    const maxRounds = parseInt(document.getElementById('extract-max-rounds').value) || 50;
+    if (!convId) return;
+
+    const agentId = document.getElementById('agent-edit-modal').dataset.editingId;
+    const agent = state.agents.find(a => a.id === agentId);
+    if (!agent) return;
+
+    const resultsDiv = document.getElementById('extract-results');
+    resultsDiv.innerHTML = '<div class="memory-empty">正在提取...</div>';
+    document.getElementById('btn-start-extract').disabled = true;
+
+    try {
+      const conv = await api('GET', `conversations/${convId}`);
+      const messages = conv.messages || [];
+      const recent = maxRounds > 0 ? messages.slice(-maxRounds * 2) : messages;
+
+      let convText = recent.map(m => {
+        const role = m.role === 'user' ? '用户' : m.agent_name || '助手';
+        const content = typeof m.content === 'string' ? m.content : '[图片/富文本]';
+        return `[${role}]: ${content}`;
+      }).join('\n');
+
+      let prompt = `你是记忆提取助手。从以下对话中提取关键事实，作为参与角色"${agent.name}"的长期记忆。\n\n`;
+      if (withContext && agent.system_prompt) {
+        prompt += `角色设定：${agent.system_prompt}\n\n`;
+      }
+      prompt += `对话内容：\n${convText}\n\n`;
+      prompt += `提取要求：
+1. 每条记忆是一句话的事实陈述
+2. 重要性分类：
+   - high：项目决策、技术选型、需求要求
+   - medium：用户偏好、工作习惯、沟通风格
+   - low：临时讨论、闲聊内容
+3. 忽略寒暄、确认词、重复内容
+4. 只提取对这个角色有用的信息
+5. 输出纯 JSON（无其他文字）：
+{"memories": [{"content": "...", "importance": "high|medium|low"}, ...]}`;
+
+      const body = {
+        messages: [{ role: 'user', content: prompt }],
+        stream: false,
+        temperature: 0.1,
+      };
+
+      const baseUrl = state.llamaUrl.replace(/\/+$/, '');
+      const res = await fetch(baseUrl + '/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const reply = json.choices?.[0]?.message?.content || '';
+      const match = reply.match(/\{[\s\S]*"memories"[\s\S]*\}/);
+      if (!match) throw new Error('模型返回格式错误');
+
+      const parsed = JSON.parse(match[0]);
+      const memories = parsed.memories || [];
+
+      resultsDiv.innerHTML = '';
+      if (memories.length === 0) {
+        resultsDiv.innerHTML = '<div class="memory-empty">未提取到有效记忆。</div>';
+        return;
+      }
+
+      state.extractedMemories = memories.map(m => ({
+        content: m.content,
+        importance: m.importance || 'low',
+        selected: true,
+      }));
+
+      renderExtractedResults();
+    } catch (err) {
+      resultsDiv.innerHTML = `<div class="memory-empty" style="color:var(--danger)">提取失败：${escapeHtml(err.message)}</div>`;
+    } finally {
+      document.getElementById('btn-start-extract').disabled = false;
+    }
+  });
+
+  document.getElementById('btn-save-extracted').addEventListener('click', async () => {
+    const id = document.getElementById('agent-edit-modal').dataset.editingId;
+    const saved = state.extractedMemories.filter(m => m.selected);
+    for (const m of saved) {
+      await addMemory(id, m.content, m.importance);
+    }
+    state.editingMemory = await getMemory(id);
+    renderMemoryList();
+    closeModal('extract-memory-modal');
+  });
 
   // Settings
   document.getElementById('btn-settings').addEventListener('click', () => {

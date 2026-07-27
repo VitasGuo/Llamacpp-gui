@@ -5,6 +5,7 @@ import threading
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import mimetypes
+import re
 from urllib.parse import urlparse
 
 CHAT_DIR = os.path.abspath("data/chat")
@@ -14,6 +15,7 @@ AGENTS_DIR = os.path.abspath("data/agents")
 AGENTS_FILE = os.path.join(CHAT_DIR, "agents.json")
 PORT_FILE = os.path.join(CHAT_DIR, "bridge_port.txt")
 WEBUI_DIR = os.path.abspath("data/webui")
+MEMORY_DIR = os.path.join(AGENTS_DIR, "memory")
 
 DEFAULT_AGENT = {
     "id": "default",
@@ -169,6 +171,37 @@ def _migrate_convs():
         os.remove(CONVERSATIONS_FILE)
 
 
+def _memory_path(agent_id):
+    return os.path.join(MEMORY_DIR, f"{_sanitize_name(agent_id)}.json")
+
+
+def _load_memory(agent_id):
+    path = _memory_path(agent_id)
+    return _load_json(path, [])
+
+
+def _save_memory(agent_id, memory):
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    _save_json(_memory_path(agent_id), memory)
+
+
+def _clean_memory(agent_id, threshold_days):
+    if threshold_days <= 0:
+        return
+    memory = _load_memory(agent_id)
+    now = int(datetime.now().timestamp())
+    kept = []
+    for item in memory:
+        if item.get("importance") == "high":
+            kept.append(item)
+            continue
+        created = datetime.fromisoformat(item.get("created_at", "2000-01-01T00:00:00")).timestamp()
+        if (now - created) < threshold_days * 86400:
+            kept.append(item)
+    if len(kept) != len(memory):
+        _save_memory(agent_id, kept)
+
+
 class BridgeHandler(BaseHTTPRequestHandler):
 
     def _cors(self):
@@ -219,7 +252,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
         elif path == "/agents":
             self._json(200, {"agents": _list_agents()})
 
-        elif path.startswith("/agents/") and len(path) > len("/agents/"):
+        elif re.match(r"^/agents/[^/]+/memory$", path):
+            aid = path.split("/")[2]
+            _clean_memory(aid, 90)
+            self._json(200, {"memory": _load_memory(aid)})
+
+        elif re.match(r"^/agents/[^/]+/memory/\d+$", path):
+            parts = path.split("/")
+            aid = parts[2]
+            idx = int(parts[4])
+            memory = _load_memory(aid)
+            if 0 <= idx < len(memory):
+                self._json(200, memory[idx])
+            else:
+                self._json(404, {"error": "memory not found"})
+
+        elif path.startswith("/agents/") and len(path) > len("/agents/") and "/memory" not in path:
             aid = path[len("/agents/"):]
             for a in _list_agents():
                 if a["id"] == aid:
@@ -285,12 +333,27 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "presence_penalty": body.get("presence_penalty"),
                 "frequency_penalty": body.get("frequency_penalty"),
                 "min_p": body.get("min_p"),
+                "memory_budget": body.get("memory_budget"),
+                "memory_clean_days": body.get("memory_clean_days"),
                 "alias": body.get("alias", ""),
                 "avatar": body.get("avatar", ""),
                 "created_at": _now(),
             }
             _write_agent_file(agent)
             self._json(201, agent)
+
+        elif re.match(r"^/agents/[^/]+/memory$", path):
+            aid = path.split("/")[2]
+            memory = _load_memory(aid)
+            entry = {
+                "content": body.get("content", ""),
+                "importance": body.get("importance", "low"),
+                "created_at": _now(),
+            }
+            if entry["content"]:
+                memory.append(entry)
+                _save_memory(aid, memory)
+            self._json(201, memory)
 
         else:
             self._json(404, {"error": "not found"})
@@ -323,7 +386,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     return
             self._json(404, {"error": "conversation not found"})
 
-        elif path.startswith("/agents/") and len(path) > len("/agents/"):
+        elif re.match(r"^/agents/[^/]+/memory/\d+$", path):
+            parts = path.split("/")
+            aid = parts[2]
+            idx = int(parts[4])
+            memory = _load_memory(aid)
+            if 0 <= idx < len(memory):
+                if "content" in body:
+                    memory[idx]["content"] = body["content"]
+                if "importance" in body:
+                    memory[idx]["importance"] = body["importance"]
+                _save_memory(aid, memory)
+                self._json(200, memory[idx])
+            else:
+                self._json(404, {"error": "memory not found"})
+
+        elif path.startswith("/agents/") and len(path) > len("/agents/") and "/memory" not in path:
             aid = path[len("/agents/"):]
             agents = _list_agents()
             for i, a in enumerate(agents):
@@ -338,7 +416,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         agents[i]["alias"] = body["alias"]
                     if "avatar" in body:
                         agents[i]["avatar"] = body["avatar"]
-                    for key in ["top_p", "top_k", "repeat_penalty", "presence_penalty", "frequency_penalty", "min_p"]:
+                    for key in ["top_p", "top_k", "repeat_penalty", "presence_penalty", "frequency_penalty", "min_p", "memory_budget", "memory_clean_days"]:
                         if key in body:
                             agents[i][key] = body[key]
                     _write_agent_file(agents[i])
@@ -361,6 +439,23 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     self._json(200, {"deleted": True})
                     return
             self._json(404, {"error": "conversation not found"})
+
+        elif re.match(r"^/agents/[^/]+/memory/\d+$", path):
+            parts = path.split("/")
+            aid = parts[2]
+            idx = int(parts[4])
+            memory = _load_memory(aid)
+            if 0 <= idx < len(memory):
+                memory.pop(idx)
+                _save_memory(aid, memory)
+                self._json(200, {"deleted": True})
+            else:
+                self._json(404, {"error": "memory not found"})
+
+        elif re.match(r"^/agents/[^/]+/memory$", path):
+            aid = path.split("/")[2]
+            _save_memory(aid, [])
+            self._json(200, {"deleted": True})
 
         elif path.startswith("/agents/") and len(path) > len("/agents/"):
             aid = path[len("/agents/"):]

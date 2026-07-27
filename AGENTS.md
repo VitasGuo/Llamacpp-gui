@@ -47,3 +47,7 @@ pyinstaller -D -w --name='Lammacpp启动器' main.py
 - `model/` —— 纯数据模型（`script.py`、`download_entry.py`）
 - `config/` —— `config.py` 单例
 - `utils/` —— `logger.py`、`validator.py`
+
+## 注意事项
+- **代码修改规则** - 禁止大范围无关重构，在动手写代码前需要评估改动影响范围，有不明确的地方需要向用户提问确认。尽量减少手动实现代码，如果有现成的库可以调用，请优先使用现成的库。
+- **改动总计额** - 改动完成后，需要对改动内容进行简单总结
