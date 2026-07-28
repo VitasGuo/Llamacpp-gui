@@ -546,14 +546,14 @@ function getRecentMessages(rounds) {
 }
 
 function buildMessagesForAgent(agent) {
-  const result = [];
-  if (agent.system_prompt) result.push({ role: 'system', content: agent.system_prompt });
+  const systemParts = [agent.system_prompt || "You are a helpful assistant."];
   if (agent._memory && agent._memory.length > 0) {
     const budget = agent.memory_budget || 1024;
     const ctx = buildMemoryContext(agent._memory, budget);
-    if (ctx) result.push({ role: 'system', content: `[长期记忆]\n${ctx}` });
+    if (ctx) systemParts.push(`[长期记忆]\n${ctx}`);
   }
-  if (state.conversationBackground) result.push({ role: 'system', content: `[对话背景]\n${state.conversationBackground}` });
+  if (state.conversationBackground) systemParts.push(`[对话背景]\n${state.conversationBackground}`);
+  const result = [{ role: 'system', content: systemParts.join('\n\n') }];
   const msgs = getRecentMessages(state.maxContextRounds);
   for (const msg of msgs) {
     if (msg.role === 'system') continue;
@@ -567,7 +567,13 @@ function buildMessagesForAgent(agent) {
 }
 
 function buildRequestBody(messages, agent, streaming) {
-  const body = { messages, stream: streaming, temperature: agent.temperature ?? 0.8 };
+  const sys = messages.filter(m => m.role === 'system');
+  const other = messages.filter(m => m.role !== 'system');
+  if (sys.length === 0) {
+    sys.push({ role: 'system', content: 'You are a helpful assistant.' });
+  }
+  const sorted = [...sys, ...other];
+  const body = { messages: sorted, stream: streaming, temperature: agent.temperature ?? 0.8 };
   const params = ['top_p', 'top_k', 'repeat_penalty', 'presence_penalty', 'frequency_penalty', 'min_p'];
   for (const p of params) {
     if (agent[p] != null) body[p] = agent[p];
@@ -758,7 +764,17 @@ function confirmAddMembers() {
   if (state.currentConvId) saveConversationAgents(state.currentConvId);
 }
 
-function removeParticipant(id) {
+async function removeParticipant(id) {
+  const agentTasks = state.tasks.filter(t => t.agent_id === id && t.enabled);
+  if (agentTasks.length > 0) {
+    const msg = `该角色在对话中存在 ${agentTasks.length} 个启用的定时任务。\n移除角色后这些任务将被删除。\n确定要移除吗？`;
+    if (!confirm(msg)) return;
+    for (const task of agentTasks) {
+      await deleteTask(state.currentConvId, task.id);
+    }
+    state.tasks = await loadTasks(state.currentConvId);
+    renderTaskBar();
+  }
   state.conversationAgents = state.conversationAgents.filter(aid => aid !== id);
   renderAgentChips();
   if (state.conversationAgents.length === 0) enableInput(false);

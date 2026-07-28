@@ -316,8 +316,7 @@ class SchedulerService:
                 return
 
             messages = []
-            if agent.get("system_prompt"):
-                messages.append({"role": "system", "content": agent["system_prompt"]})
+            messages.append({"role": "system", "content": agent.get("system_prompt") or "You are a helpful assistant."})
 
             msgs_for_llm = conv.get("messages", [])[-50:]
             for m in msgs_for_llm:
