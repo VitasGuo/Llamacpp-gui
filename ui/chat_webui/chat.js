@@ -22,6 +22,7 @@ const state = {
   scrollLocked: false,
   theme: 'dark',
   fontSize: 'normal',
+  tasks: [],
 };
 
 const PRESET_EMOJIS = ['🤖','🌐','💻','✍️','📚','🎨','🧠','⚡','🎯','🔧','🗣','📝'];
@@ -204,6 +205,124 @@ function buildMemoryContext(memory, budget) {
   return lines.join('\n');
 }
 
+/* ===== Tasks ===== */
+async function loadTasks(convId) {
+  try {
+    const data = await api('GET', `conversations/${convId}/tasks`);
+    return data.tasks || [];
+  } catch { return []; }
+}
+
+async function createTask(convId, data) {
+  return await api('POST', `conversations/${convId}/tasks`, data);
+}
+
+async function updateTask(convId, taskId, data) {
+  return await api('PUT', `conversations/${convId}/tasks/${taskId}`, data);
+}
+
+async function deleteTask(convId, taskId) {
+  return await api('DELETE', `conversations/${convId}/tasks/${taskId}`);
+}
+
+function renderTaskBar() {
+  const badge = document.getElementById('task-count');
+  if (!badge) return;
+  if (state.tasks.length === 0) {
+    badge.textContent = '0';
+    badge.className = 'badge empty';
+  } else {
+    const enabled = state.tasks.filter(t => t.enabled).length;
+    badge.textContent = enabled;
+    badge.className = 'badge' + (enabled > 0 ? '' : ' empty');
+  }
+}
+
+function renderTaskList() {
+  const list = document.getElementById('task-list');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!state.currentConvId) {
+    list.innerHTML = '<div class="memory-empty">请先选择一个对话</div>';
+    return;
+  }
+  if (state.tasks.length === 0) {
+    list.innerHTML = '<div class="memory-empty">暂无定时任务。</div>';
+    return;
+  }
+  for (const task of state.tasks) {
+    const agent = state.agents.find(a => a.id === task.agent_id);
+    const agentName = agent ? agent.name : '未知角色';
+    const card = document.createElement('div');
+    card.className = 'task-card';
+    const info = document.createElement('div');
+    info.className = 'task-info';
+    const name = document.createElement('div');
+    name.className = 'task-name';
+    name.textContent = task.name;
+    const meta = document.createElement('div');
+    meta.className = 'task-meta';
+    const intervalMin = Math.round((task.interval_seconds || 3600) / 60);
+    meta.textContent = `${agentName} | 每${intervalMin}分钟` + (task.last_run_time ? ` | 上次: ${task.last_run_time.slice(5, 16)}` : '');
+    const status = document.createElement('span');
+    status.className = task.enabled ? 'task-enabled' : 'task-disabled';
+    status.textContent = task.enabled ? '运行中' : '已停止';
+    info.appendChild(name);
+    info.appendChild(meta);
+    info.appendChild(status);
+    card.appendChild(info);
+    const actions = document.createElement('div');
+    actions.className = 'task-actions';
+    const toggleBtn = document.createElement('button');
+    toggleBtn.textContent = task.enabled ? '⏸' : '▶';
+    toggleBtn.title = task.enabled ? '禁用' : '启用';
+    toggleBtn.addEventListener('click', async () => {
+      await updateTask(state.currentConvId, task.id, { enabled: !task.enabled });
+      state.tasks = await loadTasks(state.currentConvId);
+      renderTaskList();
+      renderTaskBar();
+    });
+    const editBtn = document.createElement('button');
+    editBtn.textContent = '✎';
+    editBtn.title = '编辑';
+    editBtn.addEventListener('click', () => openTaskEditor(task));
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn-del';
+    delBtn.textContent = '×';
+    delBtn.title = '删除';
+    delBtn.addEventListener('click', async () => {
+      await deleteTask(state.currentConvId, task.id);
+      state.tasks = await loadTasks(state.currentConvId);
+      renderTaskList();
+      renderTaskBar();
+    });
+    actions.appendChild(toggleBtn);
+    actions.appendChild(editBtn);
+    actions.appendChild(delBtn);
+    card.appendChild(actions);
+    list.appendChild(card);
+  }
+}
+
+function openTaskEditor(task) {
+  const modal = document.getElementById('task-edit-modal');
+  document.getElementById('task-edit-title').textContent = task ? '编辑定时任务' : '添加定时任务';
+  document.getElementById('task-edit-name').value = task ? task.name : '';
+  document.getElementById('task-edit-instruction').value = task ? task.instruction : '';
+  document.getElementById('task-edit-interval').value = task ? task.interval_seconds : 3600;
+  modal.dataset.editingId = task ? task.id : '';
+  const agentSelect = document.getElementById('task-edit-agent');
+  agentSelect.innerHTML = '';
+  for (const agent of state.agents) {
+    const opt = document.createElement('option');
+    opt.value = agent.id;
+    opt.textContent = agent.name;
+    if (task && task.agent_id === agent.id) opt.selected = true;
+    agentSelect.appendChild(opt);
+  }
+  openModal('task-edit-modal');
+}
+
 /* ===== Conversations ===== */
 async function loadConversations() {
   try {
@@ -225,7 +344,9 @@ async function selectConversation(id) {
     state.messages = conv.messages || [];
     state.conversationAgents = conv.agents || [];
     state.conversationBackground = conv.background || '';
+    state.tasks = conv.tasks || [];
     renderBackgroundBar();
+    renderTaskBar();
   } catch {}
   enableInput(state.conversationAgents.length > 0);
   renderMessages();
@@ -953,20 +1074,9 @@ function renderAgentList() {
 }
 
 function renderBackgroundBar() {
-  const bar = document.getElementById('background-bar');
-  const text = document.getElementById('background-text');
-  const btn = document.getElementById('btn-edit-background');
-  if (!state.currentConvId) { bar.hidden = true; return; }
-  bar.hidden = false;
-  if (state.conversationBackground) {
-    text.textContent = state.conversationBackground;
-    text.className = 'background-text';
-    btn.textContent = '编辑';
-  } else {
-    text.textContent = '点击设定对话背景...';
-    text.className = 'background-text empty';
-    btn.textContent = '设定';
-  }
+  const btn = document.getElementById('btn-open-bg-modal');
+  if (!btn) return;
+  btn.hidden = !state.currentConvId;
 }
 
 function renderMemoryList() {
@@ -1406,12 +1516,13 @@ function bindEvents() {
     if (!url) { document.getElementById('conn-test-result').textContent = '请输入 API 地址'; return; }
     state.llamaUrl = url; await checkConnection();
   });
-  document.getElementById('btn-save-settings').addEventListener('click', () => {
+  document.getElementById('btn-save-settings').addEventListener('click', async () => {
     state.llamaUrl = document.getElementById('setting-api-url').value.trim();
     state.reasoningDisplay = document.getElementById('setting-reasoning-display').value;
     state.maxContextRounds = parseInt(document.getElementById('setting-max-rounds').value) || 10;
     state.fontSize = document.getElementById('setting-font-size').value;
     saveLocalSettings();
+    try { await api('PUT', 'settings', { llm_url: state.llamaUrl }); } catch {}
     applyFontSize(state.fontSize);
     if (state.llamaUrl) checkConnection();
     closeModal('settings-modal');
@@ -1426,19 +1537,48 @@ function bindEvents() {
   });
 
   // Background
-  document.getElementById('btn-edit-background').addEventListener('click', () => {
-    document.getElementById('background-editor').value = state.conversationBackground;
-    openModal('background-edit-modal');
+  document.getElementById('btn-open-bg-modal').addEventListener('click', () => {
+    document.getElementById('bg-editor').value = state.conversationBackground || '';
+    openModal('bg-edit-modal');
   });
-  document.getElementById('background-text').addEventListener('click', () => {
-    document.getElementById('background-editor').value = state.conversationBackground;
-    openModal('background-edit-modal');
-  });
-  document.getElementById('btn-background-save').addEventListener('click', async () => {
-    state.conversationBackground = document.getElementById('background-editor').value.trim();
+  document.getElementById('btn-bg-save').addEventListener('click', async () => {
+    state.conversationBackground = document.getElementById('bg-editor').value.trim();
     renderBackgroundBar();
-    closeModal('background-edit-modal');
+    closeModal('bg-edit-modal');
     if (state.currentConvId) await saveConversation(state.currentConvId, state.messages);
+  });
+
+  // Tasks
+  document.getElementById('btn-open-task-modal').addEventListener('click', async () => {
+    if (state.currentConvId) {
+      state.tasks = await loadTasks(state.currentConvId);
+    }
+    renderTaskList();
+    openModal('task-modal');
+  });
+
+  document.getElementById('btn-task-save').addEventListener('click', async () => {
+    if (!state.currentConvId) return;
+    const editingId = document.getElementById('task-edit-modal').dataset.editingId;
+    const data = {
+      name: document.getElementById('task-edit-name').value.trim() || '新任务',
+      agent_id: document.getElementById('task-edit-agent').value,
+      instruction: document.getElementById('task-edit-instruction').value,
+      interval_seconds: parseInt(document.getElementById('task-edit-interval').value) || 3600,
+    };
+    if (editingId) {
+      await updateTask(state.currentConvId, editingId, data);
+    } else {
+      await createTask(state.currentConvId, data);
+    }
+    state.tasks = await loadTasks(state.currentConvId);
+    renderTaskList();
+    renderTaskBar();
+    closeModal('task-edit-modal');
+  });
+
+  document.getElementById('btn-add-task')?.addEventListener('click', () => {
+    openTaskEditor(null);
   });
 
   // Modal close

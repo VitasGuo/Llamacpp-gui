@@ -2,6 +2,8 @@ import os
 import json
 import uuid
 import threading
+import time
+import urllib.request
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import mimetypes
@@ -16,6 +18,8 @@ AGENTS_FILE = os.path.join(CHAT_DIR, "agents.json")
 PORT_FILE = os.path.join(CHAT_DIR, "bridge_port.txt")
 WEBUI_DIR = os.path.abspath("data/webui")
 MEMORY_DIR = os.path.join(AGENTS_DIR, "memory")
+SETTINGS_FILE = os.path.join(CHAT_DIR, "settings.json")
+TASK_INDEX_FILE = os.path.join(CHAT_DIR, "task_index.json")
 
 DEFAULT_AGENT = {
     "id": "default",
@@ -202,6 +206,157 @@ def _clean_memory(agent_id, threshold_days):
         _save_memory(agent_id, kept)
 
 
+def _read_settings():
+    return _load_json(SETTINGS_FILE, {"llm_url": ""})
+
+
+def _write_settings(data):
+    _save_json(SETTINGS_FILE, data)
+
+
+def _read_task_index():
+    return _load_json(TASK_INDEX_FILE, [])
+
+
+def _write_task_index(index):
+    _save_json(TASK_INDEX_FILE, index)
+
+
+def _rebuild_task_index():
+    index = []
+    for conv in _list_conversations():
+        for task in conv.get("tasks", []):
+            if task.get("enabled", False):
+                index.append({
+                    "task_id": task["id"],
+                    "conversation_id": conv["id"],
+                    "agent_id": task.get("agent_id", ""),
+                    "next_run_time": task.get("next_run_time", ""),
+                })
+    _write_task_index(index)
+
+
+def _call_llm(llm_url, messages):
+    url = llm_url.rstrip("/") + "/v1/chat/completions"
+    body = json.dumps({"messages": messages, "stream": False, "temperature": 0.7}).encode()
+    req = urllib.request.Request(url, data=body, method="POST",
+        headers={"Content-Type": "application/json"}, timeout=120)
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read())
+    return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+
+class SchedulerService:
+    def __init__(self):
+        self._running = False
+        self._thread = None
+        self._executing = set()
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _loop(self):
+        while self._running:
+            try:
+                self._tick()
+            except Exception as e:
+                pass
+            time.sleep(1)
+
+    def _tick(self):
+        index = _read_task_index()
+        now_iso = _now()
+        for entry in index:
+            if not entry.get("enabled", False):
+                continue
+            if entry.get("task_id") in self._executing:
+                continue
+            if entry.get("next_run_time", "") <= now_iso:
+                self._executing.add(entry["task_id"])
+                t = threading.Thread(target=self._execute_task, args=(entry,), daemon=True)
+                t.start()
+
+    def _execute_task(self, entry):
+        task_id = entry["task_id"]
+        conv_id = entry["conversation_id"]
+        agent_id = entry["agent_id"]
+        try:
+            settings = _read_settings()
+            llm_url = settings.get("llm_url", "")
+            if not llm_url:
+                return
+
+            conv = None
+            for c in _list_conversations():
+                if c["id"] == conv_id:
+                    conv = c
+                    break
+            if not conv:
+                return
+
+            task = None
+            for t in conv.get("tasks", []):
+                if t["id"] == task_id:
+                    task = t
+                    break
+            if not task or not task.get("enabled", False):
+                return
+
+            agent = None
+            for a in _list_agents():
+                if a["id"] == agent_id:
+                    agent = a
+                    break
+            if not agent:
+                return
+
+            messages = []
+            if agent.get("system_prompt"):
+                messages.append({"role": "system", "content": agent["system_prompt"]})
+
+            msgs_for_llm = conv.get("messages", [])[-50:]
+            for m in msgs_for_llm:
+                if m.get("role") in ("user", "assistant"):
+                    messages.append({"role": m["role"], "content": m.get("content", "")})
+
+            messages.append({"role": "user", "content": task.get("instruction", "")})
+
+            response = _call_llm(llm_url, messages)
+
+            conv["messages"].append({
+                "role": "assistant",
+                "content": response,
+                "agent_id": agent_id,
+                "agent_name": agent.get("name", ""),
+            })
+            conv["updated_at"] = _now()
+            _write_conv_file(conv)
+
+            task["last_run_time"] = _now()
+            task["last_result"] = response[:200]
+
+            now = datetime.now()
+            interval = task.get("interval_seconds", 3600)
+            task["next_run_time"] = (now + __import__("datetime").timedelta(seconds=interval)).strftime("%Y-%m-%dT%H:%M:%S")
+
+            conv["tasks"] = [t for t in conv.get("tasks", []) if t["id"] != task_id] + [task]
+            _write_conv_file(conv)
+            _rebuild_task_index()
+
+        except Exception:
+            pass
+        finally:
+            self._executing.discard(task_id)
+
+
+_scheduler = SchedulerService()
+
+
 class BridgeHandler(BaseHTTPRequestHandler):
 
     def _cors(self):
@@ -241,6 +396,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 })
             self._json(200, {"conversations": summary})
 
+        elif re.match(r"^/conversations/[^/]+/tasks$", path):
+            cid = path.split("/")[2]
+            conv = None
+            for c in _list_conversations():
+                if c["id"] == cid:
+                    conv = c
+                    break
+            if conv:
+                self._json(200, {"tasks": conv.get("tasks", [])})
+            else:
+                self._json(404, {"error": "conversation not found"})
+
         elif path.startswith("/conversations/") and len(path) > len("/conversations/"):
             cid = path[len("/conversations/"):]
             for c in _list_conversations():
@@ -249,8 +416,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     return
             self._json(404, {"error": "conversation not found"})
 
-        elif path == "/agents":
-            self._json(200, {"agents": _list_agents()})
+        elif path == "/settings":
+            self._json(200, _read_settings())
 
         elif re.match(r"^/agents/[^/]+/memory$", path):
             aid = path.split("/")[2]
@@ -355,6 +522,33 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 _save_memory(aid, memory)
             self._json(201, memory)
 
+        elif re.match(r"^/conversations/[^/]+/tasks$", path):
+            cid = path.split("/")[2]
+            conv = None
+            for c in _list_conversations():
+                if c["id"] == cid:
+                    conv = c
+                    break
+            if not conv:
+                self._json(404, {"error": "conversation not found"})
+                return
+            task = {
+                "id": str(uuid.uuid4()),
+                "agent_id": body.get("agent_id", ""),
+                "name": body.get("name", "新任务"),
+                "instruction": body.get("instruction", ""),
+                "enabled": body.get("enabled", True),
+                "interval_seconds": body.get("interval_seconds", 3600),
+                "next_run_time": _now(),
+                "last_run_time": None,
+                "last_result": None,
+            }
+            conv.setdefault("tasks", []).append(task)
+            conv["updated_at"] = _now()
+            _write_conv_file(conv)
+            _rebuild_task_index()
+            self._json(201, task)
+
         else:
             self._json(404, {"error": "not found"})
 
@@ -367,7 +561,33 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._json(400, {"error": "invalid JSON"})
             return
 
-        if path.startswith("/conversations/") and len(path) > len("/conversations/"):
+        if re.match(r"^/conversations/[^/]+/tasks/[^/]+$", path):
+            parts = path.split("/")
+            cid = parts[2]
+            tid = parts[4]
+            conv = None
+            for c in _list_conversations():
+                if c["id"] == cid:
+                    conv = c
+                    break
+            if not conv:
+                self._json(404, {"error": "conversation not found"})
+                return
+            tasks = conv.get("tasks", [])
+            for i, t in enumerate(tasks):
+                if t["id"] == tid:
+                    for key in ["name", "instruction", "enabled", "interval_seconds"]:
+                        if key in body:
+                            tasks[i][key] = body[key]
+                    conv["tasks"] = tasks
+                    conv["updated_at"] = _now()
+                    _write_conv_file(conv)
+                    _rebuild_task_index()
+                    self._json(200, tasks[i])
+                    return
+            self._json(404, {"error": "task not found"})
+
+        elif path.startswith("/conversations/") and len(path) > len("/conversations/") and "/tasks" not in path:
             cid = path[len("/conversations/"):]
             convs = _list_conversations()
             for i, c in enumerate(convs):
@@ -424,6 +644,39 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     return
             self._json(404, {"error": "agent not found"})
 
+        elif path == "/settings":
+            settings = _read_settings()
+            for key in body:
+                settings[key] = body[key]
+            _write_settings(settings)
+            self._json(200, settings)
+
+        elif re.match(r"^/conversations/[^/]+/tasks/[^/]+$", path):
+            parts = path.split("/")
+            cid = parts[2]
+            tid = parts[4]
+            conv = None
+            for c in _list_conversations():
+                if c["id"] == cid:
+                    conv = c
+                    break
+            if not conv:
+                self._json(404, {"error": "conversation not found"})
+                return
+            tasks = conv.get("tasks", [])
+            for i, t in enumerate(tasks):
+                if t["id"] == tid:
+                    for key in ["name", "instruction", "enabled", "interval_seconds"]:
+                        if key in body:
+                            tasks[i][key] = body[key]
+                    conv["tasks"] = tasks
+                    conv["updated_at"] = _now()
+                    _write_conv_file(conv)
+                    _rebuild_task_index()
+                    self._json(200, tasks[i])
+                    return
+            self._json(404, {"error": "task not found"})
+
         else:
             self._json(404, {"error": "not found"})
 
@@ -431,7 +684,26 @@ class BridgeHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
-        if path.startswith("/conversations/") and len(path) > len("/conversations/"):
+        if re.match(r"^/conversations/[^/]+/tasks/[^/]+$", path):
+            parts = path.split("/")
+            cid = parts[2]
+            tid = parts[4]
+            conv = None
+            for c in _list_conversations():
+                if c["id"] == cid:
+                    conv = c
+                    break
+            if conv:
+                tasks = conv.get("tasks", [])
+                conv["tasks"] = [t for t in tasks if t["id"] != tid]
+                conv["updated_at"] = _now()
+                _write_conv_file(conv)
+                _rebuild_task_index()
+                self._json(200, {"deleted": True})
+            else:
+                self._json(404, {"error": "conversation not found"})
+
+        elif path.startswith("/conversations/") and len(path) > len("/conversations/") and "/tasks" not in path:
             cid = path[len("/conversations/"):]
             for c in _list_conversations():
                 if c["id"] == cid:
@@ -456,6 +728,25 @@ class BridgeHandler(BaseHTTPRequestHandler):
             aid = path.split("/")[2]
             _save_memory(aid, [])
             self._json(200, {"deleted": True})
+
+        elif re.match(r"^/conversations/[^/]+/tasks/[^/]+$", path):
+            parts = path.split("/")
+            cid = parts[2]
+            tid = parts[4]
+            conv = None
+            for c in _list_conversations():
+                if c["id"] == cid:
+                    conv = c
+                    break
+            if conv:
+                tasks = conv.get("tasks", [])
+                conv["tasks"] = [t for t in tasks if t["id"] != tid]
+                conv["updated_at"] = _now()
+                _write_conv_file(conv)
+                _rebuild_task_index()
+                self._json(200, {"deleted": True})
+            else:
+                self._json(404, {"error": "conversation not found"})
 
         elif path.startswith("/agents/") and len(path) > len("/agents/"):
             aid = path[len("/agents/"):]
@@ -486,6 +777,7 @@ def start_bridge():
     os.makedirs(CHAT_DIR, exist_ok=True)
     _migrate_agents()
     _migrate_convs()
+    _rebuild_task_index()
 
     port = find_free_port()
     server = HTTPServer(("127.0.0.1", port), BridgeHandler)
@@ -494,4 +786,7 @@ def start_bridge():
 
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
+
+    _scheduler.start()
+
     return server, port

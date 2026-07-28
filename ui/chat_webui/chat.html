@@ -31,20 +31,17 @@
     </aside>
 
     <main id="chat-area">
-      <div id="agent-bar">
+      <div id="toolbar">
         <span class="agent-bar-label">群聊成员</span>
         <div id="agent-chips"></div>
         <button class="btn btn-sm btn-outline" id="btn-add-member" title="添加群聊成员">＋</button>
+        <span class="toolbar-sep"></span>
+        <button class="toolbar-btn" id="btn-open-bg-modal" title="对话背景">📋</button>
+        <button class="toolbar-btn" id="btn-open-task-modal" title="定时任务">🕐 <span id="task-count">0</span></button>
         <label class="stream-toggle">
           <input type="checkbox" id="stream-toggle" checked>
           流式
         </label>
-      </div>
-
-      <div id="background-bar" class="background-bar" hidden>
-        <span class="background-bar-label">📋</span>
-        <span id="background-text" class="background-text">点击设定对话背景...</span>
-        <button class="btn btn-sm btn-outline" id="btn-edit-background">设定</button>
       </div>
 
       <div id="message-area">
@@ -136,6 +133,41 @@
     <div class="modal-footer">
       <button class="btn btn-primary" id="btn-save-settings">保存</button>
       <button class="btn modal-close" data-modal="settings-modal">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="bg-edit-modal" class="modal" hidden>
+  <div class="modal-backdrop"></div>
+  <div class="modal-content modal-sm">
+    <div class="modal-header">
+      <h2>📋 对话背景</h2>
+      <button class="btn btn-icon modal-close" data-modal="bg-edit-modal">&times;</button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-hint">填写此对话的整体背景信息，所有助手都能看到（如：项目目标、当前阶段、已有决策等）</p>
+      <textarea id="bg-editor" class="form-input form-textarea" rows="8" placeholder="例如：\n这是系统架构设计讨论。\n已确定：使用微服务架构，用 Go 语言实现。\n当前阶段：正在讨论数据库选型。"></textarea>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" id="btn-bg-save">保存</button>
+      <button class="btn modal-close" data-modal="bg-edit-modal">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="task-modal" class="modal" hidden>
+  <div class="modal-backdrop"></div>
+  <div class="modal-content modal-sm">
+    <div class="modal-header">
+      <h2>🕐 定时任务</h2>
+      <button class="btn btn-icon modal-close" data-modal="task-modal">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div id="task-list"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" id="btn-add-task">＋ 添加任务</button>
+      <button class="btn modal-close" data-modal="task-modal">关闭</button>
     </div>
   </div>
 </div>
@@ -336,6 +368,39 @@
     <div class="modal-footer">
       <button class="btn btn-primary" id="btn-background-save">保存</button>
       <button class="btn modal-close" data-modal="background-edit-modal">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="task-edit-modal" class="modal" hidden>
+  <div class="modal-backdrop"></div>
+  <div class="modal-content modal-sm">
+    <div class="modal-header">
+      <h2 id="task-edit-title">添加定时任务</h2>
+      <button class="btn btn-icon modal-close" data-modal="task-edit-modal">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row">
+        <label>任务名称</label>
+        <input type="text" id="task-edit-name" class="form-input" placeholder="例如：每日问候">
+      </div>
+      <div class="form-row">
+        <label>执行角色</label>
+        <select id="task-edit-agent" class="form-input"></select>
+      </div>
+      <div class="form-row">
+        <label>执行指令</label>
+        <textarea id="task-edit-instruction" class="form-input form-textarea" rows="3" placeholder="让这个角色做什么..."></textarea>
+      </div>
+      <div class="form-row">
+        <label>执行间隔（秒）</label>
+        <input type="number" id="task-edit-interval" class="form-input" min="60" value="3600" step="60">
+        <div class="form-hint">3600=1小时，86400=1天</div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" id="btn-task-save">保存</button>
+      <button class="btn modal-close" data-modal="task-edit-modal">取消</button>
     </div>
   </div>
 </div>
