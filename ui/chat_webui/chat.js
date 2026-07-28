@@ -313,12 +313,19 @@ function openTaskEditor(task) {
   modal.dataset.editingId = task ? task.id : '';
   const agentSelect = document.getElementById('task-edit-agent');
   agentSelect.innerHTML = '';
-  for (const agent of state.agents) {
-    const opt = document.createElement('option');
-    opt.value = agent.id;
-    opt.textContent = agent.name;
-    if (task && task.agent_id === agent.id) opt.selected = true;
-    agentSelect.appendChild(opt);
+  const participants = state.agents.filter(a => state.conversationAgents.includes(a.id));
+  if (participants.length === 0) {
+    agentSelect.innerHTML = '<option value="">请先添加群聊成员</option>';
+    agentSelect.disabled = true;
+  } else {
+    agentSelect.disabled = false;
+    for (const agent of participants) {
+      const opt = document.createElement('option');
+      opt.value = agent.id;
+      opt.textContent = agent.name;
+      if (task && task.agent_id === agent.id) opt.selected = true;
+      agentSelect.appendChild(opt);
+    }
   }
   openModal('task-edit-modal');
 }

@@ -434,6 +434,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
             else:
                 self._json(404, {"error": "memory not found"})
 
+        elif path == "/agents":
+            self._json(200, {"agents": _list_agents()})
+
         elif path.startswith("/agents/") and len(path) > len("/agents/") and "/memory" not in path:
             aid = path[len("/agents/"):]
             for a in _list_agents():
