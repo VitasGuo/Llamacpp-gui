@@ -240,7 +240,7 @@ def _call_llm(llm_url, messages):
     url = llm_url.rstrip("/") + "/v1/chat/completions"
     body = json.dumps({"messages": messages, "stream": False, "temperature": 0.7}).encode()
     req = urllib.request.Request(url, data=body, method="POST",
-        headers={"Content-Type": "application/json"}, timeout=120)
+        headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=120) as resp:
         data = json.loads(resp.read())
     return data.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -272,11 +272,10 @@ class SchedulerService:
         index = _read_task_index()
         now_iso = _now()
         for entry in index:
-            if not entry.get("enabled", False):
-                continue
             if entry.get("task_id") in self._executing:
                 continue
-            if entry.get("next_run_time", "") <= now_iso:
+            next_run = entry.get("next_run_time", "")
+            if next_run <= now_iso:
                 self._executing.add(entry["task_id"])
                 t = threading.Thread(target=self._execute_task, args=(entry,), daemon=True)
                 t.start()
@@ -289,6 +288,7 @@ class SchedulerService:
             settings = _read_settings()
             llm_url = settings.get("llm_url", "")
             if not llm_url:
+                print(f"[scheduler] No llm_url", file=sys.stderr)
                 return
 
             conv = None
@@ -304,7 +304,7 @@ class SchedulerService:
                 if t["id"] == task_id:
                     task = t
                     break
-            if not task or not task.get("enabled", False):
+            if not task or not task.get("enabled", True):
                 return
 
             agent = None

@@ -53,6 +53,8 @@ async function init() {
   if (state.llamaUrl) {
     try { await checkConnection(); } catch {}
   }
+
+  try { await api('PUT', 'settings', { llm_url: state.llamaUrl }); } catch {}
 }
 
 /* ===== Local Settings ===== */
