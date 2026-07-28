@@ -23,6 +23,8 @@ const state = {
   theme: 'dark',
   fontSize: 'normal',
   tasks: [],
+  conversationUpdatedAt: '',
+  pollTimer: null,
 };
 
 const PRESET_EMOJIS = ['🤖','🌐','💻','✍️','📚','🎨','🧠','⚡','🎯','🔧','🗣','📝'];
@@ -55,6 +57,9 @@ async function init() {
   }
 
   try { await api('PUT', 'settings', { llm_url: state.llamaUrl }); } catch {}
+
+  if (state.pollTimer) clearInterval(state.pollTimer);
+  state.pollTimer = setInterval(pollConversation, 5000);
 }
 
 /* ===== Local Settings ===== */
@@ -354,6 +359,7 @@ async function selectConversation(id) {
     state.conversationAgents = conv.agents || [];
     state.conversationBackground = conv.background || '';
     state.tasks = conv.tasks || [];
+    state.conversationUpdatedAt = conv.updated_at || '';
     renderBackgroundBar();
     renderTaskBar();
   } catch {}
@@ -1207,6 +1213,21 @@ function scrollToBottom() {
   if (state.scrollLocked) return;
   const area = document.getElementById('message-area');
   area.scrollTop = area.scrollHeight;
+}
+
+async function pollConversation() {
+  if (!state.currentConvId) return;
+  if (!state.tasks.some(t => t.enabled)) return;
+  try {
+    const conv = await api('GET', `conversations/${state.currentConvId}`);
+    if (conv.updated_at && conv.updated_at !== state.conversationUpdatedAt) {
+      state.conversationUpdatedAt = conv.updated_at;
+      state.messages = conv.messages || [];
+      state.tasks = conv.tasks || [];
+      renderMessages(true);
+      renderTaskBar();
+    }
+  } catch {}
 }
 
 /* ===== Modal ===== */
