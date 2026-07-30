@@ -1,6 +1,6 @@
 import os
 import subprocess
-from config.config import LAST_PID_FILE
+from config import LAST_PID_FILE
 
 
 class ProcessService:

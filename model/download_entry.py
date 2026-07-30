@@ -2,7 +2,7 @@ import os
 import json
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from config.config import DOWNLOAD_QUEUE_FILE
+from config import DOWNLOAD_QUEUE_FILE
 
 
 @dataclass

@@ -1,14 +1,7 @@
 import os
 import json
 
-# 路径常量
-SCRIPTS_DIR = "data/scripts"
-SCRIPTS_CONFIG = "data/scripts.json"
-LAST_PID_FILE = "data/last_pid.pid"
-APP_CONFIG_FILE = "data/app_config.json"
-DOWNLOAD_DIR = "data/downloads"
-DOWNLOAD_QUEUE_FILE = "data/downloads/queue.json"
-
+from config import APP_CONFIG_FILE
 
 class Settings:
     _instance = None

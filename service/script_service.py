@@ -1,7 +1,7 @@
 import os
 import json
 from model.script import ScriptEntry
-from config.config import SCRIPTS_DIR, SCRIPTS_CONFIG
+from config import SCRIPTS_DIR, SCRIPTS_CONFIG
 
 
 class ScriptService:

@@ -1,18 +1,18 @@
+"""模型搜索与下载标签页。"""
 import os
-import time
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QLabel, QFileDialog,
     QMessageBox, QProgressBar, QStackedWidget, QCheckBox, QSplitter,
-    QAbstractItemView, QGroupBox,
+    QAbstractItemView,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt
 
 from config.config import Settings
-from service.modelscope import search_models, list_model_files, get_download_url, download_file
-from model.download_entry import DownloadEntry, DownloadQueue
+from service.modelscope import search_models, list_model_files
+from service.download_service import DownloadManager
+from model.download_entry import DownloadEntry
 
 
 def _format_size(size_bytes):
@@ -45,80 +45,17 @@ def _format_date(iso_str):
         return iso_str[:10]
 
 
-class PauseException(Exception):
-    pass
-
-
-class DownloadWorker(QThread):
-    progress_signal = pyqtSignal(str, int, int)
-    speed_signal = pyqtSignal(str, float)
-    finished_signal = pyqtSignal(str, bool, str)
-
-    def __init__(self, url, dest_path, file_path, resume_pos=0):
-        super().__init__()
-        self.url = url
-        self.dest_path = dest_path
-        self.file_path = file_path
-        self.resume_pos = resume_pos
-        self._paused = False
-        self._cancelled = False
-
-    def run(self):
-        last_time = time.time()
-        last_bytes = self.resume_pos
-
-        def on_chunk(current, total):
-            nonlocal last_time, last_bytes
-            if self._paused:
-                raise PauseException
-            if self._cancelled:
-                raise StopIteration
-            self.progress_signal.emit(self.file_path, current, total)
-            now = time.time()
-            elapsed = now - last_time
-            if elapsed >= 1.0:
-                speed = (current - last_bytes) / elapsed
-                self.speed_signal.emit(self.file_path, speed)
-                last_time = now
-                last_bytes = current
-
-        try:
-            current, total = download_file(
-                self.url, self.dest_path,
-                resume_pos=self.resume_pos,
-                chunk_callback=on_chunk,
-            )
-            if self._cancelled:
-                if os.path.exists(self.dest_path):
-                    os.remove(self.dest_path)
-                self.finished_signal.emit(self.file_path, False, "已取消")
-            else:
-                self.finished_signal.emit(self.file_path, True, "")
-        except PauseException:
-            self.finished_signal.emit(self.file_path, False, "已暂停")
-        except StopIteration:
-            self.finished_signal.emit(self.file_path, False, "已取消")
-        except Exception as e:
-            self.finished_signal.emit(self.file_path, False, str(e))
-
-    def pause(self):
-        self._paused = True
-
-    def cancel(self):
-        self._cancelled = True
-
-
 class ModelTab(QWidget):
     def __init__(self):
         super().__init__()
         self.settings = Settings.get_instance()
-        self.download_queue = DownloadQueue()
-        self._workers = {}
+        self.download_manager = DownloadManager()
         self._current_page = 1
         self._current_keyword = ""
         self._total_count = 0
         self._current_model_id = ""
         self._init_ui()
+        self._connect_download_signals()
         self._restore_queue()
 
     def _init_ui(self):
@@ -164,6 +101,11 @@ class ModelTab(QWidget):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter)
+
+    def _connect_download_signals(self):
+        self.download_manager.progress_signal.connect(self._on_dl_progress)
+        self.download_manager.speed_signal.connect(self._on_dl_speed)
+        self.download_manager.finished_signal.connect(self._on_dl_finished)
 
     def _build_search_bar(self):
         bar = QHBoxLayout()
@@ -223,7 +165,7 @@ class ModelTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         top_bar = QHBoxLayout()
-        self.back_btn = QPushButton("← 返回搜索结果")
+        self.back_btn = QPushButton("\u2190 返回搜索结果")
         self.back_btn.clicked.connect(self._back_to_results)
         top_bar.addWidget(self.back_btn)
         self.filelist_model_label = QLabel("")
@@ -395,7 +337,11 @@ class ModelTab(QWidget):
                             size = int(float(size_text.replace("KB", "")) * 10 ** 3)
                     except ValueError:
                         pass
-                self._start_download(self._current_model_id, file_path, size, dl_path)
+            ok = self.download_manager.start_download(self._current_model_id, file_path, size, dl_path)
+            if ok:
+                entry = self.download_manager.download_queue.find(self._current_model_id, file_path)
+                if entry:
+                    self._add_queue_row(entry)
                 started += 1
         if started == 0:
             QMessageBox.warning(self, "提示", "请先勾选要下载的文件")
@@ -408,49 +354,12 @@ class ModelTab(QWidget):
         if not os.path.isdir(dl_path):
             QMessageBox.warning(self, "提示", "下载目录不存在")
             return
-        self._start_download(model_id, file_path, file_size, dl_path)
-
-    def _start_download(self, model_id, file_path, file_size, dl_path):
-        existing = self.download_queue.find(model_id, file_path)
-        active_worker = self._workers.get(file_path)
-        if active_worker and active_worker.isRunning():
-            QMessageBox.warning(self, "提示", "该文件已在下载队列中")
+        ok = self.download_manager.start_download(model_id, file_path, file_size, dl_path)
+        if not ok:
             return
-
-        filename = os.path.basename(file_path)
-        dest_path = os.path.join(dl_path, filename)
-
-        if existing and existing.status in ("paused", "downloading", "pending"):
-            entry = existing
-            entry.status = "downloading"
-            resume_pos = entry.downloaded
-        elif existing and existing.status in ("completed", "failed", "cancelled"):
-            entry = existing
-            entry.status = "downloading"
-            entry.downloaded = 0
-            resume_pos = 0
-        else:
-            entry = DownloadEntry(
-                model_id=model_id,
-                file_path=file_path,
-                file_size=file_size,
-                dest_path=dest_path,
-                downloaded=0,
-                status="downloading",
-            )
-            self.download_queue.add(entry)
-
-        url = get_download_url(model_id, file_path)
-        resume_pos = entry.downloaded
-        worker = DownloadWorker(url, dest_path, file_path, resume_pos)
-        self._workers[file_path] = worker
-
-        worker.progress_signal.connect(self._on_dl_progress)
-        worker.speed_signal.connect(self._on_dl_speed)
-        worker.finished_signal.connect(lambda fp, ok, err, e=entry: self._on_dl_finished(fp, ok, err, e))
-        worker.start()
-        self._add_queue_row(entry)
-        self.download_queue.update(entry)
+        entry = self.download_manager.download_queue.find(model_id, file_path)
+        if entry:
+            self._add_queue_row(entry)
 
     def _add_queue_row(self, entry):
         for row in range(self.queue_table.rowCount()):
@@ -490,8 +399,8 @@ class ModelTab(QWidget):
         layout.setContentsMargins(2, 0, 2, 0)
         layout.setSpacing(4)
 
-        worker = self._workers.get(entry.file_path)
-        if entry.status == "downloading" and worker and worker.isRunning():
+        worker_active = self.download_manager.is_worker_active(entry.file_path)
+        if entry.status == "downloading" and worker_active:
             pause_btn = QPushButton("暂停")
             pause_btn.clicked.connect(lambda: self._pause_download(entry))
             cancel_btn = QPushButton("取消")
@@ -517,12 +426,8 @@ class ModelTab(QWidget):
         self.queue_table.setCellWidget(row, 4, container)
 
     def _on_dl_progress(self, file_path, current, total):
-        entry = self.download_queue.find(self._current_model_id, file_path)
+        entry = self._find_entry(file_path)
         if entry:
-            entry.downloaded = current
-            if total > 0:
-                entry.file_size = total
-            self.download_queue.update(entry)
             for row in range(self.queue_table.rowCount()):
                 item = self.queue_table.item(row, 0)
                 if item and item.data(Qt.ItemDataRole.UserRole) == file_path:
@@ -540,78 +445,60 @@ class ModelTab(QWidget):
                 self.queue_table.item(row, 2).setText(text)
                 break
 
-    def _on_dl_finished(self, file_path, success, error, entry):
-        worker = self._workers.pop(file_path, None)
-        if success:
-            entry.status = "completed"
-        elif error == "已暂停":
-            entry.status = "paused"
-        elif error == "已取消":
-            entry.status = "cancelled"
-        else:
-            entry.status = "failed"
-        entry.downloaded = os.path.getsize(entry.dest_path) if os.path.exists(entry.dest_path) else entry.downloaded
-        self.download_queue.update(entry)
-
-        for row in range(self.queue_table.rowCount()):
-            item = self.queue_table.item(row, 0)
-            if item and item.data(Qt.ItemDataRole.UserRole) == file_path:
-                self._update_queue_row(row, entry)
-                self._set_queue_actions(row, entry)
-                break
-
-    def _pause_download(self, entry):
-        worker = self._workers.get(entry.file_path)
-        if worker:
-            worker.pause()
-            entry.status = "paused"
-            self.download_queue.update(entry)
+    def _on_dl_finished(self, file_path, success, error):
+        entry = self._find_entry(file_path)
+        if entry:
             for row in range(self.queue_table.rowCount()):
                 item = self.queue_table.item(row, 0)
-                if item and item.data(Qt.ItemDataRole.UserRole) == entry.file_path:
+                if item and item.data(Qt.ItemDataRole.UserRole) == file_path:
                     self._update_queue_row(row, entry)
                     self._set_queue_actions(row, entry)
                     break
+        else:
+            self._refresh_queue_ui()
 
-    def _cancel_download(self, entry):
-        worker = self._workers.get(entry.file_path)
-        if worker:
-            worker.cancel()
-        entry.status = "cancelled"
-        if os.path.exists(entry.dest_path):
-            try:
-                os.remove(entry.dest_path)
-            except OSError:
-                pass
-        entry.downloaded = 0
-        self.download_queue.update(entry)
+    def _find_entry(self, file_path):
+        for e in self.download_manager.entries:
+            if e.file_path == file_path:
+                return e
+        return None
+
+    def _refresh_queue_ui(self):
+        """全量刷新队列 UI，保持与 DownloadManager 状态同步。"""
         for row in range(self.queue_table.rowCount()):
             item = self.queue_table.item(row, 0)
-            if item and item.data(Qt.ItemDataRole.UserRole) == entry.file_path:
+            if not item:
+                continue
+            fp = item.data(Qt.ItemDataRole.UserRole)
+            entry = self._find_entry(fp)
+            if entry:
                 self._update_queue_row(row, entry)
                 self._set_queue_actions(row, entry)
-                break
+
+    def _pause_download(self, entry):
+        self.download_manager.pause_download(entry)
+        self._refresh_queue_ui()
+
+    def _cancel_download(self, entry):
+        self.download_manager.cancel_download(entry)
+        self._refresh_queue_ui()
 
     def _resume_download(self, entry):
         dl_path = self.dl_path_edit.text().strip() or os.path.dirname(entry.dest_path)
-        self._start_download(entry.model_id, entry.file_path, entry.file_size, dl_path)
+        ok = self.download_manager.resume_download(entry, dl_path)
+        if ok:
+            self._add_queue_row(entry)
 
     def _retry_download(self, entry):
-        entry.downloaded = 0
-        self.download_queue.update(entry)
         dl_path = self.dl_path_edit.text().strip() or os.path.dirname(entry.dest_path)
-        self._start_download(entry.model_id, entry.file_path, entry.file_size, dl_path)
+        ok = self.download_manager.retry_download(entry, dl_path)
+        if ok:
+            self._add_queue_row(entry)
 
     def _remove_queue_row(self, row, entry):
         self.queue_table.removeRow(row)
-        self.download_queue.remove(entry)
-        self._workers.pop(entry.file_path, None)
-        if entry.dest_path and os.path.exists(entry.dest_path):
-            try:
-                os.remove(entry.dest_path)
-            except OSError:
-                pass
+        self.download_manager.remove_download(entry)
 
     def _restore_queue(self):
-        for entry in self.download_queue.pending_downloads():
+        for entry in self.download_manager.pending_downloads():
             self._add_queue_row(entry)

@@ -1,264 +1,31 @@
+"""llama.cpp GUI 主窗口。"""
 import sys
 import os
-import shutil
-import json
-import re
-import urllib.request
 import webbrowser
 from datetime import datetime
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QTextEdit,
     QListWidget, QListWidgetItem, QMessageBox, QSplitter, QTabWidget,
-    QFileDialog, QInputDialog, QDialog, QCheckBox, QFormLayout,
-    QDialogButtonBox, QScrollArea,
+    QFileDialog, QInputDialog, QDialog,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt
 
 from config.config import Settings
-from service.path_service import validate_llamacpp_file, validate_gguf_file
+from utils.validator import validate_llamacpp_file, validate_gguf
 from service.script_service import ScriptService
+from service.script_builder import build_bat_content
 from service.process_service import ProcessService
 from service.monitor_service import MonitorService
-from service.chat_bridge import start_bridge
+from service.path_service import ensure_webui
+from chat import start_bridge
 from model.script import ScriptEntry
 from ui.model_tab import ModelTab
 from ui.monitor_tab import MonitorTab
-
-
-class NewScriptDialog(QDialog):
-    CATEGORIES = [
-        {
-            "title": "通用参数",
-            "note": "",
-            "checked": True,
-            "switches": [
-                {"key": "gpu_layers", "label": "--gpu-layers (GPU 层数)", "default": "99"},
-                {"key": "port", "label": "--port (端口号)", "default": "8080"},
-                {"key": "ctx_size", "label": "--ctx-size (上下文大小)", "default": "32768"},
-                {"key": "alias", "label": "--alias (模型别名)", "default": "qwen"},
-                {"key": "host", "label": "--host (监听地址)", "default": "0.0.0.0"},
-            ],
-        },
-        {
-            "title": "模型参数",
-            "note": "",
-            "checked": False,
-            "switches": [
-                {"key": "no_mmproj_offload", "label": "--no-mmproj-offload (不加载视觉模型)", "default": ""},
-                {"key": "mmproj", "label": "--mmproj (是否启用外挂视觉模型)", "default": ""},
-                {"key": "reasoning", "label": "--reasoning off (关闭模型思考)", "default": ""},
-                {"key": "main_gpu", "label": "--main-gpu (指定主推理gpu，单显卡忽略该参数)", "default": "0"},
-                {"key": "ts", "label": "-ts (混合gpu负载, 例如1,3，意思为两张显卡负载比例为1:3，单显卡忽略该参数)", "default": "1,3"},
-            ],
-        },
-        {
-            "title": "MTP 参数",
-            "note": "需要支持MTP的模型才能开启",
-            "checked": False,
-            "switches": [
-                {"key": "spec_type", "label": "--spec-type (是否开启MTP预测-需模型支持)", "default": "draft-mtp"},
-                {"key": "spec_draft_n_max", "label": "--spec-draft-n-max (额外预测token数)", "default": "2"},
-            ],
-        },
-        {
-            "title": "模型量化参数",
-            "note": "",
-            "checked": True,
-            "switches": [
-                {"key": "cache_type_k", "label": "--cache-type-k (是否开启k量化)", "default": "q8_0"},
-                {"key": "cache_type_v", "label": "--cache-type-v (是否开启v量化)", "default": "q8_0"},
-            ],
-        },
-        {
-            "title": "MOE 模型参数",
-            "note": "如果你不清楚什么是MOE模型，则下列参数均保持默认就好",
-            "checked": False,
-            "switches": [
-                {"key": "n_cpu_moe", "label": "--n-cpu-moe (分配cpu线程数，需小于等于cpu物理核心数)", "default": "", "show_input": True},
-                # {"key": "moe_router_type", "label": "--moe-router-type (指定MOE路由类型)", "default": "topk"},
-                # {"key": "top_k", "label": "--top-k (激活专家数)", "default": "9"},
-                {"key": "mmap", "label": "--mmap (启用内存映射，动态加载权重)", "default": "", "checked": True},
-                {"key": "no_mmap_fallback", "label": "--no-mmap-fallback (禁用回退加载模式，但可能导致显存爆炸，可尝试开启)", "default": ""},
-            ],
-        },
-    ]
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("新建启动脚本 - 选择参数")
-        self.setFixedWidth(620)
-        self._init_ui()
-
-    def _init_ui(self):
-        layout = QVBoxLayout(self)
-
-        tip = QLabel("勾选需要启用的参数，并填写对应值，需要注意llama.cpp版本，某些参数需要新版才能支持。如果发现某些参数启用后报错，则需要升级llamacpp版本，或者关闭该参数。")
-        tip.setWordWrap(True)
-        layout.addWidget(tip)
-
-        form = QFormLayout()
-        self.checkboxes = {}
-        self.value_inputs = {}
-
-        for cat in self.CATEGORIES:
-            if cat["title"]:
-                label = QLabel(cat["title"])
-                label.setStyleSheet(
-                    "font-weight: bold; font-size: 12px; padding: 8px 0 2px 0;"
-                )
-                form.addRow(label)
-
-            if cat["note"]:
-                note = QLabel(cat["note"])
-                note.setStyleSheet(
-                    "color: #cc6600; font-size: 11px; padding: 0 0 4px 0;"
-                )
-                note.setWordWrap(True)
-                form.addRow(note)
-
-            for sw in cat["switches"]:
-                cb = QCheckBox(sw["label"])
-                cb.setChecked(sw.get("checked", cat["checked"]))
-                self.checkboxes[sw["key"]] = cb
-
-                if sw.get("show_input", sw["default"] != ""):
-                    val_widget = QLineEdit(sw["default"])
-                else:
-                    val_widget = None
-                self.value_inputs[sw["key"]] = val_widget
-
-                row = QHBoxLayout()
-                row.addWidget(cb)
-                if val_widget:
-                    row.addWidget(val_widget)
-                row.addStretch()
-
-                form_row = QWidget()
-                form_row.setLayout(row)
-                form.addRow(form_row)
-
-        scroll = QWidget()
-        scroll.setLayout(form)
-        scroll_area = QScrollArea()
-        scroll_area.setMinimumHeight(300)
-        scroll_area.setWidget(scroll)
-        scroll_area.setWidgetResizable(True)
-        layout.addWidget(scroll_area)
-
-        button_box = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel,
-        )
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-
-    def get_config(self):
-        result = {}
-        for cat in self.CATEGORIES:
-            for sw in cat["switches"]:
-                cb = self.checkboxes[sw["key"]]
-                if cb.isChecked():
-                    if sw.get("show_input", sw["default"] != ""):
-                        val = self.value_inputs[sw["key"]].text().strip()
-                        if not val:
-                            continue
-                    else:
-                        val = ""
-                    result[sw["key"]] = val
-        return result
-
-
-class LogWorker(QThread):
-    log_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal()
-    server_ready_signal = pyqtSignal(str)
-    tps_signal = pyqtSignal(float)
-
-    def __init__(self, bat_path, process_service):
-        super().__init__()
-        self.bat_path = bat_path
-        self.process_service = process_service
-        self._running = False
-        self._url_emitted = False
-        self._url_pattern = re.compile(r"https?://\d+\.\d+\.\d+\.\d+:\d+")
-        self._tps_pattern = re.compile(
-            r"([\d.]+)\s+tokens?\s+per\s+second"
-        )
-
-    def run(self):
-        self._running = True
-        result = self.process_service.start_script(self.bat_path)
-        if result["success"]:
-            self.log_signal.emit(f"进程已启动，PID: {result['pid']}")
-        else:
-            self.log_signal.emit(f"启动失败: {result.get('error', '未知错误')}")
-
-        while self._running:
-            line = self.process_service.read_output()
-            if line:
-                if not self._url_emitted:
-                    m = self._url_pattern.search(line)
-                    if m:
-                        self._url_emitted = True
-                        self.server_ready_signal.emit(m.group())
-                tps_m = self._tps_pattern.search(line)
-                if tps_m:
-                    try:
-                        self.tps_signal.emit(float(tps_m.group(1)))
-                    except ValueError:
-                        pass
-                self.log_signal.emit(line)
-            if not self.process_service.is_process_alive():
-                break
-            self.msleep(200)
-
-        self.log_signal.emit("进程已结束")
-        self.finished_signal.emit()
-
-
-class CheckUpdateWorker(QThread):
-    result_signal = pyqtSignal(str, str)
-
-    def run(self):
-        try:
-            req = urllib.request.Request(
-                "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest",
-                headers={"User-Agent": "llamacpp-gui/1.0", "Accept": "application/vnd.github+json"},
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                published = data.get("published_at", "")
-                if published:
-                    dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
-                    self.result_signal.emit(dt.strftime("%Y-%m-%d"), "")
-                    return
-            self.result_signal.emit("", "未能获取到版本信息")
-        except Exception as e:
-            self.result_signal.emit("", str(e))
-
-
-class CheckAppUpdateWorker(QThread):
-    result_signal = pyqtSignal(str, str)
-
-    def run(self):
-        try:
-            req = urllib.request.Request(
-                "https://api.github.com/repos/kkblank/Llamacpp-gui/releases/latest",
-                headers={"User-Agent": "llamacpp-gui/1.0", "Accept": "application/vnd.github+json"},
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                published = data.get("published_at", "")
-                if published:
-                    dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
-                    self.result_signal.emit(dt.strftime("%Y-%m-%d"), "")
-                    return
-            self.result_signal.emit("", "未能获取到版本信息")
-        except Exception as e:
-            self.result_signal.emit("", str(e))
+from ui.dialogs.new_script_dialog import NewScriptDialog
+from ui.workers.log_worker import LogWorker
+from ui.workers.update_workers import CheckUpdateWorker, CheckAppUpdateWorker
 
 
 class MainWindow(QMainWindow):
@@ -284,8 +51,7 @@ class MainWindow(QMainWindow):
         self._load_saved_paths()
 
         self.monitor_service.start()
-
-        self._ensure_webui()
+        ensure_webui()
         self._start_bridge()
 
     def closeEvent(self, event):
@@ -307,16 +73,9 @@ class MainWindow(QMainWindow):
         control_widget = QWidget()
         control_layout = QVBoxLayout(control_widget)
 
-        # 路径配置面板
         control_layout.addWidget(self._create_path_panel())
-
-        # 脚本管理面板
         control_layout.addWidget(self._create_script_panel())
-
-        # 控制面板
         control_layout.addWidget(self._create_control_panel())
-
-        # 日志面板
         control_layout.addWidget(self._create_log_panel(), stretch=1)
 
         tabs.addTab(control_widget, "主控制")
@@ -334,7 +93,6 @@ class MainWindow(QMainWindow):
         group = QGroupBox("路径配置")
         layout = QVBoxLayout(group)
 
-        # llama.cpp 路径
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("llama-server.exe 路径:"))
         self.llamacpp_path_edit = QLineEdit()
@@ -345,7 +103,6 @@ class MainWindow(QMainWindow):
         row1.addWidget(browse_btn1)
         layout.addLayout(row1)
 
-        # 模型文件路径
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("模型文件 (.gguf):"))
         self.model_path_edit = QLineEdit()
@@ -356,7 +113,6 @@ class MainWindow(QMainWindow):
         row2.addWidget(browse_btn2)
         layout.addLayout(row2)
 
-        # 外挂视觉模型路径
         row3 = QHBoxLayout()
         row3.addWidget(QLabel("外挂视觉模型 (.gguf):"))
         self.visual_model_path_edit = QLineEdit()
@@ -375,7 +131,6 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # 左侧：脚本列表 + 操作按钮
         left_layout = QVBoxLayout()
         self.script_list = QListWidget()
         self.script_list.currentItemChanged.connect(self._on_script_selected)
@@ -396,7 +151,6 @@ class MainWindow(QMainWindow):
         left_panel = QWidget()
         left_panel.setLayout(left_layout)
 
-        # 右侧：脚本内容编辑器
         self.script_editor = QTextEdit()
         self.script_editor.setPlaceholderText("在此输入启动脚本内容。")
 
@@ -420,7 +174,7 @@ class MainWindow(QMainWindow):
         self.stop_btn.clicked.connect(self._stop_script)
         layout.addWidget(self.stop_btn)
 
-        self.status_label = QLabel("● 就绪")
+        self.status_label = QLabel("\u25cf 就绪")
         self.status_label.setStyleSheet(
             "color: green; font-size: 12px; font-weight: bold;"
         )
@@ -498,7 +252,7 @@ class MainWindow(QMainWindow):
             self, "选择 GGUF 模型文件", "", "GGUF Files (*.gguf)"
         )
         if path:
-            if validate_gguf_file(path):
+            if validate_gguf(path):
                 self.model_path_edit.setText(path)
                 self.settings.model_path = path
                 self.settings.save()
@@ -511,7 +265,7 @@ class MainWindow(QMainWindow):
             self, "选择外挂视觉模型文件", "", "GGUF Files (*.gguf)"
         )
         if path:
-            if validate_gguf_file(path):
+            if validate_gguf(path):
                 self.visual_model_path_edit.setText(path)
                 self.settings.visual_model_path = path
                 self.settings.save()
@@ -557,7 +311,10 @@ class MainWindow(QMainWindow):
         dialog = NewScriptDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             config = dialog.get_config()
-            bat_content = self._build_bat_content(exe_dir, model_path, config)
+            bat_content = build_bat_content(
+                exe_dir, model_path, config,
+                visual_model_path=self.settings.visual_model_path,
+            )
             self.script_editor.setPlainText(bat_content)
             self.current_script_name = name
             entry = ScriptEntry(name=name, content=bat_content, model_path=model_path)
@@ -567,62 +324,6 @@ class MainWindow(QMainWindow):
             if item:
                 self.script_list.setCurrentItem(item[0])
             self._append_log(f"脚本已新建并保存: {bat_path}")
-
-    def _build_bat_content(self, exe_dir, model_path, config):
-        lines = [
-            "@echo off",
-            f'cd /d "{exe_dir}"',
-            "llama-server.exe ^",
-            f'-m "{model_path}" ^',
-        ]
-
-        parts = []
-
-        if "gpu_layers" in config:
-            parts.append(f"--gpu-layers {config['gpu_layers']} ^")
-        if "port" in config:
-            parts.append(f"--port {config['port']} ^")
-        if "ctx_size" in config:
-            parts.append(f"--ctx-size {config['ctx_size']} ^")
-        if "alias" in config:
-            parts.append(f'--alias "{config["alias"]}" ^')
-        if "no_mmproj_offload" in config:
-            parts.append("--no-mmproj-offload ^")
-        if "mmproj" in config:
-            vpath = self.settings.visual_model_path
-            if vpath:
-                parts.append(f'--mmproj "{vpath}" ^')
-        if "reasoning" in config:
-            parts.append("--reasoning off ^")
-        if "main_gpu" in config:
-            parts.append(f"--main-gpu {config['main_gpu']} ^")
-        if "ts" in config:
-            parts.append(f"-ts {config['ts']} ^")
-        if "spec_type" in config:
-            parts.append(f"--spec-type {config['spec_type']} ^")
-        if "spec_draft_n_max" in config:
-            parts.append(f"--spec-draft-n-max {config['spec_draft_n_max']} ^")
-        if "cache_type_k" in config:
-            parts.append(f"--cache-type-k {config['cache_type_k']} ^")
-        if "cache_type_v" in config:
-            parts.append(f"--cache-type-v {config['cache_type_v']} ^")
-        if "n_cpu_moe" in config:
-            parts.append(f"--n-cpu-moe {config['n_cpu_moe']} ^")
-        if "moe_router_type" in config:
-            parts.append(f"--moe-router-type {config['moe_router_type']} ^")
-        if "top_k" in config:
-            parts.append(f"--top-k {config['top_k']} ^")
-        if "mmap" in config:
-            parts.append("--mmap ^")
-        if "no_mmap_fallback" in config:
-            parts.append("--no-mmap-fallback ^")
-        if "host" in config:
-            parts.append(f"--host {config['host']}")
-
-        if parts:
-            parts[-1] = parts[-1].rstrip(" ^")
-        lines.extend(parts)
-        return "\n".join(lines)
 
     def _save_script(self):
         if self.current_script_name:
@@ -690,7 +391,6 @@ class MainWindow(QMainWindow):
 
         bat_path = self.script_service.get_script_path(self.current_script_name)
         if not os.path.exists(bat_path):
-            # 如果脚本文件不存在，先保存
             entry = ScriptEntry(
                 name=self.current_script_name,
                 content=content,
@@ -710,7 +410,7 @@ class MainWindow(QMainWindow):
         self.is_running = True
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.status_label.setText("● 运行中")
+        self.status_label.setText("\u25cf 运行中")
         self.status_label.setStyleSheet(
             "color: orange; font-size: 12px; font-weight: bold;"
         )
@@ -725,7 +425,7 @@ class MainWindow(QMainWindow):
         self.is_running = False
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.status_label.setText("● 就绪")
+        self.status_label.setText("\u25cf 就绪")
         self.status_label.setStyleSheet(
             "color: green; font-size: 12px; font-weight: bold;"
         )
@@ -751,21 +451,10 @@ class MainWindow(QMainWindow):
         self.is_running = False
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.status_label.setText("● 就绪")
+        self.status_label.setText("\u25cf 就绪")
         self.status_label.setStyleSheet(
             "color: green; font-size: 12px; font-weight: bold;"
         )
-
-    def _ensure_webui(self):
-        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_webui")
-        dst = os.path.abspath("data/webui")
-        if not os.path.isdir(src):
-            return
-        os.makedirs(dst, exist_ok=True)
-        for fname in ["chat.html", "chat.css", "chat.js", "marked.min.js"]:
-            s = os.path.join(src, fname)
-            if os.path.exists(s):
-                shutil.copy2(s, os.path.join(dst, fname))
 
     def _start_bridge(self):
         try:
@@ -828,7 +517,3 @@ def main():
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()
