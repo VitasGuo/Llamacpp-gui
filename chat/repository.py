@@ -5,6 +5,7 @@ import urllib.request
 from datetime import datetime
 
 from .models import DEFAULT_AGENT
+from .image_compressor import compress_image_data_url
 
 # 路径常量
 CHAT_DIR = os.path.abspath("data/chat")
@@ -148,6 +149,32 @@ def migrate_convs():
                 conv["agents"] = []
             write_conv_file(conv)
         os.remove(old_file)
+
+
+def migrate_conversation_images():
+    """压缩旧对话中的内嵌图片，压缩成功的图片打上 _optimized 标记。"""
+    for conv in list_conversations():
+        changed = False
+        for message in conv.get("messages", []):
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get("_optimized"):
+                    continue
+                image_url = part.get("image_url")
+                if not isinstance(image_url, dict):
+                    continue
+                url = image_url.get("url")
+                if not isinstance(url, str) or not url.startswith("data:image/"):
+                    continue
+                compressed = compress_image_data_url(url)
+                if compressed is not None:
+                    image_url["url"] = compressed
+                    part["_optimized"] = True
+                    changed = True
+        if changed:
+            write_conv_file(conv)
 
 
 # ─── Memory CRUD ─────────────────────────────────────────

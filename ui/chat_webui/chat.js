@@ -29,6 +29,8 @@ const state = {
 
 const PRESET_EMOJIS = ['🤖','🌐','💻','✍️','📚','🎨','🧠','⚡','🎯','🔧','🗣','📝'];
 const AVATAR_COLORS = ['#4f8cff','#e74c5c','#2ecc71','#f39c12','#9b59b6','#1abc9c','#e67e22','#3498db'];
+const MAX_IMAGE_SIDE = 768;
+const JPEG_QUALITY = 0.7;
 
 /* ===== Init ===== */
 async function init() {
@@ -535,8 +537,18 @@ function buildUserMessage(text, images) {
   if (images.length === 0) return { role: 'user', content: text };
   const parts = [];
   if (text) parts.push({ type: 'text', text });
-  for (const img of images) parts.push({ type: 'image_url', image_url: { url: img.dataUrl } });
+  for (const img of images) parts.push({ type: 'image_url', image_url: { url: img.dataUrl }, _optimized: true });
   return { role: 'user', content: parts };
+}
+
+function cleanContentForLLM(content) {
+  if (!Array.isArray(content)) return content;
+  return content.map(({ type, text, image_url }) => {
+    const clean = { type };
+    if (text !== undefined) clean.text = text;
+    if (image_url !== undefined) clean.image_url = image_url;
+    return clean;
+  });
 }
 
 function getRecentMessages(rounds) {
@@ -565,7 +577,7 @@ function buildMessagesForAgent(agent) {
   const msgs = getRecentMessages(state.maxContextRounds);
   for (const msg of msgs) {
     if (msg.role === 'system') continue;
-    let content = msg.content;
+    let content = cleanContentForLLM(msg.content);
     if (msg.role === 'assistant' && msg.agent_name && msg.agent_name !== agent.name) {
       content = `[${msg.agent_name}]: ${content}`;
     }
@@ -790,16 +802,64 @@ async function removeParticipant(id) {
 }
 
 /* ===== Image Handling ===== */
-function handleImageUpload(files) {
+async function handleImageUpload(files) {
   for (const file of files) {
     if (!file.type.startsWith('image/')) continue;
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      state.pendingImages.push({ file, dataUrl: e.target.result, name: file.name });
+    try {
+      const dataUrl = await compressImageFile(file);
+      state.pendingImages.push({ file, dataUrl, name: file.name });
       renderImagePreviews();
-    };
-    reader.readAsDataURL(file);
+    } catch {}
   }
+}
+
+function loadImageFile(file) {
+  if (typeof createImageBitmap === 'function') {
+    return createImageBitmap(file, { imageOrientation: 'from-image' }).catch(() => loadImageElement(file));
+  }
+  return loadImageElement(file);
+}
+
+function loadImageElement(file) {
+  return new Promise((resolve, reject) => {
+    const objectUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      resolve(img);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error('图片加载失败'));
+    };
+    img.src = objectUrl;
+  });
+}
+
+function compressImageFile(file) {
+  return loadImageFile(file).then((source) => new Promise((resolve, reject) => {
+    const scale = Math.min(1, MAX_IMAGE_SIDE / Math.max(source.width, source.height));
+    const width = Math.max(1, Math.round(source.width * scale));
+    const height = Math.max(1, Math.round(source.height * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, width, height);
+    ctx.drawImage(source, 0, 0, width, height);
+    if (typeof source.close === 'function') source.close();
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        reject(new Error('图片压缩失败'));
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('图片编码失败'));
+      reader.readAsDataURL(blob);
+    }, 'image/jpeg', JPEG_QUALITY);
+  }));
 }
 
 function removeImage(idx) { state.pendingImages.splice(idx, 1); renderImagePreviews(); }

@@ -9,6 +9,7 @@ from .repository import (
     CHAT_DIR,
     migrate_agents,
     migrate_convs,
+    migrate_conversation_images,
     rebuild_task_index,
 )
 from .scheduler import SchedulerService
@@ -31,6 +32,7 @@ def start_bridge():
     os.makedirs(CHAT_DIR, exist_ok=True)
     migrate_agents()
     migrate_convs()
+    migrate_conversation_images()
     rebuild_task_index()
 
     port = find_free_port()
