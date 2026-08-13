@@ -22,6 +22,7 @@ const state = {
   scrollLocked: false,
   theme: 'dark',
   fontSize: 'normal',
+  sidebarCollapsed: false,
   tasks: [],
   conversationUpdatedAt: '',
   pollTimer: null,
@@ -40,6 +41,7 @@ async function init() {
   if (saved.maxContextRounds != null) state.maxContextRounds = saved.maxContextRounds;
   if (saved.theme) state.theme = saved.theme;
   if (saved.fontSize) state.fontSize = saved.fontSize;
+  if (saved.sidebarCollapsed != null) state.sidebarCollapsed = saved.sidebarCollapsed;
 
   document.getElementById('setting-api-url').value = state.llamaUrl;
   document.getElementById('setting-reasoning-display').value = state.reasoningDisplay;
@@ -48,6 +50,7 @@ async function init() {
 
   applyTheme(state.theme);
   applyFontSize(state.fontSize);
+  applySidebar();
 
   await loadAgents();
   await loadConversations();
@@ -75,7 +78,16 @@ function saveLocalSettings() {
     maxContextRounds: state.maxContextRounds,
     theme: state.theme,
     fontSize: state.fontSize,
+    sidebarCollapsed: state.sidebarCollapsed,
   }));
+}
+
+function applySidebar() {
+  const sidebar = document.getElementById('sidebar');
+  const btn = document.getElementById('btn-sidebar-toggle');
+  sidebar.classList.toggle('collapsed', state.sidebarCollapsed);
+  btn.textContent = state.sidebarCollapsed ? '»' : '«';
+  btn.title = state.sidebarCollapsed ? '展开侧栏' : '收起侧栏';
 }
 
 /* ===== Connection ===== */
@@ -1342,6 +1354,12 @@ function highlightEmojiOption(avatar) {
 
 /* ===== Events ===== */
 function bindEvents() {
+  document.getElementById('btn-sidebar-toggle').addEventListener('click', () => {
+    state.sidebarCollapsed = !state.sidebarCollapsed;
+    applySidebar();
+    saveLocalSettings();
+  });
+
   document.getElementById('btn-send').addEventListener('click', sendMessage);
   document.getElementById('btn-stop').addEventListener('click', stopGeneration);
 

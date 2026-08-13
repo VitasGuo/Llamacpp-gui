@@ -4,15 +4,14 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QLabel, QFileDialog,
-    QMessageBox, QProgressBar, QStackedWidget, QCheckBox, QSplitter,
+    QMessageBox, QProgressBar, QStackedWidget, QCheckBox, QSplitter, QComboBox,
     QAbstractItemView,
 )
 from PyQt6.QtCore import Qt
 
 from config.config import Settings
-from service.modelscope import search_models, list_model_files
+from service import model_sources
 from service.download_service import DownloadManager
-from model.download_entry import DownloadEntry
 
 
 def _format_size(size_bytes):
@@ -50,7 +49,10 @@ class ModelTab(QWidget):
         super().__init__()
         self.settings = Settings.get_instance()
         self.download_manager = DownloadManager()
+        self._current_source = model_sources.SOURCE_MODELSCOPE
         self._current_page = 1
+        self._page_size = 20
+        self._has_next = False
         self._current_keyword = ""
         self._total_count = 0
         self._current_model_id = ""
@@ -80,18 +82,20 @@ class ModelTab(QWidget):
         bottom_layout = QVBoxLayout(bottom_widget)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         bottom_layout.addWidget(QLabel("下载队列"))
-        self.queue_table = QTableWidget(0, 5)
-        self.queue_table.setHorizontalHeaderLabels(["文件名", "进度", "速度", "状态", "操作"])
+        self.queue_table = QTableWidget(0, 6)
+        self.queue_table.setHorizontalHeaderLabels(["来源", "文件名", "进度", "速度", "状态", "操作"])
         self.queue_table.horizontalHeader().setStretchLastSection(False)
-        self.queue_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.queue_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.queue_table.setColumnWidth(1, 160)
+        self.queue_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.queue_table.setColumnWidth(0, 150)
+        self.queue_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.queue_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.queue_table.setColumnWidth(2, 80)
+        self.queue_table.setColumnWidth(2, 160)
         self.queue_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.queue_table.setColumnWidth(3, 70)
+        self.queue_table.setColumnWidth(3, 80)
         self.queue_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self.queue_table.setColumnWidth(4, 120)
+        self.queue_table.setColumnWidth(4, 70)
+        self.queue_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.queue_table.setColumnWidth(5, 120)
         self.queue_table.verticalHeader().setVisible(False)
         self.queue_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.queue_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -109,6 +113,19 @@ class ModelTab(QWidget):
 
     def _build_search_bar(self):
         bar = QHBoxLayout()
+        bar.addWidget(QLabel("来源:"))
+        self.source_combo = QComboBox()
+        self.source_combo.addItem(
+            model_sources.get_label(model_sources.SOURCE_MODELSCOPE),
+            model_sources.SOURCE_MODELSCOPE,
+        )
+        self.source_combo.addItem(
+            model_sources.get_label(model_sources.SOURCE_HF_MIRROR),
+            model_sources.SOURCE_HF_MIRROR,
+        )
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        bar.addWidget(self.source_combo)
+
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("输入关键词搜索 ModelScope 模型...")
         self.search_btn = QPushButton("搜索")
@@ -125,11 +142,11 @@ class ModelTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.result_table = QTableWidget(0, 5)
-        self.result_table.setHorizontalHeaderLabels(["模型ID", "参数", "下载量", "更新日期", "操作"])
+        self.result_table.setHorizontalHeaderLabels(["模型ID", "参数/标签", "下载量", "更新日期", "操作"])
         self.result_table.horizontalHeader().setStretchLastSection(False)
         self.result_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.result_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.result_table.setColumnWidth(1, 80)
+        self.result_table.setColumnWidth(1, 120)
         self.result_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         self.result_table.setColumnWidth(2, 70)
         self.result_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
@@ -223,24 +240,44 @@ class ModelTab(QWidget):
     def _load_search_page(self):
         self.search_btn.setEnabled(False)
         self.search_btn.setText("搜索中...")
-        result = search_models(self._current_keyword, self._current_page)
+        result = model_sources.search_models(
+            self._current_source,
+            self._current_keyword,
+            self._current_page,
+            self._page_size,
+        )
         self.search_btn.setEnabled(True)
         self.search_btn.setText("搜索")
+        error = result.get("error")
+        if error:
+            QMessageBox.warning(self, "搜索失败", f"来源 {model_sources.get_label(self._current_source)} 搜索失败：{error}")
         self._total_count = result.get("total_count", 0)
         models = result.get("models", [])
         page_size = result.get("page_size", 20)
+        self._page_size = page_size
+        has_next = result.get("has_next")
+        if has_next is None:
+            has_next = self._current_page * page_size < self._total_count
+        self._has_next = has_next
 
-        total_pages = max(1, (self._total_count + page_size - 1) // page_size)
-        self.page_label.setText(f"第 {self._current_page}/{total_pages} 页")
+        if self._total_count > 0:
+            total_pages = max(1, (self._total_count + page_size - 1) // page_size)
+            self.page_label.setText(f"第 {self._current_page}/{total_pages} 页")
+        else:
+            self.page_label.setText(f"第 {self._current_page} 页")
         self.prev_btn.setEnabled(self._current_page > 1)
-        self.next_btn.setEnabled(self._current_page < total_pages)
+        self.next_btn.setEnabled(self._has_next)
 
         self.result_table.setRowCount(0)
         for row, m in enumerate(models):
             self.result_table.insertRow(row)
             mid = m.get("id", "")
             self.result_table.setItem(row, 0, QTableWidgetItem(mid))
-            self.result_table.setItem(row, 1, QTableWidgetItem(_format_params(m.get("params", 0))))
+            if self._current_source == model_sources.SOURCE_HF_MIRROR:
+                tag_text = m.get("pipeline_tag") or m.get("library_name") or ""
+                self.result_table.setItem(row, 1, QTableWidgetItem(tag_text))
+            else:
+                self.result_table.setItem(row, 1, QTableWidgetItem(_format_params(m.get("params", 0))))
             self.result_table.setItem(row, 2, QTableWidgetItem(str(m.get("downloads", 0))))
             self.result_table.setItem(row, 3, QTableWidgetItem(_format_date(m.get("last_modified", ""))))
 
@@ -250,25 +287,44 @@ class ModelTab(QWidget):
 
         self.stack.setCurrentIndex(0)
 
+    def _on_source_changed(self):
+        source = self.source_combo.currentData()
+        if source == self._current_source:
+            return
+        self._current_source = source
+        self._current_keyword = ""
+        self._current_page = 1
+        self._has_next = False
+        self._total_count = 0
+        self.search_input.clear()
+        if source == model_sources.SOURCE_HF_MIRROR:
+            self.search_input.setPlaceholderText("输入关键词搜索 Hugging Face 模型...")
+        else:
+            self.search_input.setPlaceholderText("输入关键词搜索 ModelScope 模型...")
+        self.result_table.setRowCount(0)
+        self.page_label.setText("第 0 页")
+        self.prev_btn.setEnabled(False)
+        self.next_btn.setEnabled(False)
+        self.stack.setCurrentIndex(0)
+
     def _prev_page(self):
         if self._current_page > 1:
             self._current_page -= 1
             self._load_search_page()
 
     def _next_page(self):
-        page_size = 20
-        total_pages = max(1, (self._total_count + page_size - 1) // page_size)
-        if self._current_page < total_pages:
+        if self._has_next:
             self._current_page += 1
             self._load_search_page()
 
     def _show_file_list(self, model_id):
         self._current_model_id = model_id
-        self.filelist_model_label.setText(f"当前模型: {model_id}")
+        source_label = model_sources.get_label(self._current_source)
+        self.filelist_model_label.setText(f"当前模型 [{source_label}]: {model_id}")
         self.filelist_model_label.setStyleSheet("font-weight: bold;")
 
         self.file_table.setRowCount(0)
-        files = list_model_files(model_id)
+        files = model_sources.list_model_files(self._current_source, model_id)
         gguf_files = [f for f in files if f.get("Path", "").lower().endswith(".gguf")]
 
         if not gguf_files:
@@ -337,9 +393,13 @@ class ModelTab(QWidget):
                             size = int(float(size_text.replace("KB", "")) * 10 ** 3)
                     except ValueError:
                         pass
-            ok = self.download_manager.start_download(self._current_model_id, file_path, size, dl_path)
+            ok = self.download_manager.start_download(
+                self._current_source, self._current_model_id, file_path, size, dl_path
+            )
             if ok:
-                entry = self.download_manager.download_queue.find(self._current_model_id, file_path)
+                entry = self.download_manager.download_queue.find(
+                    self._current_source, self._current_model_id, file_path
+                )
                 if entry:
                     self._add_queue_row(entry)
                 started += 1
@@ -354,17 +414,21 @@ class ModelTab(QWidget):
         if not os.path.isdir(dl_path):
             QMessageBox.warning(self, "提示", "下载目录不存在")
             return
-        ok = self.download_manager.start_download(model_id, file_path, file_size, dl_path)
+        ok = self.download_manager.start_download(
+            self._current_source, model_id, file_path, file_size, dl_path
+        )
         if not ok:
             return
-        entry = self.download_manager.download_queue.find(model_id, file_path)
+        entry = self.download_manager.download_queue.find(
+            self._current_source, model_id, file_path
+        )
         if entry:
             self._add_queue_row(entry)
 
     def _add_queue_row(self, entry):
         for row in range(self.queue_table.rowCount()):
-            item = self.queue_table.item(row, 0)
-            if item and item.text() == entry.filename and item.data(Qt.ItemDataRole.UserRole) == entry.file_path:
+            item = self.queue_table.item(row, 1)
+            if item and item.data(Qt.ItemDataRole.UserRole) == (entry.source, entry.file_path):
                 self._update_queue_row(row, entry)
                 self._set_queue_actions(row, entry)
                 return
@@ -372,26 +436,29 @@ class ModelTab(QWidget):
         row = self.queue_table.rowCount()
         self.queue_table.insertRow(row)
 
+        source_item = QTableWidgetItem(model_sources.get_short_label(entry.source))
+        self.queue_table.setItem(row, 0, source_item)
+
         name_item = QTableWidgetItem(entry.filename)
-        name_item.setData(Qt.ItemDataRole.UserRole, entry.file_path)
-        self.queue_table.setItem(row, 0, name_item)
+        name_item.setData(Qt.ItemDataRole.UserRole, (entry.source, entry.file_path))
+        self.queue_table.setItem(row, 1, name_item)
 
         prog = QProgressBar()
         prog.setMinimum(0)
         prog.setMaximum(100)
         prog.setValue(entry.progress)
-        self.queue_table.setCellWidget(row, 1, prog)
+        self.queue_table.setCellWidget(row, 2, prog)
 
-        self.queue_table.setItem(row, 2, QTableWidgetItem(""))
-        self.queue_table.setItem(row, 3, QTableWidgetItem(entry.status))
+        self.queue_table.setItem(row, 3, QTableWidgetItem(""))
+        self.queue_table.setItem(row, 4, QTableWidgetItem(entry.status))
 
         self._set_queue_actions(row, entry)
 
     def _update_queue_row(self, row, entry):
-        prog = self.queue_table.cellWidget(row, 1)
+        prog = self.queue_table.cellWidget(row, 2)
         if isinstance(prog, QProgressBar):
             prog.setValue(entry.progress)
-        self.queue_table.item(row, 3).setText(entry.status)
+        self.queue_table.item(row, 4).setText(entry.status)
 
     def _set_queue_actions(self, row, entry):
         container = QWidget()
@@ -399,7 +466,7 @@ class ModelTab(QWidget):
         layout.setContentsMargins(2, 0, 2, 0)
         layout.setSpacing(4)
 
-        worker_active = self.download_manager.is_worker_active(entry.file_path)
+        worker_active = self.download_manager.is_worker_active(entry.source, entry.file_path)
         if entry.status == "downloading" and worker_active:
             pause_btn = QPushButton("暂停")
             pause_btn.clicked.connect(lambda: self._pause_download(entry))
@@ -423,54 +490,57 @@ class ModelTab(QWidget):
             remove_btn.clicked.connect(lambda: self._remove_queue_row(row, entry))
             layout.addWidget(remove_btn)
 
-        self.queue_table.setCellWidget(row, 4, container)
+        self.queue_table.setCellWidget(row, 5, container)
 
-    def _on_dl_progress(self, file_path, current, total):
-        entry = self._find_entry(file_path)
+    def _on_dl_progress(self, source, file_path, current, total):
+        entry = self._find_entry(source, file_path)
         if entry:
             for row in range(self.queue_table.rowCount()):
-                item = self.queue_table.item(row, 0)
-                if item and item.data(Qt.ItemDataRole.UserRole) == file_path:
+                item = self.queue_table.item(row, 1)
+                if item and item.data(Qt.ItemDataRole.UserRole) == (source, file_path):
                     self._update_queue_row(row, entry)
                     break
 
-    def _on_dl_speed(self, file_path, speed):
+    def _on_dl_speed(self, source, file_path, speed):
         for row in range(self.queue_table.rowCount()):
-            item = self.queue_table.item(row, 0)
-            if item and item.data(Qt.ItemDataRole.UserRole) == file_path:
+            item = self.queue_table.item(row, 1)
+            if item and item.data(Qt.ItemDataRole.UserRole) == (source, file_path):
                 if speed >= 10 ** 6:
                     text = f"{speed / 10 ** 6:.1f}MB/s"
                 else:
                     text = f"{speed / 10 ** 3:.1f}KB/s"
-                self.queue_table.item(row, 2).setText(text)
+                self.queue_table.item(row, 3).setText(text)
                 break
 
-    def _on_dl_finished(self, file_path, success, error):
-        entry = self._find_entry(file_path)
+    def _on_dl_finished(self, source, file_path, success, error):
+        entry = self._find_entry(source, file_path)
         if entry:
             for row in range(self.queue_table.rowCount()):
-                item = self.queue_table.item(row, 0)
-                if item and item.data(Qt.ItemDataRole.UserRole) == file_path:
+                item = self.queue_table.item(row, 1)
+                if item and item.data(Qt.ItemDataRole.UserRole) == (source, file_path):
                     self._update_queue_row(row, entry)
                     self._set_queue_actions(row, entry)
                     break
         else:
             self._refresh_queue_ui()
 
-    def _find_entry(self, file_path):
+    def _find_entry(self, source, file_path):
         for e in self.download_manager.entries:
-            if e.file_path == file_path:
+            if e.source == source and e.file_path == file_path:
                 return e
         return None
 
     def _refresh_queue_ui(self):
         """全量刷新队列 UI，保持与 DownloadManager 状态同步。"""
         for row in range(self.queue_table.rowCount()):
-            item = self.queue_table.item(row, 0)
+            item = self.queue_table.item(row, 1)
             if not item:
                 continue
-            fp = item.data(Qt.ItemDataRole.UserRole)
-            entry = self._find_entry(fp)
+            key = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(key, tuple):
+                continue
+            source, fp = key
+            entry = self._find_entry(source, fp)
             if entry:
                 self._update_queue_row(row, entry)
                 self._set_queue_actions(row, entry)

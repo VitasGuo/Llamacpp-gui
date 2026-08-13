@@ -62,8 +62,17 @@ html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Sego
 /* Layout */
 #main-layout { display: flex; flex: 1; overflow: hidden; }
 
-#sidebar { width: 240px; background: var(--bg-surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow-y: auto; flex-shrink: 0; }
-#conv-list { flex: 1; padding: 8px; }
+#sidebar { width: 240px; background: var(--bg-surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0; transition: width 0.18s ease; }
+#sidebar-header { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+#sidebar-title { font-size: 0.929em; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sidebar-toggle { width: 28px; height: 28px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; border: none; border-radius: var(--radius-sm); background: transparent; color: var(--text-dim); cursor: pointer; font-size: 1em; line-height: 1; transition: background 0.15s, color 0.15s; }
+.sidebar-toggle:hover { background: var(--bg-hover); color: var(--text); }
+#sidebar.collapsed { width: 44px; }
+#sidebar.collapsed #sidebar-title,
+#sidebar.collapsed #conv-list,
+#sidebar.collapsed #conv-empty { display: none; }
+#sidebar.collapsed #sidebar-header { justify-content: center; border-bottom: none; padding: 8px 0; }
+#conv-list { flex: 1; padding: 8px; overflow-y: auto; }
 #conv-empty { display: none; }
 #conv-list:empty + #conv-empty { display: block; }
 

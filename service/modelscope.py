@@ -1,12 +1,8 @@
 import json
-import os
 import urllib.request
-import urllib.error
 
 API_BASE = "https://modelscope.ai/openapi/v1"
 LEGACY_BASE = "https://modelscope.cn/api/v1/models"
-
-CHUNK_SIZE = 1024 * 1024
 
 
 def search_models(keyword: str, page: int = 1, page_size: int = 20) -> dict:
@@ -48,38 +44,3 @@ def get_download_url(model_id: str, file_path: str, revision: str = "master") ->
     quoted_path = urllib.request.quote(file_path, safe="")
     quoted_rev = urllib.request.quote(revision, safe="")
     return f"{LEGACY_BASE}/{quoted_id}/repo?Revision={quoted_rev}&FilePath={quoted_path}"
-
-
-def download_file(url: str, dest_path: str, resume_pos: int = 0, chunk_callback=None):
-    headers = {
-        "User-Agent": "llamacpp-gui/1.0",
-    }
-    if resume_pos > 0:
-        headers["Range"] = f"bytes={resume_pos}-"
-
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    mode = "ab" if resume_pos > 0 else "wb"
-
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        total = resume_pos
-        if resume_pos == 0:
-            content_length = resp.headers.get("Content-Length")
-            if content_length:
-                total = int(content_length)
-        else:
-            content_range = resp.headers.get("Content-Range", "")
-            if "/" in content_range:
-                total = int(content_range.split("/")[1])
-
-        with open(dest_path, mode) as f:
-            while True:
-                chunk = resp.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                f.write(chunk)
-                resume_pos += len(chunk)
-                if chunk_callback:
-                    chunk_callback(resume_pos, total)
-
-    return resume_pos, total

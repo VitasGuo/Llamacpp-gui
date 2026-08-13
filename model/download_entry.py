@@ -9,6 +9,7 @@ from config import DOWNLOAD_QUEUE_FILE
 class DownloadEntry:
     model_id: str
     file_path: str
+    source: str = "modelscope"
     file_size: int = 0
     dest_path: str = ""
     downloaded: int = 0
@@ -26,6 +27,7 @@ class DownloadEntry:
 
     def to_dict(self):
         return {
+            "source": self.source,
             "model_id": self.model_id,
             "file_path": self.file_path,
             "file_size": self.file_size,
@@ -37,6 +39,7 @@ class DownloadEntry:
     @classmethod
     def from_dict(cls, d):
         return cls(
+            source=d.get("source", "modelscope"),
             model_id=d.get("model_id", ""),
             file_path=d.get("file_path", ""),
             file_size=d.get("file_size", 0),
@@ -62,9 +65,9 @@ class DownloadQueue:
     def update(self, entry: DownloadEntry):
         self._save()
 
-    def find(self, model_id: str, file_path: str):
+    def find(self, source: str, model_id: str, file_path: str):
         for e in self.entries:
-            if e.model_id == model_id and e.file_path == file_path:
+            if e.source == source and e.model_id == model_id and e.file_path == file_path:
                 return e
         return None
 
