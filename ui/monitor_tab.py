@@ -66,7 +66,25 @@ class GpuCard(QFrame):
         mem_row.setSpacing(8)
         layout.addLayout(mem_row)
 
-    def update(self, util_pct, mem_used, mem_total):
+        # 温度：0–100°C 进度条（沿用 _bar_style：≥80°C 红色预警）
+        self.temp_bar = QProgressBar()
+        self.temp_bar.setRange(0, 100)
+        self.temp_bar.setFixedHeight(18)
+        self.temp_label = QLabel("--°C")
+        self.temp_label.setFixedWidth(60)
+        temp_row = QHBoxLayout()
+        temp_row.addWidget(QLabel("  温度  "))
+        temp_row.addWidget(self.temp_bar, 1)
+        temp_row.addWidget(self.temp_label)
+        temp_row.setSpacing(8)
+        layout.addLayout(temp_row)
+
+        # 功耗：无固定量程，用文本展示（µW → W 在 service 层换算）
+        self.power_label = QLabel("功耗: -- W")
+        self.power_label.setStyleSheet("color: #555;")
+        layout.addWidget(self.power_label)
+
+    def update(self, util_pct, mem_used, mem_total, temp=None, power_w=None):
         self.util_bar.setValue(int(util_pct))
         self.util_bar.setStyleSheet(_bar_style(util_pct))
         self.util_label.setText(f"{util_pct:.0f}%")
@@ -75,6 +93,19 @@ class GpuCard(QFrame):
         self.mem_bar.setValue(int(pct))
         self.mem_bar.setStyleSheet(_bar_style(pct))
         self.mem_label.setText(f"{_fmt_bytes(mem_used)} / {_fmt_bytes(mem_total)}")
+
+        if temp is None:
+            self.temp_bar.setValue(0)
+            self.temp_label.setText("N/A")
+        else:
+            self.temp_bar.setValue(min(max(int(temp), 0), 100))
+            self.temp_bar.setStyleSheet(_bar_style(temp))
+            self.temp_label.setText(f"{temp:.0f}°C")
+
+        if power_w is None:
+            self.power_label.setText("功耗: N/A")
+        else:
+            self.power_label.setText(f"功耗: {power_w:.1f} W")
 
 
 class TpsChart(QWidget):
@@ -380,4 +411,7 @@ class MonitorTab(QWidget):
             c.deleteLater()
 
         for i, info in enumerate(gpus):
-            self._gpu_cards[i].update(info["util"], info["mem_used"], info["mem_total"])
+            self._gpu_cards[i].update(
+                info["util"], info["mem_used"], info["mem_total"],
+                info.get("temp"), info.get("power_w"),
+            )

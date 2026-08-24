@@ -226,6 +226,9 @@ class MonitorService(QObject):
                 nvmlDeviceGetUtilizationRates,
                 nvmlDeviceGetMemoryInfo,
                 nvmlDeviceGetName,
+                nvmlDeviceGetTemperature,
+                nvmlDeviceGetPowerUsage,
+                NVML_TEMPERATURE_GPU,
             )
             results = []
             for handle in self._gpu_handles:
@@ -236,11 +239,25 @@ class MonitorService(QObject):
                     name = name_raw.decode("utf-8", errors="replace")
                 else:
                     name = name_raw
+                # 温度/功耗独立容错：部分卡型可能不支持其中一项（NVML 报错），
+                # 单项失败不影响其余指标，缺失以 None 推送（UI 显示 N/A）
+                temp_c = None
+                try:
+                    temp_c = nvmlDeviceGetTemperature(handle, NVML_TEMPERATURE_GPU)
+                except Exception:
+                    pass
+                power_w = None
+                try:
+                    power_w = nvmlDeviceGetPowerUsage(handle) / 1_000_000  # µW → W
+                except Exception:
+                    pass
                 results.append({
                     "name": name,
                     "util": util.gpu,
                     "mem_used": mem.used,
                     "mem_total": mem.total,
+                    "temp": temp_c,
+                    "power_w": power_w,
                 })
             return results
         except Exception as e:
