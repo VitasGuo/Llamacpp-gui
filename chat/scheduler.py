@@ -25,7 +25,8 @@ class SchedulerService:
         self._running = False
         self._thread = None
         self._executing = set()
-        self._last_tick_error_log = 0.0
+        self._last_tick_error_log = None
+        self._last_skip_log_ts = {}
 
     def start(self):
         self._running = True
@@ -41,8 +42,8 @@ class SchedulerService:
                 self._tick()
             except Exception as e:
                 # 保留 try/except 防守护线程死亡；记日志并 60s 节流（防异常持续时刷日志）
-                now = time.time()
-                if now - self._last_tick_error_log >= 60:
+                now = time.monotonic()
+                if self._last_tick_error_log is None or now - self._last_tick_error_log >= 60:
                     self._last_tick_error_log = now
                     error(f"[scheduler] _tick 异常: {e}\n{traceback.format_exc()}")
             time.sleep(1)
@@ -67,7 +68,12 @@ class SchedulerService:
             settings = read_settings()
             llm_url = settings.get("llm_url", "")
             if not llm_url:
-                error(f"[scheduler] No llm_url，跳过任务 {task_id}")
+                # 任务到期后每秒都会进到这里，日志 60s 内至多记一条，避免刷量
+                now = time.monotonic()
+                last = self._last_skip_log_ts.get(task_id)
+                if last is None or now - last >= 60:
+                    self._last_skip_log_ts[task_id] = now
+                    error(f"[scheduler] No llm_url，跳过任务 {task_id}")
                 return
 
             conv = None
