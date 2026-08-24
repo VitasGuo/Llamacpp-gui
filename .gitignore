@@ -112,3 +112,4 @@ config/local_*.py
 /dist
 打包命令.txt
 需求.md
+.agent-teams

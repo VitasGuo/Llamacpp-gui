@@ -1,4 +1,5 @@
 """新建启动脚本的参数选择对话框。"""
+from PyQt6.QtGui import QIntValidator
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QCheckBox, QDialog, QDialogButtonBox, QScrollArea,
@@ -52,6 +53,8 @@ class NewScriptDialog(QDialog):
 
                 if sw.get("show_input", sw["default"] != ""):
                     val_widget = QLineEdit(sw["default"])
+                    if sw.get("numeric"):
+                        val_widget.setValidator(QIntValidator(0, 1000000000))
                 else:
                     val_widget = None
                 self.value_inputs[sw["key"]] = val_widget

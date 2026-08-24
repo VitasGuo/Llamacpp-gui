@@ -14,6 +14,16 @@ CATEGORIES = [
         ],
     },
     {
+        "title": "并发与批处理参数",
+        "note": "",
+        "checked": False,
+        "switches": [
+            {"key": "np", "label": "-np (最大并发数量)", "default": "2", "numeric": True},
+            {"key": "b", "label": "-b (逻辑批处理上限)", "default": "2048", "numeric": True},
+            {"key": "ub", "label": "-ub (物理批处理上限)", "default": "1024", "numeric": True},
+        ],
+    },
+    {
         "title": "模型参数",
         "note": "",
         "checked": False,
@@ -75,6 +85,12 @@ def build_bat_content(exe_dir, model_path, config, visual_model_path=""):
         parts.append(f"--ctx-size {config['ctx_size']} ^")
     if "alias" in config:
         parts.append(f'--alias "{config["alias"]}" ^')
+    if "np" in config:
+        parts.append(f"-np {config['np']} ^")
+    if "b" in config:
+        parts.append(f"-b {config['b']} ^")
+    if "ub" in config:
+        parts.append(f"-ub {config['ub']} ^")
     if "no_mmproj_offload" in config:
         parts.append("--no-mmproj-offload ^")
     if "mmproj" in config:
