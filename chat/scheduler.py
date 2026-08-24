@@ -1,6 +1,7 @@
 """定时任务调度器。"""
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta
 
 from .log import error
@@ -15,11 +16,16 @@ from .repository import (
 )
 
 
+# 错误摘要落盘上限（last_error / last_result 共用），完整 traceback 只进日志文件
+_ERROR_SUMMARY_MAX = 200
+
+
 class SchedulerService:
     def __init__(self):
         self._running = False
         self._thread = None
         self._executing = set()
+        self._last_tick_error_log = 0.0
 
     def start(self):
         self._running = True
@@ -33,8 +39,12 @@ class SchedulerService:
         while self._running:
             try:
                 self._tick()
-            except Exception:
-                pass
+            except Exception as e:
+                # 保留 try/except 防守护线程死亡；记日志并 60s 节流（防异常持续时刷日志）
+                now = time.time()
+                if now - self._last_tick_error_log >= 60:
+                    self._last_tick_error_log = now
+                    error(f"[scheduler] _tick 异常: {e}\n{traceback.format_exc()}")
             time.sleep(1)
 
     def _tick(self):
@@ -107,6 +117,9 @@ class SchedulerService:
 
             task["last_run_time"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             task["last_result"] = response[:200]
+            # 成功：清空错误状态
+            task["last_error"] = ""
+            task["error_count"] = 0
 
             now = datetime.now()
             interval = task.get("interval_seconds", 3600)
@@ -116,7 +129,49 @@ class SchedulerService:
             write_conv_file(conv)
             rebuild_task_index()
 
-        except Exception:
-            pass
+        except Exception as e:
+            # 记日志（含 traceback）并回写错误状态 + 推进 next_run_time（失败退避，
+            # 避免 LLM 服务器挂掉时每个 tick 重试）
+            summary = f"{type(e).__name__}: {e}"[:_ERROR_SUMMARY_MAX]
+            error(f"[scheduler] 任务 {task_id} 执行失败: {summary}\n{traceback.format_exc()}")
+            self._record_task_error(conv_id, task_id, summary)
         finally:
             self._executing.discard(task_id)
+
+    def _record_task_error(self, conv_id, task_id, summary):
+        """失败回写：last_error / last_result / error_count / last_run_time，并按 interval 推进 next_run_time。
+
+        重新从磁盘读取 conv，避免把主流程已半更新（如已 append 消息未落盘）的
+        内存状态一并持久化。回写自身失败时只记日志、不再抛出。
+        """
+        try:
+            conv = None
+            for c in list_conversations():
+                if c["id"] == conv_id:
+                    conv = c
+                    break
+            if not conv:
+                return
+
+            task = None
+            for t in conv.get("tasks", []):
+                if t["id"] == task_id:
+                    task = t
+                    break
+            if not task:
+                return
+
+            now = datetime.now()
+            interval = task.get("interval_seconds", 3600)
+            task["last_error"] = summary
+            # webui 原样展示 last_result，保持字符串类型
+            task["last_result"] = "[执行失败] " + summary
+            task["error_count"] = task.get("error_count", 0) + 1
+            task["last_run_time"] = now.strftime("%Y-%m-%dT%H:%M:%S")
+            task["next_run_time"] = (now + timedelta(seconds=interval)).strftime("%Y-%m-%dT%H:%M:%S")
+
+            conv["tasks"] = [t for t in conv.get("tasks", []) if t["id"] != task_id] + [task]
+            write_conv_file(conv)
+            rebuild_task_index()
+        except Exception as e:
+            error(f"[scheduler] 任务 {task_id} 失败信息回写失败: {e}")
