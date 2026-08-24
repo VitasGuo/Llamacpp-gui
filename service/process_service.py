@@ -100,13 +100,21 @@ class ProcessService:
     def is_running(self):
         if self.current_pid:
             try:
-                process = subprocess.Popen(
-                    ["taskkill", "/F", "/PID", str(self.current_pid)],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {self.current_pid}", "/FO", "CSV", "/NH"],
+                    capture_output=True,
+                    text=True,
                 )
-                process.communicate()
-                return process.returncode != 0
+                for line in result.stdout.strip().split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split('","')
+                    if len(parts) >= 2:
+                        pid = parts[1].strip('"')
+                        if pid.isdigit() and int(pid) == self.current_pid:
+                            return True
+                return False
             except Exception:
                 return False
         return False
