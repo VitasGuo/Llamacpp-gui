@@ -50,16 +50,43 @@ def find_free_port(start=18765, max_attempts=10):
     return start
 
 
+def _read_old_port():
+    """读取上次记录的桥端口；文件不存在或内容畸形时返回 None。"""
+    if not os.path.exists(PORT_FILE):
+        return None
+    try:
+        with open(PORT_FILE, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (ValueError, OSError):
+        return None
+
+
 def start_bridge():
-    """启动聊天桥 HTTP 服务器（守护线程）。返回 (server, port)。"""
+    """启动聊天桥 HTTP 服务器（守护线程）。返回 (server, port)。
+
+    优先 bind PORT_FILE 记录的旧端口（重启后端口稳定，消除探测-bind 竞态）；
+    旧端口被占用（OSError）或首次运行（无文件）时回退 find_free_port 找新端口。
+    bind 成功后才写端口文件。
+    """
     os.makedirs(CHAT_DIR, exist_ok=True)
     migrate_agents()
     migrate_convs()
     migrate_conversation_images()
     rebuild_task_index()
 
-    port = find_free_port()
-    server = HTTPServer(("127.0.0.1", port), BridgeHandler)
+    port = None
+    server = None
+    old_port = _read_old_port()
+    if old_port is not None:
+        try:
+            server = HTTPServer(("127.0.0.1", old_port), BridgeHandler)
+            port = old_port
+        except OSError:
+            pass  # 旧端口被占用：回退 find_free_port
+    if server is None:
+        port = find_free_port()
+        server = HTTPServer(("127.0.0.1", port), BridgeHandler)
+
     with open(PORT_FILE, "w", encoding="utf-8") as f:
         f.write(str(port))
 
