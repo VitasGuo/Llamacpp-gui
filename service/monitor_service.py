@@ -1,6 +1,8 @@
 import psutil
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
+from utils.logger import error
+
 
 class MonitorService(QObject):
     metrics_updated = pyqtSignal(dict)
@@ -28,7 +30,8 @@ class MonitorService(QObject):
                     nvmlDeviceGetHandleByIndex(i) for i in range(count)
                 ]
                 self._gpu_available = True
-        except Exception:
+        except Exception as e:
+            error(f"GPU 监控初始化失败（NVML），已禁用 GPU 显示: {e}")
             self._gpu_handles = []
             self._gpu_available = False
 
@@ -82,5 +85,6 @@ class MonitorService(QObject):
                     "mem_total": mem.total,
                 })
             return results
-        except Exception:
+        except Exception as e:
+            error(f"GPU 指标采样失败: {e}")
             return []

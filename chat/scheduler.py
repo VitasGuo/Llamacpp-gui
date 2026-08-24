@@ -1,9 +1,9 @@
 """定时任务调度器。"""
-import sys
 import threading
 import time
 from datetime import datetime, timedelta
 
+from .log import error
 from .repository import (
     call_llm,
     list_agents,
@@ -57,7 +57,7 @@ class SchedulerService:
             settings = read_settings()
             llm_url = settings.get("llm_url", "")
             if not llm_url:
-                print(f"[scheduler] No llm_url", file=sys.stderr)
+                error(f"[scheduler] No llm_url，跳过任务 {task_id}")
                 return
 
             conv = None

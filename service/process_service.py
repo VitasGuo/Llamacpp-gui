@@ -3,6 +3,7 @@ import subprocess
 from typing import Optional
 
 from config import LAST_PID_FILE
+from utils.logger import error
 
 
 class ProcessService:
@@ -32,6 +33,7 @@ class ProcessService:
             self._save_pid(process.pid)
             return {"success": True, "pid": process.pid, "process": process}
         except Exception as e:
+            error(f"启动脚本失败 {bat_path}: {e}")
             return {"success": False, "error": str(e)}
 
     def stop_by_pid(self):
@@ -45,8 +47,8 @@ class ProcessService:
                 self.current_pid = None
                 self.current_process = None
                 return True
-            except Exception:
-                pass
+            except Exception as e:
+                error(f"stop_by_pid 结束进程失败 PID={self.current_pid}: {e}")
         return False
 
     def stop_by_name(self):
@@ -71,10 +73,10 @@ class ProcessService:
                                 capture_output=True,
                             )
                             killed.append({"name": keyword, "pid": pid})
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+                        except Exception as e:
+                            error(f"stop_by_name 结束进程失败 {keyword} PID={pid}: {e}")
+            except Exception as e:
+                error(f"stop_by_name tasklist 查询失败 {keyword}: {e}")
         self._clear_pid()
         self.current_pid = None
         self.current_process = None
@@ -117,7 +119,8 @@ class ProcessService:
                         if pid.isdigit() and int(pid) == self.current_pid:
                             return True
                 return False
-            except Exception:
+            except Exception as e:
+                error(f"is_running tasklist 查询失败 PID={self.current_pid}: {e}")
                 return False
         return False
 
@@ -145,6 +148,6 @@ class ProcessService:
             try:
                 with open(self.pid_file, "r") as f:
                     return int(f.read().strip())
-            except (ValueError, IOError):
-                pass
+            except (ValueError, IOError) as e:
+                error(f"读取 {self.pid_file} 失败: {e}")
         return None

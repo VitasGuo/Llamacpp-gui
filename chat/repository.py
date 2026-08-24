@@ -4,6 +4,7 @@ import json
 import urllib.request
 from datetime import datetime
 
+from .log import error
 from .models import DEFAULT_AGENT
 from .image_compressor import compress_image_data_url
 
@@ -22,14 +23,19 @@ def _load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (json.JSONDecodeError, IOError):
+    except (json.JSONDecodeError, IOError) as e:
+        error(f"读取 JSON 文件失败 {path}: {e}")
         return default
 
 
 def _save_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        error(f"写入 JSON 文件失败 {path}: {e}")
+        raise
 
 
 def _now():

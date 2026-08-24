@@ -7,6 +7,7 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 from model.download_entry import DownloadEntry, DownloadQueue
 from service import model_sources
 from service.download_client import download_file
+from utils.logger import error
 
 
 class PauseException(Exception):
@@ -65,6 +66,7 @@ class DownloadWorker(QThread):
         except StopIteration:
             self.finished_signal.emit(self.source, self.file_path, False, "已取消")
         except Exception as e:
+            error(f"下载失败 {self.source} {self.file_path}: {e}")
             self.finished_signal.emit(self.source, self.file_path, False, str(e))
 
     def pause(self):
@@ -171,8 +173,8 @@ class DownloadManager(QObject):
         if os.path.exists(entry.dest_path):
             try:
                 os.remove(entry.dest_path)
-            except OSError:
-                pass
+            except OSError as e:
+                error(f"取消下载后删除文件失败 {entry.dest_path}: {e}")
         entry.downloaded = 0
         self.download_queue.update(entry)
 
@@ -190,8 +192,8 @@ class DownloadManager(QObject):
         if entry.dest_path and os.path.exists(entry.dest_path):
             try:
                 os.remove(entry.dest_path)
-            except OSError:
-                pass
+            except OSError as e:
+                error(f"移除下载后删除文件失败 {entry.dest_path}: {e}")
 
     def _find_entry_by_path(self, source, file_path):
         for e in self.download_queue.entries:
