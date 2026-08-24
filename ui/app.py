@@ -49,6 +49,7 @@ class MainWindow(QMainWindow):
 
         self._init_ui()
         self._load_saved_paths()
+        self._restore_service_state()
 
         self.monitor_service.start()
         ensure_webui()
@@ -230,6 +231,19 @@ class MainWindow(QMainWindow):
         if self.settings.visual_model_path:
             self.visual_model_path_edit.setText(self.settings.visual_model_path)
         self._refresh_script_list()
+
+    def _restore_service_state(self):
+        pid = self.process_service.restore_last_pid()
+        if pid is None:
+            return
+        self.is_running = True
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.status_label.setText("\u25cf 运行中")
+        self.status_label.setStyleSheet(
+            "color: orange; font-size: 12px; font-weight: bold;"
+        )
+        self._append_log(f"检测到上次启动的服务仍在运行, PID={pid}")
 
     def _select_llamacpp_path(self):
         path, _ = QFileDialog.getOpenFileName(

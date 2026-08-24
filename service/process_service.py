@@ -1,5 +1,7 @@
 import os
 import subprocess
+from typing import Optional
+
 from config import LAST_PID_FILE
 
 
@@ -118,6 +120,17 @@ class ProcessService:
             except Exception:
                 return False
         return False
+
+    def restore_last_pid(self) -> Optional[int]:
+        pid = self.load_last_pid()
+        if pid is None:
+            return None
+        self.current_pid = pid
+        if self.is_running():
+            return pid
+        self._clear_pid()
+        self.current_pid = None
+        return None
 
     def _save_pid(self, pid):
         with open(self.pid_file, "w") as f:
