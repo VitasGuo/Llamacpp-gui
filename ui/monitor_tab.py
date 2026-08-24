@@ -356,6 +356,9 @@ class MonitorTab(QWidget):
 
     def _on_hist_range_changed(self, index):
         self._hist_chart.set_window(self._hist_range.currentData())
+        # 换范围必须按新范围重新读取：set_window 只缩放坐标轴并重渲染
+        # 已加载点，不重读则 1h→7d 后仍显示旧的 1h 数据（挤在轴右端）
+        self._refresh_history()
 
     def _refresh_history(self):
         """从 service 读取所选范围的历史 t/s 数据并重绘历史图。"""
