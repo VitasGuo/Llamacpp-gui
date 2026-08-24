@@ -386,7 +386,11 @@ class MonitorTab(QWidget):
 
     def _update_gpus(self, gpus):
         if not gpus:
-            if not self._gpu_placeholder.parent():
+            # Qt 的 removeWidget 不改变父对象：仅判 parent 时，占位符被
+            # removeWidget+hide 后就永远满足不了"无父"条件，"GPU 消失→恢复
+            # →再消失"循环后占位符不再恢复。补 isHidden() 判定（widget 自身
+            # 显隐标志，不受窗口可见性影响）。
+            if not self._gpu_placeholder.parent() or self._gpu_placeholder.isHidden():
                 for c in self._gpu_cards:
                     c.setParent(None)
                     c.deleteLater()
