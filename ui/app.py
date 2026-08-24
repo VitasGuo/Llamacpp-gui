@@ -573,8 +573,10 @@ class MainWindow(QMainWindow):
         """删除日志面板头部超出上限的块，仅保留最近 2000 行。
 
         纯文本追加（QTextEdit.append），按 document 块数裁剪：选中头部多余块
-        后整体删除，其余内容不受影响；裁剪后把光标移回文末，保持
-        "视口跟随最新日志"的既有行为（不破坏自动滚动）。
+        后整体删除，其余内容不受影响。裁剪不操作控件光标/滚动条（不做
+        moveCursor(End)）：那样会把滚动到上方读历史的用户强制拉回底部。
+        裁剪后视口行为与裁剪前 append 一致——用户位于底部时块数减少后
+        滚动条自动钳制回底部，新日志继续跟随；用户读历史时视口原地不动。
         """
         doc = self.log_text.document()
         excess = doc.blockCount() - LOG_PANEL_MAX_BLOCKS
@@ -588,8 +590,6 @@ class MainWindow(QMainWindow):
             excess,
         )
         cursor.removeSelectedText()
-        # 恢复光标到文末：删除头部块后视口仍停留在最新日志处
-        self.log_text.moveCursor(QTextCursor.MoveOperation.End)
 
 
 def main():
