@@ -11,7 +11,6 @@ from .repository import (
     _load_json,
     _now,
     _save_json,
-    clean_memory,
     delete_agent_file,
     delete_conv_file,
     list_agents,
@@ -100,8 +99,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._json(200, read_settings())
 
         elif re.match(r"^/agents/[^/]+/memory$", path):
+            # 纯读取：清理逻辑已挪到 server.py 的 6h 周期任务，GET 不再有副作用
             aid = path.split("/")[2]
-            clean_memory(aid, 90)
             self._json(200, {"memory": load_memory(aid)})
 
         elif re.match(r"^/agents/[^/]+/memory/\d+$", path):
