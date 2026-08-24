@@ -14,6 +14,7 @@ from PyQt6.QtCore import Qt
 
 from config.config import Settings
 from utils.validator import validate_llamacpp_file, validate_gguf
+from utils.logger import info
 from service.script_service import ScriptService
 from service.script_builder import build_bat_content
 from service.process_service import ProcessService
@@ -203,6 +204,15 @@ class MainWindow(QMainWindow):
         self.app_update_date_label = QLabel("")
         self.app_update_date_label.setStyleSheet("color: gray; font-size: 11px;")
         layout.addWidget(self.app_update_date_label)
+
+        # 显式清理入口：不常用、放右侧不突出位置，避免误触
+        self.cleanup_all_btn = QPushButton("清理全部llama进程")
+        self.cleanup_all_btn.setToolTip(
+            "结束本机所有 llama-server.exe / main.exe 进程"
+            "（包括未通过本软件启动的实例），点击需确认。"
+        )
+        self.cleanup_all_btn.clicked.connect(self._cleanup_all_processes)
+        layout.addWidget(self.cleanup_all_btn)
 
         return group
 
@@ -456,11 +466,40 @@ class MainWindow(QMainWindow):
         if not self.is_running:
             return
 
-        result = self.process_service.stop_all()
-        if result["pid_stopped"] or result["name_stopped"]:
+        # 常规停止只按 PID（本软件跟踪的进程）；"清理全部"走 _cleanup_all_processes
+        stopped = self.process_service.stop_by_pid()
+        if stopped:
             self._append_log("进程已终止")
         else:
             self._append_log("尝试终止进程，但可能未找到相关进程")
+
+        self.is_running = False
+        self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.status_label.setText("\u25cf 就绪")
+        self.status_label.setStyleSheet(
+            "color: green; font-size: 12px; font-weight: bold;"
+        )
+
+    def _cleanup_all_processes(self):
+        """显式清理全部 llama 进程（含手动启动的实例），需确认。"""
+        reply = QMessageBox.question(
+            self, "确认清理全部 llama 进程",
+            "此操作将结束本机所有 llama-server.exe / main.exe 进程，"
+            "包括未通过本软件启动的实例。\n确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        killed = self.process_service.stop_by_name()
+        if killed:
+            detail = ", ".join(f"{k['name']}(PID={k['pid']})" for k in killed)
+            self._append_log(f"已清理全部 llama 进程: {detail}")
+            info(f"用户手动清理全部 llama 进程: {detail}")
+        else:
+            self._append_log("清理完成，未发现相关进程")
+            info("用户手动清理全部 llama 进程: 未发现相关进程")
 
         self.is_running = False
         self.run_btn.setEnabled(True)
