@@ -191,7 +191,15 @@ class SchedulerService:
         base = 上次计划时间（task.next_run_time）；new_next = base + interval；
         若 new_next < now（机器休眠/执行超时），取 now（立即再调度，不补跑多次）；
         计划时间缺失/畸形时退化为 base = now（不排到过去，无 1s 级重试）。
+        interval 非数值或 < 60s（绕过前端校验的脏数据）时退化为 60s（UI 声明的最小间隔），
+        防止 interval<=0 时 new_next 被钳到 now 造成 1s 级重试风暴。
         """
+        try:
+            interval = int(interval)
+        except (TypeError, ValueError):
+            interval = 60
+        if interval < 60:
+            interval = 60
         base = now
         if planned_iso:
             try:
