@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QInputDialog, QDialog,
 )
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QTextCursor
 
 from config.config import Settings
 from utils.validator import validate_llamacpp_file, validate_gguf
@@ -28,6 +29,10 @@ from ui.dialogs.new_script_dialog import NewScriptDialog
 from ui.workers.log_worker import LogWorker
 from ui.workers.update_workers import CheckUpdateWorker, CheckAppUpdateWorker
 
+# 日志面板行数上限：保留最近 N 个块（行）；每追加 M 条检查一次，避免刷屏时频繁裁剪
+LOG_PANEL_MAX_BLOCKS = 2000
+LOG_PANEL_TRIM_EVERY = 50
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -41,6 +46,7 @@ class MainWindow(QMainWindow):
         self._server_url = ""
         self._bridge_server = None
         self._bridge_port = None
+        self._log_append_count = 0
 
         self.setWindowTitle("llama.cpp GUI Client")
         self.resize(960, 700)
@@ -559,6 +565,31 @@ class MainWindow(QMainWindow):
     def _append_log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_text.append(f"[{timestamp}] {message}")
+        self._log_append_count += 1
+        if self._log_append_count % LOG_PANEL_TRIM_EVERY == 0:
+            self._trim_log_panel()
+
+    def _trim_log_panel(self):
+        """删除日志面板头部超出上限的块，仅保留最近 2000 行。
+
+        纯文本追加（QTextEdit.append），按 document 块数裁剪：选中头部多余块
+        后整体删除，其余内容不受影响；裁剪后把光标移回文末，保持
+        "视口跟随最新日志"的既有行为（不破坏自动滚动）。
+        """
+        doc = self.log_text.document()
+        excess = doc.blockCount() - LOG_PANEL_MAX_BLOCKS
+        if excess <= 0:
+            return
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        cursor.movePosition(
+            QTextCursor.MoveOperation.NextBlock,
+            QTextCursor.MoveMode.KeepAnchor,
+            excess,
+        )
+        cursor.removeSelectedText()
+        # 恢复光标到文末：删除头部块后视口仍停留在最新日志处
+        self.log_text.moveCursor(QTextCursor.MoveOperation.End)
 
 
 def main():
