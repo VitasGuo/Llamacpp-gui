@@ -32,6 +32,9 @@ class LogWorker(QThread):
             self.log_signal.emit(f"进程已启动，PID: {result['pid']}")
         else:
             self.log_signal.emit(f"启动失败: {result.get('error', '未知错误')}")
+            # 启动失败直接结束：否则下方循环会以 current_process（可能属于
+            # 其他仍在运行的脚本）为回退目标，串读并重复转发其输出
+            return
 
         while self._running:
             # 读自己的进程输出（多服务器并发时不与其他脚本的 worker 互相串扰）

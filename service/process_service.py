@@ -247,7 +247,7 @@ class ProcessService:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("0.0.0.0", int(port)))
                 return False
-        except OSError:
+        except (OSError, ValueError):
             return True
 
     def _save_pid(self, pid):
