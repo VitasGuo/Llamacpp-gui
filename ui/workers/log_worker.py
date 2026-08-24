@@ -8,7 +8,7 @@ class LogWorker(QThread):
     log_signal = pyqtSignal(str)
     finished_signal = pyqtSignal()
     server_ready_signal = pyqtSignal(str)
-    tps_signal = pyqtSignal(float)
+    tps_signal = pyqtSignal(str, float)  # (script_name, tps)：多服务器按脚本归属
 
     def __init__(self, bat_path, process_service, script_name="", port=None):
         super().__init__()
@@ -48,7 +48,9 @@ class LogWorker(QThread):
                 tps_m = self._tps_pattern.search(line)
                 if tps_m:
                     try:
-                        self.tps_signal.emit(float(tps_m.group(1)))
+                        self.tps_signal.emit(
+                            self.script_name or "default", float(tps_m.group(1))
+                        )
                     except ValueError:
                         pass
                 self.log_signal.emit(line)

@@ -54,7 +54,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("llama.cpp GUI Client")
         self.resize(960, 700)
 
-        self.monitor_service = MonitorService()
+        self.monitor_service = MonitorService(self.process_service)
         self.monitor_tab = MonitorTab(self.monitor_service)
 
         self._init_ui()
@@ -360,10 +360,12 @@ class MainWindow(QMainWindow):
             self.current_script_name = name
             content = self.script_service.load_script_content(name)
             self.script_editor.setPlainText(content)
+            self.monitor_tab.set_focus_script(name)
             self._sync_control_panel()
         else:
             # 取消选中 → 控制面板回退全局状态（旧版本启动/last_pid 恢复的进程）
             self.current_script_name = ""
+            self.monitor_tab.set_focus_script("")
             self._sync_control_panel()
 
     def _select_llamacpp_path(self):

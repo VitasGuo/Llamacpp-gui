@@ -78,17 +78,18 @@ class GpuCard(QFrame):
 
 
 class TpsChart(QWidget):
+    """多系列 t/s 折线图：每个服务一条线（图例=脚本名/模型名），60 秒滑动窗口。"""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._data = deque(maxlen=300)
+        self._series = {}  # name -> QLineSeries
+        self._data = {}    # name -> deque((ts, tps))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self._series = QLineSeries()
         self._chart = QChart()
-        self._chart.addSeries(self._series)
-        self._chart.legend().hide()
+        self._chart.legend().setVisible(True)
         self._chart.setTitle("推理速度 (最近 60 秒)")
 
         self._axis_x = QValueAxis()
@@ -104,33 +105,49 @@ class TpsChart(QWidget):
         self._axis_y.setTitleText("t/s")
         self._chart.addAxis(self._axis_y, Qt.AlignmentFlag.AlignLeft)
 
-        self._series.attachAxis(self._axis_x)
-        self._series.attachAxis(self._axis_y)
-
         self._view = QChartView(self._chart)
         layout.addWidget(self._view)
 
-    def add_tps(self, tps):
-        now = time.time()
-        self._data.append((now, tps))
+    def _ensure_series(self, name):
+        s = self._series.get(name)
+        if s is None:
+            s = QLineSeries()
+            s.setName(name)
+            self._series[name] = s
+            self._chart.addSeries(s)
+            s.attachAxis(self._axis_x)
+            s.attachAxis(self._axis_y)
+        return s
+
+    def add_tps(self, name, tps):
+        data = self._data.get(name)
+        if data is None:
+            data = self._data[name] = deque(maxlen=300)
+        data.append((time.time(), tps))
+        self._ensure_series(name)
         self._refresh()
 
     def _refresh(self):
         now = time.time()
         cutoff = now - 60
-        while self._data and self._data[0][0] < cutoff:
-            self._data.popleft()
-
-        self._series.clear()
-        if not self._data:
-            return
-
-        max_tps = max(v for _, v in self._data)
+        max_tps = 0
+        for name, data in list(self._data.items()):
+            while data and data[0][0] < cutoff:
+                data.popleft()
+            if not data:
+                # 该服务已停（窗口内无新点）→ 移除系列，图例同步消失
+                s = self._series.pop(name)
+                del self._data[name]
+                self._chart.removeSeries(s)
+                s.deleteLater()
+                continue
+            max_tps = max(max_tps, max(v for _, v in data))
+            s = self._series[name]
+            win_start = cutoff if len(data) > 1 else data[0][0]
+            s.clear()
+            for ts, tps in data:
+                s.append(ts - win_start, tps)
         self._axis_y.setRange(0, max_tps * 1.2 if max_tps > 0 else 100)
-
-        win_start = cutoff if len(self._data) > 1 else self._data[0][0]
-        for ts, tps in self._data:
-            self._series.append(ts - win_start, tps)
 
 
 class MonitorTab(QWidget):
@@ -140,12 +157,19 @@ class MonitorTab(QWidget):
         ("2 秒", 2000),
     ]
 
+    # /metrics 不可用时回退日志正则 t/s 的"新鲜度"窗口（秒）：
+    # 日志 t/s 只在服务器打印速度行时更新，超过窗口的值视为陈旧不参与绘制
+    LOG_TPS_FALLBACK_WINDOW = 5.0
+
     def __init__(self, monitor_service, parent=None):
         super().__init__(parent)
         self._service = monitor_service
         self._server_running = False
         self._server_start_time = 0.0
         self._gpu_cards = []
+        self._focus_name = ""     # 聚焦（选中）脚本：t/s 标签优先显示它
+        self._log_tps = {}        # name -> (ts, tps)：日志正则通道（回退数据源）
+        self._metrics_ok = {}     # name -> bool：/metrics 最近一次是否可用
 
         self._setup_ui()
         self._service.metrics_updated.connect(self._on_metrics)
@@ -237,10 +261,54 @@ class MonitorTab(QWidget):
     def _on_freq_changed(self, index):
         self._service.set_interval(self._freq.currentData())
 
-    @pyqtSlot(float)
-    def update_tps(self, tps):
+    def set_focus_script(self, name):
+        """聚焦脚本（脚本列表选中项）：t/s 标签优先显示该服务的速度。"""
+        self._focus_name = name or ""
+
+    @pyqtSlot(str, float)
+    def update_tps(self, name, tps):
+        """日志正则 t/s 通道（回退数据源），按脚本归属。
+
+        /metrics 可用时该通道只作记录（不重复绘点）；不可用时在新鲜度
+        窗口内作为该服务的 t/s 数据源。
+        """
+        now = time.time()
+        self._log_tps[name] = (now, tps)
+        if not self._metrics_ok.get(name, False):
+            self._tps_chart.add_tps(name, tps)
+        self._maybe_update_label(name, tps)
+
+    def _update_servers(self, servers):
+        """合并 /metrics 推送（按服务维度）：可用则绘点，不可用则回退日志正则。"""
+        now = time.time()
+        active = set()
+        for s in servers:
+            name = s.get("name")
+            if not name:
+                continue
+            active.add(name)
+            ok = bool(s.get("ok"))
+            self._metrics_ok[name] = ok
+            tps = s.get("tps")
+            if ok and tps is not None:
+                self._tps_chart.add_tps(name, tps)
+                self._maybe_update_label(name, tps)
+        # 回退：/metrics 不可用且存在新鲜的日志正则 t/s
+        for name in list(self._log_tps):
+            ts, tps = self._log_tps[name]
+            if now - ts > 300:
+                del self._log_tps[name]
+                continue
+            if name in active and not self._metrics_ok.get(name, False) \
+                    and now - ts < self.LOG_TPS_FALLBACK_WINDOW:
+                self._tps_chart.add_tps(name, tps)
+                self._maybe_update_label(name, tps)
+
+    def _maybe_update_label(self, name, tps):
+        """t/s 标签：聚焦脚本优先；未聚焦时显示最近到达的值（单一服务时与旧行为一致）。"""
+        if self._focus_name and name != self._focus_name:
+            return
         self._tps_label.setText(f"推理速度: {tps:.1f} t/s")
-        self._tps_chart.add_tps(tps)
 
     def on_server_started(self):
         self._server_running = True
@@ -276,6 +344,7 @@ class MonitorTab(QWidget):
         self._ram_text.setText(f"{rp:.0f}%  {_fmt_bytes(m['ram_used'])} / {_fmt_bytes(m['ram_total'])}")
 
         self._update_gpus(m.get("gpus", []))
+        self._update_servers(m.get("servers", []))
 
     def _update_gpus(self, gpus):
         if not gpus:
