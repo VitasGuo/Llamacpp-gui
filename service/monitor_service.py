@@ -105,7 +105,17 @@ class MonitorService(QObject):
 
     def _metrics_loop(self):
         while not self._metrics_stop.is_set():
-            self._poll_servers_once()
+            try:
+                self._poll_servers_once()
+            except Exception as e:
+                # 守护线程兜底：单次异常不应杀死轮询线程（t/s 永久失效）
+                now = time.monotonic()
+                if (
+                    self._last_metrics_err_log_ts is None
+                    or now - self._last_metrics_err_log_ts >= 60
+                ):
+                    error(f"/metrics 轮询异常（继续轮询）: {e}")
+                    self._last_metrics_err_log_ts = now
             self._metrics_stop.wait(METRICS_FETCH_INTERVAL)
 
     def _poll_servers_once(self):

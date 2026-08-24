@@ -170,6 +170,7 @@ class MonitorTab(QWidget):
         self._focus_name = ""     # 聚焦（选中）脚本：t/s 标签优先显示它
         self._log_tps = {}        # name -> (ts, tps)：日志正则通道（回退数据源）
         self._metrics_ok = {}     # name -> bool：/metrics 最近一次是否可用
+        self._log_drawn_ts = {}   # name -> 已绘制的日志正则 t/s 点的 ts（防重复绘点）
 
         self._setup_ui()
         self._service.metrics_updated.connect(self._on_metrics)
@@ -276,6 +277,7 @@ class MonitorTab(QWidget):
         self._log_tps[name] = (now, tps)
         if not self._metrics_ok.get(name, False):
             self._tps_chart.add_tps(name, tps)
+            self._log_drawn_ts[name] = now
         self._maybe_update_label(name, tps)
 
     def _update_servers(self, servers):
@@ -298,10 +300,15 @@ class MonitorTab(QWidget):
             ts, tps = self._log_tps[name]
             if now - ts > 300:
                 del self._log_tps[name]
+                self._log_drawn_ts.pop(name, None)
                 continue
             if name in active and not self._metrics_ok.get(name, False) \
                     and now - ts < self.LOG_TPS_FALLBACK_WINDOW:
-                self._tps_chart.add_tps(name, tps)
+                # 每条日志行只绘一次：update_tps 已绘过则跳过；日志行在
+                # _metrics_ok 仍为旧值(True)期间到达时，由扫描补绘
+                if self._log_drawn_ts.get(name, 0.0) < ts:
+                    self._tps_chart.add_tps(name, tps)
+                    self._log_drawn_ts[name] = ts
                 self._maybe_update_label(name, tps)
 
     def _maybe_update_label(self, name, tps):
