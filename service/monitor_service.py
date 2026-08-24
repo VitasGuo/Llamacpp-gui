@@ -1,3 +1,5 @@
+import time
+
 import psutil
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
@@ -14,6 +16,7 @@ class MonitorService(QObject):
         self._timer.timeout.connect(self._collect)
         self._gpu_handles = []
         self._gpu_available = False
+        self._last_gpu_err_log_ts = None
         self._init_gpu()
 
     def _init_gpu(self):
@@ -86,5 +89,9 @@ class MonitorService(QObject):
                 })
             return results
         except Exception as e:
-            error(f"GPU 指标采样失败: {e}")
+            # NVML 持续故障时会每秒触发一次，节流为 60s 内至多记一条，避免日志刷量
+            now = time.monotonic()
+            if self._last_gpu_err_log_ts is None or now - self._last_gpu_err_log_ts >= 60:
+                error(f"GPU 指标采样失败: {e}")
+                self._last_gpu_err_log_ts = now
             return []
