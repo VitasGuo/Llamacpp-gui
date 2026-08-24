@@ -3,7 +3,7 @@ from collections import deque
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
-    QLabel, QProgressBar, QComboBox, QFrame,
+    QLabel, QProgressBar, QComboBox, QFrame, QPushButton,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QPainter
@@ -181,6 +181,92 @@ class TpsChart(QWidget):
         self._axis_y.setRange(0, max_tps * 1.2 if max_tps > 0 else 100)
 
 
+class HistoryChart(QWidget):
+    """t/s 历史折线图（只读）：按所选时间范围渲染 data/history/ 的 JSONL 数据，
+    每服务一条线（图例=脚本名），用于调参前后对比。与实时 TpsChart 相互独立。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._series = {}  # name -> QLineSeries
+        self._points = []  # [{ts, server, tps}]
+        self._window = 3600.0
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._chart = QChart()
+        self._chart.legend().setVisible(True)
+        self._chart.setTitle("t/s 历史")
+
+        self._axis_x = QValueAxis()
+        self._axis_x.setLabelFormat("%.0f")
+        self._axis_x.setTickCount(7)
+        self._chart.addAxis(self._axis_x, Qt.AlignmentFlag.AlignBottom)
+
+        self._axis_y = QValueAxis()
+        self._axis_y.setRange(0, 100)
+        self._axis_y.setLabelFormat("%.0f")
+        self._axis_y.setTitleText("t/s")
+        self._chart.addAxis(self._axis_y, Qt.AlignmentFlag.AlignLeft)
+
+        self._view = QChartView(self._chart)
+        layout.addWidget(self._view)
+        self._apply_window()
+
+    def _ensure_series(self, name):
+        s = self._series.get(name)
+        if s is None:
+            s = QLineSeries()
+            s.setName(name)
+            self._series[name] = s
+            self._chart.addSeries(s)
+            s.attachAxis(self._axis_x)
+            s.attachAxis(self._axis_y)
+        return s
+
+    def set_window(self, seconds):
+        self._window = float(seconds)
+        self._apply_window()
+        self._refresh()
+
+    def _apply_window(self):
+        # 1 小时用秒，更长的范围用小时（避免 X 轴出现 604800 这类大数）
+        if self._window <= 3600:
+            self._axis_x.setTitleText("秒")
+        else:
+            self._axis_x.setTitleText("小时")
+
+    def load_points(self, points):
+        self._points = points or []
+        self._refresh()
+
+    def _x(self, ts, start):
+        return ts - start if self._window <= 3600 else (ts - start) / 3600.0
+
+    def _refresh(self):
+        now = time.time()
+        start = now - self._window
+        per_name = {}
+        for p in self._points:
+            if p["ts"] >= start:
+                per_name.setdefault(p["server"], []).append((p["ts"], p["tps"]))
+        # 窗口内无数据的系列移除（图例同步消失）
+        for name in list(self._series):
+            if name not in per_name:
+                s = self._series.pop(name)
+                self._chart.removeSeries(s)
+                s.deleteLater()
+        max_tps = 0
+        for name, pts in per_name.items():
+            s = self._ensure_series(name)
+            s.clear()
+            for ts, tps in pts:
+                s.append(self._x(ts, start), tps)
+            max_tps = max(max_tps, max(v for _, v in pts))
+        self._axis_x.setRange(0, self._x(now, start))
+        self._axis_y.setRange(0, max_tps * 1.2 if max_tps > 0 else 100)
+
+
 class MonitorTab(QWidget):
     FREQ_OPTIONS = [
         ("0.5 秒", 500),
@@ -233,6 +319,48 @@ class MonitorTab(QWidget):
         self._tps_chart = TpsChart()
         bottom.addWidget(self._tps_chart, 2)
         layout.addLayout(bottom)
+
+        layout.addWidget(self._build_history_group())
+        self._refresh_history()
+
+    # t/s 历史视图时间范围（秒）
+    HIST_RANGE_OPTIONS = [
+        ("1 小时", 3600),
+        ("24 小时", 86400),
+        ("7 天", 7 * 86400),
+    ]
+
+    def _build_history_group(self):
+        group = QGroupBox("t/s 历史（最近 7 天，用于调参前后对比）")
+        v = QVBoxLayout(group)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(4)
+
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("时间范围:"))
+        self._hist_range = QComboBox()
+        for label, val in self.HIST_RANGE_OPTIONS:
+            self._hist_range.addItem(label, val)
+        self._hist_range.currentIndexChanged.connect(self._on_hist_range_changed)
+        bar.addWidget(self._hist_range)
+        self._hist_refresh_btn = QPushButton("刷新")
+        self._hist_refresh_btn.clicked.connect(self._refresh_history)
+        bar.addWidget(self._hist_refresh_btn)
+        bar.addStretch()
+        v.addLayout(bar)
+
+        self._hist_chart = HistoryChart()
+        self._hist_chart.setFixedHeight(170)
+        v.addWidget(self._hist_chart)
+        return group
+
+    def _on_hist_range_changed(self, index):
+        self._hist_chart.set_window(self._hist_range.currentData())
+
+    def _refresh_history(self):
+        """从 service 读取所选范围的历史 t/s 数据并重绘历史图。"""
+        points = self._service.load_history(self._hist_range.currentData())
+        self._hist_chart.load_points(points)
 
     def _build_top_bar(self):
         w = QWidget()
@@ -309,6 +437,8 @@ class MonitorTab(QWidget):
         if not self._metrics_ok.get(name, False):
             self._tps_chart.add_tps(name, tps)
             self._log_drawn_ts[name] = now
+            # 日志回退通道的 t/s 也进历史落盘缓冲（与实时曲线同源同规则）
+            self._service.record_tps(name, tps)
         self._maybe_update_label(name, tps)
 
     def _update_servers(self, servers):

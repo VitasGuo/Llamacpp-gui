@@ -1,16 +1,26 @@
 import re
+import os
+import json
 import time
 import threading
 import urllib.request
+from datetime import datetime, timedelta
 
 import psutil
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
+from config import HISTORY_DIR
 from utils.logger import error
 
 # /metrics 轮询间隔与单次请求超时（秒）
 METRICS_FETCH_INTERVAL = 1.0
 METRICS_TIMEOUT = 1.0
+
+# t/s 历史落盘（T14）：data/history/tps-YYYYMMDD.jsonl 按天分文件，
+# 每 HISTORY_FLUSH_INTERVAL 秒聚合写盘一次（非每次采样都写）
+HISTORY_FLUSH_INTERVAL = 5.0
+HISTORY_RETENTION_DAYS = 7
+HISTORY_FILE_PREFIX = "tps-"
 
 # llama.cpp /metrics 的 token 计数器字段名（不同版本命名可能不同，按序容错）
 _GEN_TOKEN_NAMES = ("llm_generation_tokens", "llm_generation_tokens_total")
@@ -66,6 +76,12 @@ class MonitorService(QObject):
             target=self._metrics_loop, daemon=True, name="metrics-poll"
         )
         self._metrics_thread.start()
+
+        # t/s 历史落盘（T14）：滚动缓冲 + 5s 聚合写盘
+        self._hist_buf = {}  # server 名 -> (样本 ts, tps)，保留最近一次
+        self._hist_last_write = time.monotonic()
+        self._last_hist_err_log_ts = None
+        self._cleanup_history()
 
     def _init_gpu(self):
         try:
@@ -209,6 +225,11 @@ class MonitorService(QObject):
         gpus = self._get_all_gpu_stats()
         with self._lock:
             servers = [dict(s) for s in self._server_tps.values()]
+        # t/s 历史：/metrics 通道的有效值进滚动缓冲（5s 聚合写盘）
+        for s in servers:
+            if s.get("ok") and s.get("tps") is not None:
+                self._hist_buf[s["name"]] = (s["updated_at"], s["tps"])
+        self._maybe_flush_history()
         self.metrics_updated.emit({
             "cpu": cpu,
             "ram_percent": mem.percent,
@@ -217,6 +238,103 @@ class MonitorService(QObject):
             "gpus": gpus,
             "servers": servers,
         })
+
+    # ── t/s 历史持久化（data/history/tps-YYYYMMDD.jsonl，保留 7 天）──
+
+    def record_tps(self, name, tps):
+        """记录一个 t/s 采样点（历史落盘缓冲）。
+
+        由 UI 层在日志正则回退通道调用（/metrics 不可用时），使历史曲线
+        与实时曲线数据源一致；每 5s 聚合写盘一次，不是每次采样都写。
+        """
+        if name and isinstance(tps, (int, float)) and tps >= 0:
+            self._hist_buf[name] = (time.time(), float(tps))
+
+    def _maybe_flush_history(self):
+        now_mono = time.monotonic()
+        if not self._hist_buf or now_mono - self._hist_last_write < HISTORY_FLUSH_INTERVAL:
+            return
+        lines = [
+            json.dumps({"ts": ts, "server": name, "tps": tps}, ensure_ascii=False)
+            for name, (ts, tps) in self._hist_buf.items()
+        ]
+        try:
+            os.makedirs(HISTORY_DIR, exist_ok=True)
+            day = datetime.now().strftime("%Y%m%d")
+            path = os.path.join(HISTORY_DIR, f"{HISTORY_FILE_PREFIX}{day}.jsonl")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            self._hist_buf.clear()  # 写盘成功后才清缓冲，失败下轮重试
+            self._hist_last_write = now_mono
+        except OSError as e:
+            now = time.monotonic()
+            if (
+                self._last_hist_err_log_ts is None
+                or now - self._last_hist_err_log_ts >= 60
+            ):
+                error(f"t/s 历史写盘失败: {e}")
+                self._last_hist_err_log_ts = now
+
+    def _cleanup_history(self):
+        """启动时清理超过保留期的历史文件（按天文件，文件名即日期）。"""
+        try:
+            os.makedirs(HISTORY_DIR, exist_ok=True)
+            cutoff = (
+                datetime.now() - timedelta(days=HISTORY_RETENTION_DAYS)
+            ).strftime("%Y%m%d")
+            for fn in os.listdir(HISTORY_DIR):
+                if fn.startswith(HISTORY_FILE_PREFIX) and fn.endswith(".jsonl"):
+                    day = fn[len(HISTORY_FILE_PREFIX):-len(".jsonl")]
+                    # YYYYMMDD 字符串比较即时间序
+                    if day.isdigit() and day < cutoff:
+                        os.remove(os.path.join(HISTORY_DIR, fn))
+        except OSError as e:
+            error(f"t/s 历史清理失败: {e}")
+
+    def load_history(self, seconds):
+        """读取最近 seconds 秒的 t/s 历史，返回 [{ts, server, tps}]（时间升序）。
+
+        按天文件组织：从 cutoff 所在天到今天逐文件读取（1h 视图只读 1 个文件，
+        7d 视图最多 8 个），跳过损坏行。
+        """
+        now = datetime.now()
+        today = now.strftime("%Y%m%d")
+        start_day = (now - timedelta(seconds=seconds)).strftime("%Y%m%d")
+        cutoff_ts = time.time() - seconds
+        out = []
+        day = start_day
+        while day <= today:
+            path = os.path.join(HISTORY_DIR, f"{HISTORY_FILE_PREFIX}{day}.jsonl")
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                d = json.loads(line)
+                            except ValueError:
+                                continue
+                            ts = d.get("ts")
+                            tps = d.get("tps")
+                            if (
+                                isinstance(ts, (int, float))
+                                and isinstance(tps, (int, float))
+                                and ts >= cutoff_ts
+                            ):
+                                out.append({
+                                    "ts": ts,
+                                    "server": d.get("server", ""),
+                                    "tps": tps,
+                                })
+                except OSError:
+                    pass
+            day = (
+                datetime.strptime(day, "%Y%m%d") + timedelta(days=1)
+            ).strftime("%Y%m%d")
+        out.sort(key=lambda d: d["ts"])
+        return out
 
     def _get_all_gpu_stats(self):
         if not self._gpu_available:
