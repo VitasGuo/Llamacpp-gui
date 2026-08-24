@@ -51,14 +51,18 @@ def find_free_port(start=18765, max_attempts=10):
 
 
 def _read_old_port():
-    """读取上次记录的桥端口；文件不存在或内容畸形时返回 None。"""
+    """读取上次记录的桥端口；文件不存在、内容畸形或超出端口范围时返回 None。"""
     if not os.path.exists(PORT_FILE):
         return None
     try:
         with open(PORT_FILE, "r", encoding="utf-8") as f:
-            return int(f.read().strip())
+            p = int(f.read().strip())
     except (ValueError, OSError):
         return None
+    # 端口 0 会 bind 成随机端口但返回值仍为 0，导致 UI 拿到错误端口，必须拒绝
+    if not 0 < p <= 65535:
+        return None
+    return p
 
 
 def start_bridge():
@@ -80,12 +84,13 @@ def start_bridge():
     if old_port is not None:
         try:
             server = HTTPServer(("127.0.0.1", old_port), BridgeHandler)
-            port = old_port
+            port = server.server_address[1]  # 以实际 bind 结果为准
         except OSError:
             pass  # 旧端口被占用：回退 find_free_port
     if server is None:
         port = find_free_port()
         server = HTTPServer(("127.0.0.1", port), BridgeHandler)
+        port = server.server_address[1]  # 以实际 bind 结果为准
 
     with open(PORT_FILE, "w", encoding="utf-8") as f:
         f.write(str(port))
