@@ -1,4 +1,6 @@
 """启动脚本参数构建逻辑。"""
+import re
+
 from config.config import Settings
 
 CATEGORIES = [
@@ -81,6 +83,20 @@ def get_switch_default(key):
             if sw["key"] == key:
                 return sw.get("default", "")
     return ""
+
+
+def extract_port(content, default=8080):
+    """解析 .bat 内容中的 --port 参数值（端口预检用）；缺失或非法时返回默认 8080
+    （llama.cpp 未指定 --port 时的监听端口）。"""
+    m = re.search(r"--port\s+(\d+)", content or "")
+    if m:
+        try:
+            port = int(m.group(1))
+            if 0 < port <= 65535:
+                return port
+        except ValueError:
+            pass
+    return default
 
 
 def build_bat_content(exe_dir, model_path, config, visual_model_path=""):

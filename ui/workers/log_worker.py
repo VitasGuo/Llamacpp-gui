@@ -10,25 +10,32 @@ class LogWorker(QThread):
     server_ready_signal = pyqtSignal(str)
     tps_signal = pyqtSignal(float)
 
-    def __init__(self, bat_path, process_service):
+    def __init__(self, bat_path, process_service, script_name="", port=None):
         super().__init__()
         self.bat_path = bat_path
         self.process_service = process_service
+        self.script_name = script_name
+        self.port = port
         self._running = False
+        self._process = None
         self._url_emitted = False
         self._url_pattern = re.compile(r"https?://\d+\.\d+\.\d+\.\d+:\d+")
         self._tps_pattern = re.compile(r"([\d.]+)\s+tokens?\s+per\s+second")
 
     def run(self):
         self._running = True
-        result = self.process_service.start_script(self.bat_path)
+        result = self.process_service.start_script(
+            self.bat_path, self.script_name, self.port
+        )
         if result["success"]:
+            self._process = result.get("process")
             self.log_signal.emit(f"进程已启动，PID: {result['pid']}")
         else:
             self.log_signal.emit(f"启动失败: {result.get('error', '未知错误')}")
 
         while self._running:
-            line = self.process_service.read_output()
+            # 读自己的进程输出（多服务器并发时不与其他脚本的 worker 互相串扰）
+            line = self.process_service.read_output(self._process)
             if line:
                 if not self._url_emitted:
                     m = self._url_pattern.search(line)
@@ -42,7 +49,7 @@ class LogWorker(QThread):
                     except ValueError:
                         pass
                 self.log_signal.emit(line)
-            if not self.process_service.is_process_alive():
+            if not self.process_service.is_process_alive(self._process):
                 break
             self.msleep(200)
 

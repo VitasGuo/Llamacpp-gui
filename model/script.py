@@ -4,11 +4,16 @@ from datetime import datetime
 
 
 class ScriptEntry:
-    def __init__(self, name="", content="", model_path=""):
+    def __init__(self, name="", content="", model_path="", pid=None, started_at="", port=None):
         self.name = name
         self.content = content
         self.saved_at = datetime.now().isoformat()
         self.model_path = model_path
+        # 运行时字段（多服务器管理：由 ui 层从 process_service 的 pids.json 合并填充；
+        # 持久化在 data/pids.json，不写入 scripts.json —— 后者由 _sync_config 全量重建）
+        self.pid = pid
+        self.started_at = started_at
+        self.port = port
 
     @staticmethod
     def sanitize_filename(name):
@@ -30,6 +35,9 @@ class ScriptEntry:
             "content": self.content,
             "saved_at": self.saved_at,
             "model_path": self.model_path,
+            "pid": self.pid,
+            "started_at": self.started_at,
+            "port": self.port,
         }
 
     @classmethod
@@ -40,4 +48,7 @@ class ScriptEntry:
             model_path=d.get("model_path", ""),
         )
         entry.saved_at = d.get("saved_at", "")
+        entry.pid = d.get("pid")
+        entry.started_at = d.get("started_at", "")
+        entry.port = d.get("port")
         return entry

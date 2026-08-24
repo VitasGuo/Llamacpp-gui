@@ -7,17 +7,17 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QTextEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QSplitter, QTabWidget,
-    QFileDialog, QInputDialog, QDialog,
+    QTreeWidget, QTreeWidgetItem, QMessageBox,
+    QSplitter, QTabWidget, QFileDialog, QInputDialog, QDialog,
 )
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QTextCursor, QAction
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QTextCursor, QAction, QBrush, QColor
 
 from config.config import Settings
 from utils.validator import validate_llamacpp_file, validate_gguf
 from utils.logger import info
 from service.script_service import ScriptService
-from service.script_builder import build_bat_content
+from service.script_builder import build_bat_content, extract_port
 from service.process_service import ProcessService
 from service.monitor_service import MonitorService
 from service.path_service import ensure_webui
@@ -44,6 +44,8 @@ class MainWindow(QMainWindow):
         self.current_script_name = ""
         self.is_running = False
         self.log_worker = None
+        self.log_workers = []  # 多服务器：所有活动 LogWorker（保持引用防 GC）
+        self._script_entries = []
         self._server_url = ""
         self._bridge_server = None
         self._bridge_port = None
@@ -59,11 +61,18 @@ class MainWindow(QMainWindow):
         self._load_saved_paths()
         self._restore_service_state()
 
+        # 多服务器：每 2s 轮询刷新脚本列表状态列与控制面板
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(2000)
+        self._status_timer.timeout.connect(self._refresh_script_statuses)
+        self._status_timer.start()
+
         self.monitor_service.start()
         ensure_webui()
         self._start_bridge()
 
     def closeEvent(self, event):
+        self._status_timer.stop()
         if self._bridge_server:
             self._bridge_server.shutdown()
         self.monitor_service.stop()
@@ -147,7 +156,13 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         left_layout = QVBoxLayout()
-        self.script_list = QListWidget()
+        # 双列：脚本名 + 状态（● 运行中 PID=xxx / 已停止）
+        self.script_list = QTreeWidget()
+        self.script_list.setColumnCount(2)
+        self.script_list.setHeaderLabels(["脚本", "状态"])
+        self.script_list.setColumnWidth(1, 130)
+        self.script_list.setRootIsDecorated(False)
+        self.script_list.setUniformRowHeights(True)
         self.script_list.currentItemChanged.connect(self._on_script_selected)
         left_layout.addWidget(self.script_list)
 
@@ -256,17 +271,100 @@ class MainWindow(QMainWindow):
         self._refresh_script_list()
 
     def _restore_service_state(self):
-        pid = self.process_service.restore_last_pid()
-        if pid is None:
-            return
-        self.is_running = True
-        self.run_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.status_label.setText("\u25cf 运行中")
-        self.status_label.setStyleSheet(
-            "color: orange; font-size: 12px; font-weight: bold;"
-        )
-        self._append_log(f"检测到上次启动的服务仍在运行, PID={pid}")
+        # 多服务器恢复：对每个保存了 pid 的脚本探测存活并同步 UI
+        alive = self.process_service.restore_all_pids()
+        for name, pid in alive.items():
+            self._append_log(f"检测到脚本 '{name}' 上次启动的服务仍在运行, PID={pid}")
+        if not alive:
+            # 回退：旧版本 data/last_pid.pid（无脚本归属信息，行为与升级前一致）
+            pid = self.process_service.restore_last_pid()
+            if pid is not None:
+                self._append_log(f"检测到上次启动的服务仍在运行, PID={pid}")
+        self._refresh_script_list()
+        self._sync_control_panel()
+        self._refresh_script_statuses()
+
+    def _runtime_status_text(self, name, runtime):
+        entry = runtime.get(name)
+        if entry and isinstance(entry.get("pid"), int):
+            return f"● 运行中 PID={entry['pid']}"
+        return "已停止"
+
+    def _refresh_script_list(self):
+        self.script_list.clear()
+        self.script_list.setColumnCount(2)
+        scripts = self.script_service.load_scripts()
+        self._script_entries = scripts
+        runtime = self.process_service.load_runtime()
+        for script in scripts:
+            # 合并运行时字段（多服务器：pid/started_at/port 来自 pids.json）
+            rt = runtime.get(script.name) or {}
+            script.pid = rt.get("pid")
+            script.started_at = rt.get("started_at", "")
+            script.port = rt.get("port")
+            item = QTreeWidgetItem()
+            item.setText(0, script.name)
+            item.setText(1, self._runtime_status_text(script.name, runtime))
+            self.script_list.addTopLevelItem(item)
+
+    def _refresh_script_statuses(self):
+        """2s 轮询：按 tasklist 探测每个脚本的 pid 存活，刷新状态列与控制面板。"""
+        runtime = self.process_service.load_runtime()
+        for i in range(self.script_list.topLevelItemCount()):
+            item = self.script_list.topLevelItem(i)
+            name = item.text(0)
+            alive = self.process_service.is_running(name)
+            entry = runtime.get(name) or {}
+            if alive:
+                item.setText(1, f"● 运行中 PID={entry.get('pid')}")
+                item.setForeground(0, QBrush(QColor("#e67e22")))
+                item.setForeground(1, QBrush(QColor("#e67e22")))
+            else:
+                item.setText(1, "已停止")
+                item.setForeground(0, QBrush(QColor("#999999")))
+                item.setForeground(1, QBrush(QColor("#999999")))
+        self._sync_control_panel()
+
+    def _sync_control_panel(self):
+        """运行/结束按钮与状态标签反映选中脚本的运行状态（多服务器按脚本独立）。
+
+        无选中脚本时回退全局 current_pid（旧版本启动/last_pid 恢复的进程）。
+        """
+        name = self.current_script_name
+        if name:
+            # 该脚本有活动 LogWorker（刚启动、pids.json 可能尚未落盘）→ 运行中
+            running = any(
+                getattr(w, "script_name", None) == name for w in self.log_workers
+            )
+            if not running:
+                running = self.process_service.is_running(name)
+        else:
+            running = self.process_service.is_running()
+        self.is_running = running
+        self.run_btn.setEnabled(not running)
+        self.stop_btn.setEnabled(running)
+        if running:
+            self.status_label.setText("\u25cf 运行中")
+            self.status_label.setStyleSheet(
+                "color: orange; font-size: 12px; font-weight: bold;"
+            )
+        else:
+            self.status_label.setText("\u25cf 就绪")
+            self.status_label.setStyleSheet(
+                "color: green; font-size: 12px; font-weight: bold;"
+            )
+
+    def _on_script_selected(self, current, previous):
+        if current:
+            name = current.text(0)
+            self.current_script_name = name
+            content = self.script_service.load_script_content(name)
+            self.script_editor.setPlainText(content)
+            self._sync_control_panel()
+        else:
+            # 取消选中 → 控制面板回退全局状态（旧版本启动/last_pid 恢复的进程）
+            self.current_script_name = ""
+            self._sync_control_panel()
 
     def _select_llamacpp_path(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -309,19 +407,6 @@ class MainWindow(QMainWindow):
                 self._append_log(f"外挂视觉模型已设置: {path}")
             else:
                 QMessageBox.warning(self, "验证失败", "请选择 .gguf 格式的模型文件。")
-
-    def _refresh_script_list(self):
-        self.script_list.clear()
-        scripts = self.script_service.load_scripts()
-        for script in scripts:
-            self.script_list.addItem(script.name)
-
-    def _on_script_selected(self, current, previous):
-        if current:
-            name = current.text()
-            self.current_script_name = name
-            content = self.script_service.load_script_content(name)
-            self.script_editor.setPlainText(content)
 
     def _new_script(self):
         self.current_script_name = ""
@@ -394,7 +479,7 @@ class MainWindow(QMainWindow):
         if not current:
             QMessageBox.warning(self, "提示", "请先选择一个脚本。")
             return
-        name = current.text()
+        name = current.text(0)
         reply = QMessageBox.question(
             self, "确认删除",
             f"确定要删除脚本 '{name}' 吗？",
@@ -409,12 +494,12 @@ class MainWindow(QMainWindow):
 
     def _run_script(self):
         if self.is_running:
-            QMessageBox.warning(self, "提示", "已有进程在运行，请先结束。")
+            QMessageBox.warning(self, "提示", "该脚本已有进程在运行，请先结束。")
             return
 
         if not self.current_script_name:
-            if self.script_list.count() > 0:
-                self.script_list.setCurrentRow(0)
+            if self.script_list.topLevelItemCount() > 0:
+                self.script_list.setCurrentItem(self.script_list.topLevelItem(0))
                 if not self.current_script_name:
                     return
             else:
@@ -435,14 +520,30 @@ class MainWindow(QMainWindow):
             )
             bat_path = self.script_service.save_script(entry)
 
+        # 端口预检：解析 .bat 的 --port（默认 8080），bind 探测；被占则询问
+        port = extract_port(content, default=8080)
+        if self.process_service.is_port_in_use(port):
+            reply = QMessageBox.question(
+                self, "端口占用",
+                f"端口 {port} 已被占用，仍要启动？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
         self._server_url = ""
-        self.log_worker = LogWorker(bat_path, self.process_service)
-        self.log_worker.log_signal.connect(self._append_log)
-        self.log_worker.server_ready_signal.connect(self._on_server_ready)
-        self.log_worker.tps_signal.connect(self.monitor_tab.update_tps)
-        self.log_worker.finished.connect(self._on_run_finished)
-        self.log_worker.finished.connect(self.monitor_tab.on_server_stopped)
-        self.log_worker.start()
+        worker = LogWorker(
+            bat_path, self.process_service,
+            self.current_script_name, port,
+        )
+        self.log_worker = worker
+        self.log_workers.append(worker)
+        worker.log_signal.connect(self._append_log)
+        worker.server_ready_signal.connect(self._on_server_ready)
+        worker.tps_signal.connect(self.monitor_tab.update_tps)
+        worker.finished.connect(lambda w=worker: self._on_run_finished(w))
+        worker.finished.connect(self.monitor_tab.on_server_stopped)
+        worker.start()
 
         self.is_running = True
         self.run_btn.setEnabled(False)
@@ -451,6 +552,7 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet(
             "color: orange; font-size: 12px; font-weight: bold;"
         )
+        self._refresh_script_statuses()
         self.monitor_tab.on_server_started()
 
     def _on_server_ready(self, url):
@@ -458,14 +560,15 @@ class MainWindow(QMainWindow):
         self._server_url = url
         self._append_log(f"检测到服务已就绪: {url}")
 
-    def _on_run_finished(self):
-        self.is_running = False
-        self.run_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.status_label.setText("\u25cf 就绪")
-        self.status_label.setStyleSheet(
-            "color: green; font-size: 12px; font-weight: bold;"
-        )
+    def _on_run_finished(self, worker=None):
+        # 多服务器：某脚本的进程退出 → 清除该脚本运行时记录，刷新状态
+        if worker is not None:
+            name = getattr(worker, "script_name", "")
+            if name:
+                self.process_service.clear_runtime(name)
+            self.log_workers = [w for w in self.log_workers if w is not worker]
+        self._sync_control_panel()
+        self._refresh_script_statuses()
 
     def _open_chat_window(self):
         if self._bridge_port:
@@ -480,19 +583,19 @@ class MainWindow(QMainWindow):
             return
 
         # 常规停止只按 PID（本软件跟踪的进程）；"清理全部"走 _cleanup_all_processes
-        stopped = self.process_service.stop_by_pid()
+        # 多服务器：停止选中脚本自己的进程；无脚本归属时走全局 current_pid（兼容旧版本）
+        name = self.current_script_name
+        if name and self.process_service.load_runtime().get(name, {}).get("pid"):
+            stopped = self.process_service.stop_by_pid(name)
+        else:
+            stopped = self.process_service.stop_by_pid()
         if stopped:
             self._append_log("进程已终止")
         else:
             self._append_log("尝试终止进程，但可能未找到相关进程")
 
-        self.is_running = False
-        self.run_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.status_label.setText("\u25cf 就绪")
-        self.status_label.setStyleSheet(
-            "color: green; font-size: 12px; font-weight: bold;"
-        )
+        self._sync_control_panel()
+        self._refresh_script_statuses()
 
     def _cleanup_all_processes(self):
         """显式清理全部 llama 进程（含手动启动的实例），需确认。"""
@@ -514,13 +617,9 @@ class MainWindow(QMainWindow):
             self._append_log("清理完成，未发现相关进程")
             info("用户手动清理全部 llama 进程: 未发现相关进程")
 
-        self.is_running = False
-        self.run_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.status_label.setText("\u25cf 就绪")
-        self.status_label.setStyleSheet(
-            "color: green; font-size: 12px; font-weight: bold;"
-        )
+        # stop_by_name 已清空 pids.json 全部条目；各 LogWorker 检测到进程退出后自行结束
+        self._sync_control_panel()
+        self._refresh_script_statuses()
 
     def _start_bridge(self):
         try:
