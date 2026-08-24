@@ -129,7 +129,8 @@ class SchedulerService:
 
             now = datetime.now()
             interval = task.get("interval_seconds", 3600)
-            task["next_run_time"] = (now + timedelta(seconds=interval)).strftime("%Y-%m-%dT%H:%M:%S")
+            # 基于上次计划时间（当前 next_run_time）推算，执行耗时不产生漂移
+            task["next_run_time"] = self._next_run_time(task.get("next_run_time"), interval, now)
 
             conv["tasks"] = [t for t in conv.get("tasks", []) if t["id"] != task_id] + [task]
             write_conv_file(conv)
@@ -174,10 +175,30 @@ class SchedulerService:
             task["last_result"] = "[执行失败] " + summary
             task["error_count"] = task.get("error_count", 0) + 1
             task["last_run_time"] = now.strftime("%Y-%m-%dT%H:%M:%S")
-            task["next_run_time"] = (now + timedelta(seconds=interval)).strftime("%Y-%m-%dT%H:%M:%S")
+            # 与成功路径同一"基于计划时间"逻辑（计划时间缺失/畸形时退化为 now）
+            task["next_run_time"] = self._next_run_time(task.get("next_run_time"), interval, now)
 
             conv["tasks"] = [t for t in conv.get("tasks", []) if t["id"] != task_id] + [task]
             write_conv_file(conv)
             rebuild_task_index()
         except Exception as e:
             error(f"[scheduler] 任务 {task_id} 失败信息回写失败: {e}")
+
+    @staticmethod
+    def _next_run_time(planned_iso, interval, now):
+        """按上次计划时间推算 next_run_time，消除累积漂移。
+
+        base = 上次计划时间（task.next_run_time）；new_next = base + interval；
+        若 new_next < now（机器休眠/执行超时），取 now（立即再调度，不补跑多次）；
+        计划时间缺失/畸形时退化为 base = now（不排到过去，无 1s 级重试）。
+        """
+        base = now
+        if planned_iso:
+            try:
+                base = datetime.fromisoformat(planned_iso)
+            except (TypeError, ValueError):
+                base = now
+        new_next = base + timedelta(seconds=interval)
+        if new_next < now:
+            new_next = now
+        return new_next.strftime("%Y-%m-%dT%H:%M:%S")
