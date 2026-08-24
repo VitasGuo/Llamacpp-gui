@@ -1,4 +1,5 @@
 """启动脚本参数构建逻辑。"""
+from config.config import Settings
 
 CATEGORIES = [
     {
@@ -64,6 +65,22 @@ CATEGORIES = [
         ],
     },
 ]
+
+
+def get_switch_default(key):
+    """取参数默认值：优先用 Settings 中用户保存的值；为空或未设置时回退 CATEGORIES 内置默认。
+
+    这样无配置时行为与历史硬编码默认一致；用户在设置对话框保存过值后，
+    该值用于新建脚本对话框的预填（用户仍可在对话框中再次覆盖）。
+    """
+    value = getattr(Settings.get_instance(), key, None)
+    if value:
+        return value
+    for cat in CATEGORIES:
+        for sw in cat["switches"]:
+            if sw["key"] == key:
+                return sw.get("default", "")
+    return ""
 
 
 def build_bat_content(exe_dir, model_path, config, visual_model_path=""):

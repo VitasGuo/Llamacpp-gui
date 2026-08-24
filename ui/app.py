@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QInputDialog, QDialog,
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QTextCursor
+from PyQt6.QtGui import QTextCursor, QAction
 
 from config.config import Settings
 from utils.validator import validate_llamacpp_file, validate_gguf
@@ -26,6 +26,7 @@ from model.script import ScriptEntry
 from ui.model_tab import ModelTab
 from ui.monitor_tab import MonitorTab
 from ui.dialogs.new_script_dialog import NewScriptDialog
+from ui.dialogs.settings_dialog import SettingsDialog
 from ui.workers.log_worker import LogWorker
 from ui.workers.update_workers import CheckUpdateWorker, CheckAppUpdateWorker
 
@@ -69,6 +70,12 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _init_ui(self):
+        # 菜单：设置入口
+        settings_menu = self.menuBar().addMenu("设置")
+        settings_action = QAction("设置...", self)
+        settings_action.triggered.connect(self._open_settings)
+        settings_menu.addAction(settings_action)
+
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
@@ -523,6 +530,10 @@ class MainWindow(QMainWindow):
             self._bridge_server = None
             self._bridge_port = None
             self._append_log(f"聊天桥服务启动失败: {e}")
+
+    def _open_settings(self):
+        dialog = SettingsDialog(self)
+        dialog.exec()
 
     def _check_update(self):
         self.check_update_btn.setEnabled(False)

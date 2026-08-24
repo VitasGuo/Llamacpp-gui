@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QCheckBox, QDialog, QDialogButtonBox, QScrollArea,
 )
 
-from service.script_builder import CATEGORIES
+from service.script_builder import CATEGORIES, get_switch_default
 
 
 class NewScriptDialog(QDialog):
@@ -52,7 +52,8 @@ class NewScriptDialog(QDialog):
                 self.checkboxes[sw["key"]] = cb
 
                 if sw.get("show_input", sw["default"] != ""):
-                    val_widget = QLineEdit(sw["default"])
+                    # 默认值预填：Settings 用户设置优先，否则 CATEGORIES 内置默认
+                    val_widget = QLineEdit(get_switch_default(sw["key"]))
                     if sw.get("numeric"):
                         val_widget.setValidator(QIntValidator(0, 1000000000))
                 else:
