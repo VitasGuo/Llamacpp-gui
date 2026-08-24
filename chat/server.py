@@ -3,7 +3,7 @@ import os
 import socket
 import threading
 import time
-from http.server import HTTPServer
+from http.server import ThreadingHTTPServer
 
 from .handlers import BridgeHandler
 from .log import error
@@ -83,13 +83,13 @@ def start_bridge():
     old_port = _read_old_port()
     if old_port is not None:
         try:
-            server = HTTPServer(("127.0.0.1", old_port), BridgeHandler)
+            server = ThreadingHTTPServer(("127.0.0.1", old_port), BridgeHandler)
             port = server.server_address[1]  # 以实际 bind 结果为准
         except OSError:
             pass  # 旧端口被占用：回退 find_free_port
     if server is None:
         port = find_free_port()
-        server = HTTPServer(("127.0.0.1", port), BridgeHandler)
+        server = ThreadingHTTPServer(("127.0.0.1", port), BridgeHandler)
         port = server.server_address[1]  # 以实际 bind 结果为准
 
     with open(PORT_FILE, "w", encoding="utf-8") as f:
