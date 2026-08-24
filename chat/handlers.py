@@ -7,6 +7,7 @@ import mimetypes
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
+from .log import error as _log_error
 from .repository import (
     _load_json,
     _now,
@@ -136,6 +137,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "forbidden"})
             return
         if not os.path.isfile(filepath):
+            _log_error(f"webui 404: 请求 {path}，文件 {filepath} 不存在（CWD={os.getcwd()}）")
             self._json(404, {"error": "not found"})
             return
         mime, _ = mimetypes.guess_type(filepath)

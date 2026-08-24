@@ -15,7 +15,7 @@ from PyQt6.QtGui import QTextCursor, QAction, QBrush, QColor
 
 from config.config import Settings
 from utils.validator import validate_llamacpp_file, validate_gguf
-from utils.logger import info
+from utils.logger import error, info
 from service.script_service import ScriptService
 from service.script_builder import build_bat_content, extract_port
 from service.process_service import ProcessService
@@ -573,12 +573,28 @@ class MainWindow(QMainWindow):
         self._refresh_script_statuses()
 
     def _open_chat_window(self):
-        if self._bridge_port:
-            url = f"http://127.0.0.1:{self._bridge_port}/chat.html"
-            webbrowser.open(url)
-            self._append_log(f"已打开聊天页面: {url}")
-        else:
+        if not self._bridge_port:
             QMessageBox.warning(self, "提示", "聊天桥服务未启动。")
+            return
+
+        # 打开前重新确保静态文件已部署（幂等，可修复 data/webui 缺失）
+        ensure_webui()
+        webui_file = os.path.abspath(os.path.join("data", "webui", "chat.html"))
+        if not os.path.isfile(webui_file):
+            self._append_log(f"聊天页面文件缺失: {webui_file}")
+            error(f"打开聊天页面失败: {webui_file} 不存在（CWD={os.getcwd()}）")
+            QMessageBox.warning(
+                self, "无法打开聊天页面",
+                f"找不到聊天页面文件:\n{webui_file}\n\n"
+                f"当前工作目录: {os.getcwd()}\n\n"
+                "请确认程序从项目根目录（或 PyInstaller 产物所在目录）启动，\n"
+                "且 ui/chat_webui 目录完整后重试。",
+            )
+            return
+
+        url = f"http://127.0.0.1:{self._bridge_port}/chat.html"
+        webbrowser.open(url)
+        self._append_log(f"已打开聊天页面: {url}")
 
     def _stop_script(self):
         if not self.is_running:
@@ -627,6 +643,11 @@ class MainWindow(QMainWindow):
         try:
             self._bridge_server, self._bridge_port = start_bridge()
             self._append_log(f"聊天桥服务已启动，端口: {self._bridge_port}")
+            webui_file = os.path.abspath(os.path.join("data", "webui", "chat.html"))
+            if os.path.isfile(webui_file):
+                info(f"聊天页面文件就绪: {webui_file}")
+            else:
+                error(f"聊天页面文件缺失（聊天页将返回 404）: {webui_file}（CWD={os.getcwd()}）")
         except Exception as e:
             self._bridge_server = None
             self._bridge_port = None
