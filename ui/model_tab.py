@@ -343,7 +343,10 @@ class ModelTab(QWidget):
             wl.setContentsMargins(0, 0, 0, 0)
             self.file_table.setCellWidget(row, 0, w)
 
-            self.file_table.setItem(row, 1, QTableWidgetItem(f.get("Path", "")))
+            file_item = QTableWidgetItem(f.get("Path", ""))
+            # 原始大小（字节）存进 UserRole，供 _download_selected 直接读取，避免从显示文本有损反解析
+            file_item.setData(Qt.ItemDataRole.UserRole, int(f.get("Size", 0) or 0))
+            self.file_table.setItem(row, 1, file_item)
             self.file_table.setItem(row, 2, QTableWidgetItem(_format_size(f.get("Size", 0))))
 
             dl_btn = QPushButton("下载")
@@ -381,28 +384,20 @@ class ModelTab(QWidget):
             cb = w.findChild(QCheckBox)
             if cb and cb.isChecked():
                 file_path = self.file_table.item(row, 1).text()
-                size_text = self.file_table.item(row, 2).text()
-                size = 0
-                if size_text:
-                    try:
-                        if "GB" in size_text:
-                            size = int(float(size_text.replace("GB", "")) * 10 ** 9)
-                        elif "MB" in size_text:
-                            size = int(float(size_text.replace("MB", "")) * 10 ** 6)
-                        elif "KB" in size_text:
-                            size = int(float(size_text.replace("KB", "")) * 10 ** 3)
-                    except ValueError:
-                        pass
-            ok = self.download_manager.start_download(
-                self._current_source, self._current_model_id, file_path, size, dl_path
-            )
-            if ok:
-                entry = self.download_manager.download_queue.find(
-                    self._current_source, self._current_model_id, file_path
+                # 读取行构建时存入 UserRole 的原始大小（字节），非 int 时取 0
+                size = self.file_table.item(row, 1).data(Qt.ItemDataRole.UserRole)
+                if not isinstance(size, int):
+                    size = 0
+                ok = self.download_manager.start_download(
+                    self._current_source, self._current_model_id, file_path, size, dl_path
                 )
-                if entry:
-                    self._add_queue_row(entry)
-                started += 1
+                if ok:
+                    entry = self.download_manager.download_queue.find(
+                        self._current_source, self._current_model_id, file_path
+                    )
+                    if entry:
+                        self._add_queue_row(entry)
+                    started += 1
         if started == 0:
             QMessageBox.warning(self, "提示", "请先勾选要下载的文件")
 

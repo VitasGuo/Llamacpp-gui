@@ -275,6 +275,8 @@ class MainWindow(QMainWindow):
         alive = self.process_service.restore_all_pids()
         for name, pid in alive.items():
             self._append_log(f"检测到脚本 '{name}' 上次启动的服务仍在运行, PID={pid}")
+            # 同步到监控页状态面板（否则恢复后显示"未运行"，与实际不符）
+            self.monitor_tab.on_server_started(name)
         if not alive:
             # 回退：旧版本 data/last_pid.pid（无脚本归属信息，行为与升级前一致）
             pid = self.process_service.restore_last_pid()
@@ -308,13 +310,20 @@ class MainWindow(QMainWindow):
             self.script_list.addTopLevelItem(item)
 
     def _refresh_script_statuses(self):
-        """2s 轮询：按 tasklist 探测每个脚本的 pid 存活，刷新状态列与控制面板。"""
+        """2s 轮询：一次批量 tasklist 探测所有脚本 pid 的存活，刷新状态列与控制面板。"""
         runtime = self.process_service.load_runtime()
+        pids = {
+            entry.get("pid")
+            for entry in runtime.values()
+            if isinstance(entry.get("pid"), int) and entry.get("pid") > 0
+        }
+        alive_set = self.process_service.alive_pids(pids)
         for i in range(self.script_list.topLevelItemCount()):
             item = self.script_list.topLevelItem(i)
             name = item.text(0)
-            alive = self.process_service.is_running(name)
             entry = runtime.get(name) or {}
+            pid = entry.get("pid")
+            alive = isinstance(pid, int) and pid > 0 and pid in alive_set
             if alive:
                 item.setText(1, f"● 运行中 PID={entry.get('pid')}")
                 item.setForeground(0, QBrush(QColor("#e67e22")))
@@ -544,7 +553,12 @@ class MainWindow(QMainWindow):
         worker.server_ready_signal.connect(self._on_server_ready)
         worker.tps_signal.connect(self.monitor_tab.update_tps)
         worker.finished.connect(lambda w=worker: self._on_run_finished(w))
-        worker.finished.connect(self.monitor_tab.on_server_stopped)
+        # 多服务器：退出时带上脚本名，只重置该服务的状态（不顶掉其他服务）
+        worker.finished.connect(
+            lambda w=worker: self.monitor_tab.on_server_stopped(
+                getattr(w, "script_name", "") or "default"
+            )
+        )
         worker.start()
 
         self.is_running = True
@@ -555,7 +569,7 @@ class MainWindow(QMainWindow):
             "color: orange; font-size: 12px; font-weight: bold;"
         )
         self._refresh_script_statuses()
-        self.monitor_tab.on_server_started()
+        self.monitor_tab.on_server_started(self.current_script_name or "default")
 
     def _on_server_ready(self, url):
         url = url.replace("0.0.0.0", "127.0.0.1")

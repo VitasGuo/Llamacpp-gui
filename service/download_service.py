@@ -56,18 +56,28 @@ class DownloadWorker(QThread):
                 chunk_callback=on_chunk,
             )
             if self._cancelled:
-                if os.path.exists(self.dest_path):
-                    os.remove(self.dest_path)
+                self._remove_partial_file()
                 self.finished_signal.emit(self.source, self.file_path, False, "已取消")
             else:
                 self.finished_signal.emit(self.source, self.file_path, True, "")
         except PauseException:
             self.finished_signal.emit(self.source, self.file_path, False, "已暂停")
         except StopIteration:
+            # 取消中断（下个 chunk 检查到 _cancelled）：同样删除半成品
+            self._remove_partial_file()
             self.finished_signal.emit(self.source, self.file_path, False, "已取消")
         except Exception as e:
             error(f"下载失败 {self.source} {self.file_path}: {e}")
             self.finished_signal.emit(self.source, self.file_path, False, str(e))
+
+    def _remove_partial_file(self):
+        """取消时删除半成品文件。句柄在 worker 线程内持有，由 worker 自己删除，
+        避免 manager 侧删除被占用文件失败/句柄竞态（Windows 上文件锁定）。"""
+        if os.path.exists(self.dest_path):
+            try:
+                os.remove(self.dest_path)
+            except OSError as e:
+                error(f"取消下载后删除文件失败 {self.dest_path}: {e}")
 
     def pause(self):
         self._paused = True
@@ -86,9 +96,11 @@ class DownloadManager(QObject):
         super().__init__(parent)
         self.download_queue = DownloadQueue()
         self._workers = {}
+        # queue.json 写盘节流：(source, file_path) -> 上次持久化的 time.monotonic()
+        self._last_persist = {}
 
     def start_download(self, source, model_id, file_path, file_size, dl_path):
-        """启动下载。如果已在队列中则恢复，否则新建。"""
+        """启动下载。如果已在队列中则恢复，否则新建；支持从本地已有文件续传。"""
         existing = self.download_queue.find(source, model_id, file_path)
         worker_key = (source, file_path)
         active_worker = self._workers.get(worker_key)
@@ -96,18 +108,34 @@ class DownloadManager(QObject):
             return False  # 已在下载中
 
         filename = os.path.basename(file_path)
+        # 下载目录可能已变更，本地文件存在性基于新算出的 dest_path 判断
         dest_path = os.path.join(dl_path, filename)
+        local_size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
 
         if existing and existing.status in ("paused", "downloading", "pending"):
+            # 暂停/进行中/待下载的续传保持现状：沿用 entry.downloaded
             entry = existing
             entry.status = "downloading"
-            resume_pos = entry.downloaded
-        elif existing and existing.status in ("completed", "failed", "cancelled"):
+        elif existing and existing.status == "failed":
+            entry = existing
+            if file_size > 0 and local_size == file_size:
+                # 本地文件已完整（失败发生在下载完成之后），直接标记完成
+                entry.status = "completed"
+                entry.downloaded = local_size
+                self.download_queue.update(entry)
+                return True  # 无需启动 worker
+            # 失败重试：优先从本地已有文件续传，不再无条件从 0 开始
+            entry.status = "downloading"
+            if (0 < local_size < file_size) or (file_size == 0 and local_size > 0):
+                entry.downloaded = local_size
+            else:
+                entry.downloaded = 0
+        elif existing and existing.status in ("completed", "cancelled"):
             entry = existing
             entry.status = "downloading"
             entry.downloaded = 0
-            resume_pos = 0
         else:
+            # 新任务：先入队，再根据本地文件状态决定续传或直接完成
             entry = DownloadEntry(
                 source=source,
                 model_id=model_id,
@@ -117,11 +145,22 @@ class DownloadManager(QObject):
                 downloaded=0,
                 status="downloading",
             )
+            if file_size > 0 and local_size >= file_size:
+                # 本地已有完整文件（同名残留），直接标记完成，无需启动 worker
+                entry.status = "completed"
+                entry.downloaded = local_size
+                self.download_queue.add(entry)
+                return True
+            if (0 < local_size < file_size) or (file_size == 0 and local_size > 0):
+                # 本地已有同名半成品（例如上次中断残留），从断点续传，避免 "wb" 截断
+                entry.downloaded = local_size
             self.download_queue.add(entry)
 
+        # 以本次计算出的 dest_path 为准（下载目录可能已变更）
+        entry.dest_path = dest_path
+
         url = model_sources.get_download_url(source, model_id, file_path)
-        resume_pos = entry.downloaded
-        worker = DownloadWorker(source, url, dest_path, file_path, resume_pos)
+        worker = DownloadWorker(source, url, dest_path, file_path, entry.downloaded)
         self._workers[worker_key] = worker
 
         worker.progress_signal.connect(self._on_progress)
@@ -132,13 +171,19 @@ class DownloadManager(QObject):
         return True
 
     def _on_progress(self, source, file_path, current, total):
-        """转发进度信号并更新队列。"""
+        """转发进度信号并更新队列；queue.json 写盘节流（同一文件至少 1 秒一次）。"""
         entry = self._find_entry_by_path(source, file_path)
         if entry:
+            # 内存中的 entry 每次回调照常更新
             entry.downloaded = current
             if total > 0:
                 entry.file_size = total
-            self.download_queue.update(entry)
+            # 节流持久化：避免每个 1MB chunk 都全量重写 queue.json（最终状态由 _on_finished 落盘）
+            now = time.monotonic()
+            key = (source, file_path)
+            if now - self._last_persist.get(key, 0.0) >= 1.0:
+                self._last_persist[key] = now
+                self.download_queue.update(entry)
         self.progress_signal.emit(source, file_path, current, total)
 
     def _on_speed(self, source, file_path, speed):
@@ -146,6 +191,7 @@ class DownloadManager(QObject):
 
     def _on_finished(self, source, file_path, success, error, entry):
         worker = self._workers.pop((source, file_path), None)
+        self._last_persist.pop((source, file_path), None)
         if success:
             entry.status = "completed"
         elif error == "已暂停":
@@ -170,11 +216,16 @@ class DownloadManager(QObject):
         if worker:
             worker.cancel()
         entry.status = "cancelled"
-        if os.path.exists(entry.dest_path):
-            try:
-                os.remove(entry.dest_path)
-            except OSError as e:
-                error(f"取消下载后删除文件失败 {entry.dest_path}: {e}")
+        # 有活动 worker 时不在此删文件：worker 仍持有打开句柄，继续写到下个 chunk
+        # 才停止，删除被占用文件会失败（Windows 文件锁定）/产生句柄竞态，
+        # 半成品由 worker 的 cancel 路径（_remove_partial_file）自己删除；
+        # 仅在无活动 worker 时保留原有删除逻辑
+        if not self.is_worker_active(entry.source, entry.file_path):
+            if os.path.exists(entry.dest_path):
+                try:
+                    os.remove(entry.dest_path)
+                except OSError as e:
+                    error(f"取消下载后删除文件失败 {entry.dest_path}: {e}")
         entry.downloaded = 0
         self.download_queue.update(entry)
 
@@ -187,6 +238,10 @@ class DownloadManager(QObject):
         return self.start_download(entry.source, entry.model_id, entry.file_path, entry.file_size, dl_path)
 
     def remove_download(self, entry):
+        # 若仍有活动 worker，先取消，避免 UI 行已删除但后台继续下载（幽灵下载）；
+        # worker 会在下个 chunk 停止并经 cancel 路径自行删除半成品
+        if self.is_worker_active(entry.source, entry.file_path):
+            self._workers[(entry.source, entry.file_path)].cancel()
         self.download_queue.remove(entry)
         self._workers.pop((entry.source, entry.file_path), None)
         if entry.dest_path and os.path.exists(entry.dest_path):

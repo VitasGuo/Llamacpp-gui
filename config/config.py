@@ -2,6 +2,7 @@ import os
 import json
 
 from config import APP_CONFIG_FILE
+from utils.atomic_io import atomic_write_json
 
 class Settings:
     _instance = None
@@ -29,8 +30,7 @@ class Settings:
 
     def save(self):
         os.makedirs(os.path.dirname(APP_CONFIG_FILE), exist_ok=True)
-        with open(APP_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.config, f, indent=4)
+        atomic_write_json(APP_CONFIG_FILE, self.config, indent=4, ensure_ascii=False)
 
     @property
     def llamacpp_path(self):

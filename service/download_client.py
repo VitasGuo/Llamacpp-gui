@@ -20,6 +20,16 @@ def download_file(url: str, dest_path: str, resume_pos: int = 0, chunk_callback=
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
+            # 兼容处理：新版本 urllib 用 resp.status，个别旧版本用 resp.getcode()
+            status = getattr(resp, "status", None)
+            if status is None:
+                status = resp.getcode()
+            # 断点续传时若服务器/代理忽略 Range 而返回 200（整文件内容），
+            # 继续追加写会使文件内容重复拼接、损坏，故重置为从头下载
+            if resume_pos > 0 and status != 206:
+                mode = "wb"
+                resume_pos = 0
+
             total = resume_pos
             if resume_pos == 0:
                 content_length = resp.headers.get("Content-Length")

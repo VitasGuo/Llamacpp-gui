@@ -1291,13 +1291,17 @@ async function pollConversation() {
   if (!state.currentConvId) return;
   if (!state.tasks.some(t => t.enabled)) return;
   try {
-    const conv = await api('GET', `conversations/${state.currentConvId}`);
-    if (conv.updated_at && conv.updated_at !== state.conversationUpdatedAt) {
-      state.conversationUpdatedAt = conv.updated_at;
-      state.messages = conv.messages || [];
-      state.tasks = conv.tasks || [];
-      renderMessages(true);
-      renderTaskBar();
+    // 先拉轻量 meta（不含消息体），有更新再拉完整对话，避免每 5s 拉取数 MB base64 图片
+    const meta = await api('GET', `conversations/${state.currentConvId}/meta`);
+    if (meta.updated_at && meta.updated_at !== state.conversationUpdatedAt) {
+      const conv = await api('GET', `conversations/${state.currentConvId}`);
+      if (conv.updated_at && conv.updated_at !== state.conversationUpdatedAt) {
+        state.conversationUpdatedAt = conv.updated_at;
+        state.messages = conv.messages || [];
+        state.tasks = conv.tasks || [];
+        renderMessages(true);
+        renderTaskBar();
+      }
     }
   } catch {}
 }

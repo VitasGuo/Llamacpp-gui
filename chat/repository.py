@@ -1,6 +1,7 @@
 """聊天模块数据访问层。"""
 import os
 import json
+import uuid
 import urllib.request
 from datetime import datetime
 
@@ -30,11 +31,20 @@ def _load_json(path, default):
 
 def _save_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    # 原子写：先写线程唯一的临时文件，完整写入后 os.replace 覆盖目标文件，
+    # 避免进程中途崩溃/断电时留下半截 JSON 导致数据丢失
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
     except OSError as e:
         error(f"写入 JSON 文件失败 {path}: {e}")
+        # 尽力删除残留临时文件
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
         raise
 
 
@@ -76,13 +86,50 @@ def write_agent_file(agent):
             if os.path.exists(old):
                 os.remove(old)
             break
-    _save_json(_agent_path(agent.get("name", "unnamed")), agent)
+
+    base = agent.get("name", "unnamed")
+    path = _agent_path(base)
+    if os.path.exists(path):
+        existing = _load_json(path, None)
+        if existing and existing.get("id") != agent["id"]:
+            # 同名不同 id：自动改名，避免覆盖另一个 agent 的配置（与对话改名策略一致）
+            for n in range(1, 100):
+                t = f"{base}({n})"
+                p = _agent_path(t)
+                if not os.path.exists(p):
+                    agent["name"] = t
+                    path = p
+                    break
+    _save_json(path, agent)
 
 
 def delete_agent_file(name):
     path = _agent_path(name)
     if os.path.exists(path):
         os.remove(path)
+
+
+def delete_agent(agent_id):
+    """按 id 删除：agent 文件 + 其长期记忆文件（按 agent_id 命名），返回是否删除成功。"""
+    for a in list_agents():
+        if a.get("id") == agent_id:
+            path = _agent_path(a.get("name", "unnamed"))
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError as e:
+                    error(f"删除 agent 文件失败 {path}: {e}")
+                    return False
+            # 一并清理孤儿长期记忆文件
+            memory = _memory_path(agent_id)
+            if os.path.exists(memory):
+                try:
+                    os.remove(memory)
+                except OSError as e:
+                    # 记忆清理失败不影响 agent 删除结果，只记日志
+                    error(f"删除 agent 记忆文件失败 {memory}: {e}")
+            return True
+    return False
 
 
 def migrate_agents():
@@ -144,6 +191,21 @@ def delete_conv_file(title):
     path = _conv_path(title)
     if os.path.exists(path):
         os.remove(path)
+
+
+def delete_conversation(conv_id):
+    """按 id 删除：找到匹配 id 的对话文件后删除，返回是否删除成功。"""
+    for c in list_conversations():
+        if c.get("id") == conv_id:
+            path = _conv_path(c.get("title", "未命名对话"))
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError as e:
+                    error(f"删除对话文件失败 {path}: {e}")
+                    return False
+            return True
+    return False
 
 
 def migrate_convs():

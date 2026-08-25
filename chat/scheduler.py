@@ -52,18 +52,42 @@ class SchedulerService:
         index = read_task_index()
         now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         for entry in index:
-            if entry.get("task_id") in self._executing:
+            # 安全取值：索引条目缺 task_id（脏数据）时无法调度，跳过该条目，
+            # 避免下方 executing.add 抛 KeyError 中断本 tick、饿死其后的到期任务
+            task_id = entry.get("task_id") or ""
+            if not task_id:
+                # 60s 内至多记一条日志（固定键），避免每个 tick（1s）刷量
+                now = time.monotonic()
+                key = "<tick-missing-task_id>"
+                last = self._last_skip_log_ts.get(key)
+                if last is None or now - last >= 60:
+                    self._last_skip_log_ts[key] = now
+                    error(f"[scheduler] 索引条目缺 task_id（entry={entry!r}），无法调度，跳过")
+                continue
+            if task_id in self._executing:
                 continue
             next_run = entry.get("next_run_time", "")
             if next_run <= now_iso:
-                self._executing.add(entry["task_id"])
+                self._executing.add(task_id)
                 t = threading.Thread(target=self._execute_task, args=(entry,), daemon=True)
                 t.start()
 
     def _execute_task(self, entry):
-        task_id = entry["task_id"]
-        conv_id = entry["conversation_id"]
-        agent_id = entry["agent_id"]
+        # 安全取值：索引条目缺 key（脏数据）时不抛 KeyError 致工作线程死亡
+        task_id = entry.get("task_id") or ""
+        conv_id = entry.get("conversation_id") or ""
+        agent_id = entry.get("agent_id", "")
+        if not task_id or not conv_id:
+            # 脏数据（缺必需字段）：60s 内至多记一条日志后直接跳过，
+            # 避免每个 tick 无限重试；同时释放 executing 标记，防止任务被永久锁定
+            self._executing.discard(task_id)
+            now = time.monotonic()
+            key = task_id or "<missing-task_id>"
+            last = self._last_skip_log_ts.get(key)
+            if last is None or now - last >= 60:
+                self._last_skip_log_ts[key] = now
+                error(f"[scheduler] 索引条目缺 task_id/conversation_id（task_id={task_id!r}, conv_id={conv_id!r}），跳过任务")
+            return
         try:
             settings = read_settings()
             llm_url = settings.get("llm_url", "")
@@ -151,6 +175,9 @@ class SchedulerService:
         重新从磁盘读取 conv，避免把主流程已半更新（如已 append 消息未落盘）的
         内存状态一并持久化。回写自身失败时只记日志、不再抛出。
         """
+        # 守卫：缺 id（脏数据）时直接返回，避免无意义的磁盘读取
+        if not conv_id or not task_id:
+            return
         try:
             conv = None
             for c in list_conversations():

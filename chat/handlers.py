@@ -12,8 +12,8 @@ from .repository import (
     _load_json,
     _now,
     _save_json,
-    delete_agent_file,
-    delete_conv_file,
+    delete_agent,
+    delete_conversation,
     list_agents,
     list_conversations,
     load_memory,
@@ -85,6 +85,26 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     break
             if conv:
                 self._json(200, {"tasks": conv.get("tasks", [])})
+            else:
+                self._json(404, {"error": "conversation not found"})
+
+        elif re.match(r"^/conversations/[^/]+/meta$", path):
+            # 轮询轻量化：只返回更新时间和计数，不含消息体，
+            # 前端先查 meta 是否有变化，再决定是否拉取完整对话
+            cid = path.split("/")[2]
+            conv = None
+            for c in list_conversations():
+                if c["id"] == cid:
+                    conv = c
+                    break
+            if conv:
+                self._json(200, {
+                    "id": conv["id"],
+                    "updated_at": conv.get("updated_at", ""),
+                    "message_count": len(conv.get("messages", [])),
+                    "agent_count": len(conv.get("agents", [])),
+                    "task_count": len(conv.get("tasks", [])),
+                })
             else:
                 self._json(404, {"error": "conversation not found"})
 
@@ -362,13 +382,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self._json(404, {"error": "conversation not found"})
 
         elif path.startswith("/conversations/") and len(path) > len("/conversations/") and "/tasks" not in path:
+            # 按 id 删除（repository 内按 id 定位文件，与名字唯一性解耦）
             cid = path[len("/conversations/"):]
-            for c in list_conversations():
-                if c["id"] == cid:
-                    delete_conv_file(c.get("title", "未命名对话"))
-                    self._json(200, {"deleted": True})
-                    return
-            self._json(404, {"error": "conversation not found"})
+            if delete_conversation(cid):
+                self._json(200, {"deleted": True})
+            else:
+                self._json(404, {"error": "conversation not found"})
 
         elif re.match(r"^/agents/[^/]+/memory/\d+$", path):
             parts = path.split("/")
@@ -388,13 +407,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._json(200, {"deleted": True})
 
         elif path.startswith("/agents/") and len(path) > len("/agents/"):
+            # 按 id 删除：agent 文件 + 长期记忆文件
             aid = path[len("/agents/"):]
-            for a in list_agents():
-                if a["id"] == aid:
-                    delete_agent_file(a["name"])
-                    self._json(200, {"deleted": True})
-                    return
-            self._json(404, {"error": "agent not found"})
+            if delete_agent(aid):
+                self._json(200, {"deleted": True})
+            else:
+                self._json(404, {"error": "agent not found"})
 
         else:
             self._json(404, {"error": "not found"})

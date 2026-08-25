@@ -9,6 +9,8 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QPainter
 from PyQt6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
 
+from ui.workers.history_worker import HistoryLoadWorker
+
 
 def _bar_style(pct):
     if pct >= 80:
@@ -84,7 +86,12 @@ class GpuCard(QFrame):
         self.power_label.setStyleSheet("color: #555;")
         layout.addWidget(self.power_label)
 
-    def update(self, util_pct, mem_used, mem_total, temp=None, power_w=None):
+    def update_stats(self, util_pct, mem_used, mem_total, temp=None, power_w=None):
+        """更新 GPU 指标显示。
+
+        注意：不命名为 update()——会遮蔽 QWidget.update()（Qt 重绘语义方法），
+        导致重绘信号链被业务方法顶掉，有潜在崩溃隐患（Bug #10）。
+        """
         self.util_bar.setValue(int(util_pct))
         self.util_bar.setStyleSheet(_bar_style(util_pct))
         self.util_label.setText(f"{util_pct:.0f}%")
@@ -281,13 +288,13 @@ class MonitorTab(QWidget):
     def __init__(self, monitor_service, parent=None):
         super().__init__(parent)
         self._service = monitor_service
-        self._server_running = False
-        self._server_start_time = 0.0
+        self._running = {}       # 脚本名 -> 启动时间 ts（多服务器状态面板）
         self._gpu_cards = []
         self._focus_name = ""     # 聚焦（选中）脚本：t/s 标签优先显示它
         self._log_tps = {}        # name -> (ts, tps)：日志正则通道（回退数据源）
         self._metrics_ok = {}     # name -> bool：/metrics 最近一次是否可用
         self._log_drawn_ts = {}   # name -> 已绘制的日志正则 t/s 点的 ts（防重复绘点）
+        self._hist_worker = None  # 历史加载 worker（保留引用防 GC）
 
         self._setup_ui()
         self._service.metrics_updated.connect(self._on_metrics)
@@ -361,9 +368,40 @@ class MonitorTab(QWidget):
         self._refresh_history()
 
     def _refresh_history(self):
-        """从 service 读取所选范围的历史 t/s 数据并重绘历史图。"""
-        points = self._service.load_history(self._hist_range.currentData())
+        """从 service 读取所选范围的历史 t/s 数据并重绘历史图（后台加载）。
+
+        7 天数据量大（约 12 万行 JSONL），解析+降采样交给 HistoryLoadWorker
+        （QThread）在后台执行，避免卡 UI 线程（性能 #3）。加载期间禁用
+        "刷新"按钮；加载期间若再次换范围，旧 worker 的结果返回时会被丢弃
+        （只应用最新一次 worker 的结果）。
+        """
+        worker = HistoryLoadWorker(self._service, self._hist_range.currentData())
+        self._hist_worker = worker
+        worker.result_signal.connect(
+            lambda points, w=worker: self._on_history_loaded(w, points)
+        )
+        # 兜底（t18）：QThread 内置 finished 在 run() 返回时必发（无论成功失败）——
+        # 即使 load_history 抛异常导致 result_signal 不发，"刷新"按钮也能恢复
+        worker.finished.connect(
+            lambda w=worker: self._on_history_worker_done(w)
+        )
+        worker.start()
+        self._hist_refresh_btn.setEnabled(False)
+
+    def _on_history_loaded(self, worker, points):
+        """历史加载完成（回到 UI 线程）：应用最新结果到历史图并恢复"刷新"按钮。"""
+        if worker is not self._hist_worker:
+            return  # 加载期间已有新的加载请求取代本 worker → 丢弃过期结果
         self._hist_chart.load_points(points)
+        self._hist_refresh_btn.setEnabled(True)
+
+    def _on_history_worker_done(self, worker):
+        """worker 结束兜底（QThread 内置 finished，run() 成功/失败都必发）：
+        即使异常导致 result_signal 未发出，"刷新"按钮也必然恢复（t18：
+        此前异常时按钮会永久禁用，无恢复路径）。"""
+        if worker is not self._hist_worker:
+            return  # 已有新的加载请求在进行 → 按钮保持禁用
+        self._hist_refresh_btn.setEnabled(True)
 
     def _build_top_bar(self):
         w = QWidget()
@@ -481,26 +519,57 @@ class MonitorTab(QWidget):
             return
         self._tps_label.setText(f"推理速度: {tps:.1f} t/s")
 
-    def on_server_started(self):
-        self._server_running = True
-        self._server_start_time = time.time()
-        self._status_label.setText("状态: \u25cf 运行中")
-        self._status_label.setStyleSheet("color: #27ae60; font-weight: bold;")
+    def on_server_started(self, name):
+        """某服务启动（多服务器）：记录/更新该脚本的启动时间并刷新状态面板。"""
+        name = name or "default"
+        self._running[name] = time.time()
         self._uptime_timer.start()
+        self._refresh_server_status()
 
-    def on_server_stopped(self):
-        self._server_running = False
-        self._status_label.setText("状态: \u25cf 未运行")
-        self._status_label.setStyleSheet("color: #888; font-weight: bold;")
-        self._uptime_label.setText("运行时长: --")
-        self._uptime_timer.stop()
+    def on_server_stopped(self, name):
+        """某服务停止（多服务器）：移除该脚本的记录并刷新状态面板。
+
+        只重置自己这条记录——其他仍在运行的服务不受影响（Bug #11）。
+        """
+        name = name or "default"
+        self._running.pop(name, None)
+        if not self._running:
+            self._uptime_timer.stop()
+        self._refresh_server_status()
+
+    def _refresh_server_status(self):
+        """服务器状态标签（多服务器）：
+
+        聚焦脚本在运行 → "运行中"（样式同现状运行态）；
+        否则有服务运行 → "N 个服务运行中"（橙色）；
+        否则 → "未运行"（灰色，同现状）。
+        """
+        if self._focus_name and self._focus_name in self._running:
+            self._status_label.setText("状态: \u25cf 运行中")
+            self._status_label.setStyleSheet("color: #27ae60; font-weight: bold;")
+        elif self._running:
+            n = len(self._running)
+            self._status_label.setText(f"状态: \u25cf {n} 个服务运行中")
+            self._status_label.setStyleSheet("color: orange; font-weight: bold;")
+        else:
+            self._status_label.setText("状态: \u25cf 未运行")
+            self._status_label.setStyleSheet("color: #888; font-weight: bold;")
+            self._uptime_label.setText("运行时长: --")
 
     def _update_uptime(self):
-        if self._server_running:
-            e = time.time() - self._server_start_time
-            h, r = divmod(int(e), 3600)
-            m, s = divmod(r, 60)
-            self._uptime_label.setText(f"运行时长: {h:02d}:{m:02d}:{s:02d}")
+        """运行时长标签（多服务器）：聚焦脚本在运行 → 显示它的时长；
+        未聚焦但有服务运行 → 显示最晚启动者的时长；否则 --。"""
+        if not self._running:
+            self._uptime_label.setText("运行时长: --")
+            return
+        if self._focus_name and self._focus_name in self._running:
+            start = self._running[self._focus_name]
+        else:
+            start = max(self._running.values())  # 最晚启动的服务
+        e = time.time() - start
+        h, r = divmod(int(e), 3600)
+        m, s = divmod(r, 60)
+        self._uptime_label.setText(f"运行时长: {h:02d}:{m:02d}:{s:02d}")
 
     @pyqtSlot(dict)
     def _on_metrics(self, m):
@@ -548,7 +617,7 @@ class MonitorTab(QWidget):
             c.deleteLater()
 
         for i, info in enumerate(gpus):
-            self._gpu_cards[i].update(
+            self._gpu_cards[i].update_stats(
                 info["util"], info["mem_used"], info["mem_total"],
                 info.get("temp"), info.get("power_w"),
             )

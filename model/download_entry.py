@@ -3,6 +3,7 @@ import json
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from config import DOWNLOAD_QUEUE_FILE
+from utils.atomic_io import atomic_write_json
 
 
 @dataclass
@@ -80,8 +81,8 @@ class DownloadQueue:
             "updated_at": datetime.now().isoformat(),
             "queue": [e.to_dict() for e in self.entries],
         }
-        with open(DOWNLOAD_QUEUE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        # 原子写（临时文件 + fsync + os.replace），进程中途崩溃不会留下写坏一半的 queue.json
+        atomic_write_json(DOWNLOAD_QUEUE_FILE, data, indent=2, ensure_ascii=False)
 
     def _load(self):
         if os.path.exists(DOWNLOAD_QUEUE_FILE):

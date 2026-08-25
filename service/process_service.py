@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Optional
 
 from config import LAST_PID_FILE, RUNTIME_FILE
+from utils.atomic_io import atomic_write_json
 from utils.logger import error
 
 
@@ -23,7 +24,8 @@ class ProcessService:
             return {"success": False, "error": f"脚本文件不存在: {bat_path}"}
         try:
             process = subprocess.Popen(
-                ["cmd", "/c", "chcp 65001 >nul && " + bat_path],
+                # 路径加引号：bat 路径含空格（如 C:\Users\John Doe\...）时 cmd 不会在空格处截断
+                ["cmd", "/c", f'chcp 65001 >nul && "{bat_path}"'],
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -152,6 +154,40 @@ class ProcessService:
             error(f"is_running tasklist 查询失败 PID={pid}: {e}")
             return False
 
+    def alive_pids(self, pids) -> set:
+        """批量存活判定：一次 tasklist 枚举全部进程，返回输入 pids 中存活者。
+
+        替代逐个 pid 各 spawn 一次 tasklist 的旧模式（2s 轮询/启动恢复），
+        把每轮 N+1 次子进程降为 1 次；tasklist 失败（非 Windows/命令错误）
+        记日志并返回空 set（与 _pid_alive 失败返回 False 的既有容错一致）。
+        """
+        wanted = {
+            p for p in pids
+            if isinstance(p, int) and not isinstance(p, bool) and p > 0
+        }
+        if not wanted:
+            return set()
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+            )
+            found = set()
+            for line in result.stdout.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split('","')
+                if len(parts) >= 2:
+                    pid_str = parts[1].strip('"')
+                    if pid_str.isdigit():
+                        found.add(int(pid_str))
+            return wanted & found
+        except Exception as e:
+            error(f"alive_pids tasklist 批量查询失败: {e}")
+            return set()
+
     def is_running(self, script_name=None):
         if script_name:
             entry = self.load_runtime().get(script_name)
@@ -196,9 +232,7 @@ class ProcessService:
 
     def _write_runtime(self, runtime: dict):
         try:
-            os.makedirs(os.path.dirname(self.runtime_file) or ".", exist_ok=True)
-            with open(self.runtime_file, "w", encoding="utf-8") as f:
-                json.dump(runtime, f, ensure_ascii=False, indent=2)
+            atomic_write_json(self.runtime_file, runtime, indent=2, ensure_ascii=False)
         except OSError as e:
             error(f"写入 {self.runtime_file} 失败: {e}")
 
@@ -232,10 +266,12 @@ class ProcessService:
         以它为准；仅当 pids.json 为空时才回退旧文件（升级兼容，旧文件持续
         记录"最近一次启动的 PID"，行为不变）。
         """
+        runtime = self.load_runtime()
+        found = self.alive_pids([entry.get("pid") for entry in runtime.values()])
         alive = {}
-        for name, entry in self.load_runtime().items():
+        for name, entry in runtime.items():
             pid = entry.get("pid")
-            if isinstance(pid, int) and pid > 0 and self._pid_alive(pid):
+            if isinstance(pid, int) and pid > 0 and pid in found:
                 alive[name] = pid
             else:
                 self.clear_runtime(name)
