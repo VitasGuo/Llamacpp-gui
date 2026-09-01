@@ -1,6 +1,7 @@
 /* ===== State ===== */
 const state = {
   llamaUrl: '',
+  llamaUrlManual: false,  // 用户是否在设置中手动保存过 API 地址（手动保存后不再自动覆盖）
   conversations: [],
   currentConvId: null,
   messages: [],
@@ -35,8 +36,23 @@ const JPEG_QUALITY = 0.7;
 
 /* ===== Init ===== */
 async function init() {
+  // 从桥服务自动获取当前运行的模型 API 地址（未手动配置时用于填充）
+  let defaultLlmUrl = '';
+  try {
+    const info = await api('GET', 'bridge/info');
+    defaultLlmUrl = (info && info.llm_url) || '';
+  } catch {}
+
   const saved = loadLocalSettings();
-  if (saved.llamaUrl) state.llamaUrl = saved.llamaUrl;
+  if (saved.llamaUrlManual) {
+    // 用户手动保存过 → 尊重用户配置
+    state.llamaUrl = saved.llamaUrl || '';
+    state.llamaUrlManual = true;
+  } else {
+    // 未手动保存 → 优先自动填充桥服务检测到的地址，其次回退本地保存值
+    state.llamaUrl = defaultLlmUrl || saved.llamaUrl || '';
+    state.llamaUrlManual = false;
+  }
   if (saved.reasoningDisplay) state.reasoningDisplay = saved.reasoningDisplay;
   if (saved.maxContextRounds != null) state.maxContextRounds = saved.maxContextRounds;
   if (saved.theme) state.theme = saved.theme;
@@ -74,6 +90,7 @@ function loadLocalSettings() {
 function saveLocalSettings() {
   localStorage.setItem('chat_settings', JSON.stringify({
     llamaUrl: state.llamaUrl,
+    llamaUrlManual: state.llamaUrlManual,
     reasoningDisplay: state.reasoningDisplay,
     maxContextRounds: state.maxContextRounds,
     theme: state.theme,
@@ -1646,6 +1663,8 @@ function bindEvents() {
   });
   document.getElementById('btn-save-settings').addEventListener('click', async () => {
     state.llamaUrl = document.getElementById('setting-api-url').value.trim();
+    // 手动保存后不再被自动检测覆盖；清空地址并保存则恢复自动检测
+    state.llamaUrlManual = state.llamaUrl !== '';
     state.reasoningDisplay = document.getElementById('setting-reasoning-display').value;
     state.maxContextRounds = parseInt(document.getElementById('setting-max-rounds').value) || 10;
     state.fontSize = document.getElementById('setting-font-size').value;

@@ -7,10 +7,11 @@ Settings.get_instance() 属性修改 + save()，取消不保存。
 from PyQt6.QtGui import QIntValidator
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QLabel, QLineEdit,
-    QDialogButtonBox, QScrollArea, QWidget,
+    QDialogButtonBox, QScrollArea, QWidget, QCheckBox,
 )
 
 from config.config import Settings
+from service import autostart_service
 
 # (分组标题, [(Settings 字段名, 显示标签), ...]) —— 分组与 script_builder.CATEGORIES 对应
 SECTIONS = [
@@ -59,6 +60,15 @@ class SettingsDialog(QDialog):
         layout.addWidget(tip)
 
         settings = Settings.get_instance()
+
+        # 常规区域：开机自启动（写入注册表），与托盘菜单开关同步
+        gen_label = QLabel("常规")
+        gen_label.setStyleSheet("font-weight: bold; font-size: 12px; padding: 8px 0 2px 0;")
+        layout.addWidget(gen_label)
+        self.auto_start_check = QCheckBox("开机自动启动（关闭窗口时最小化到系统托盘）")
+        self.auto_start_check.setChecked(autostart_service.is_enabled())
+        layout.addWidget(self.auto_start_check)
+
         form = QFormLayout()
         self.inputs = {}
         for title, fields in SECTIONS:
@@ -92,4 +102,5 @@ class SettingsDialog(QDialog):
         for key, edit in self.inputs.items():
             setattr(settings, key, edit.text().strip())
         settings.save()
+        autostart_service.set_enabled(self.auto_start_check.isChecked())
         self.accept()

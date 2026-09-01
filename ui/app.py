@@ -9,18 +9,22 @@ from PyQt6.QtWidgets import (
     QGroupBox, QLabel, QLineEdit, QPushButton, QTextEdit,
     QTreeWidget, QTreeWidgetItem, QMessageBox,
     QSplitter, QTabWidget, QFileDialog, QInputDialog, QDialog,
+    QSystemTrayIcon, QMenu, QComboBox,
 )
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QTextCursor, QAction, QBrush, QColor
+from PyQt6.QtGui import QTextCursor, QAction, QBrush, QColor, QPixmap, QPainter, QFont, QIcon
 
 from config.config import Settings
 from utils.validator import validate_llamacpp_file, validate_gguf
 from utils.logger import error, info
 from service.script_service import ScriptService
-from service.script_builder import build_bat_content, extract_port
+from service.script_builder import build_bat_content, extract_port, extract_host
 from service.process_service import ProcessService
+from service.tailscale import get_tailscale_ipv4
 from service.monitor_service import MonitorService
 from service.path_service import ensure_webui
+from service import autostart_service
+from service.model_scanner import scan_gguf_files
 from chat import start_bridge
 from model.script import ScriptEntry
 from ui.model_tab import ModelTab
@@ -28,6 +32,7 @@ from ui.monitor_tab import MonitorTab
 from ui.dialogs.new_script_dialog import NewScriptDialog
 from ui.dialogs.settings_dialog import SettingsDialog
 from ui.workers.log_worker import LogWorker
+from ui.workers.status_worker import StatusPoller
 from ui.workers.update_workers import CheckUpdateWorker, CheckAppUpdateWorker
 
 # 日志面板行数上限：保留最近 N 个块（行）；每追加 M 条检查一次，避免刷屏时频繁裁剪
@@ -47,9 +52,12 @@ class MainWindow(QMainWindow):
         self.log_workers = []  # 多服务器：所有活动 LogWorker（保持引用防 GC）
         self._script_entries = []
         self._server_url = ""
+        self._ts_url = ""
         self._bridge_server = None
         self._bridge_port = None
         self._log_append_count = 0
+        self._force_quit = False
+        self.tray_icon = None
 
         self.setWindowTitle("llama.cpp GUI Client")
         self.resize(960, 700)
@@ -57,26 +65,100 @@ class MainWindow(QMainWindow):
         self.monitor_service = MonitorService(self.process_service)
         self.monitor_tab = MonitorTab(self.monitor_service)
 
+        # 多服务器：后台线程每 2s 轮询 tasklist 刷新脚本列表状态列与控制面板
+        # （tasklist 约 0.5~0.7s，放 GUI 线程会卡顿，故用后台 QThread）。
+        # 必须在 _init_ui/_restore_service_state 之前创建，因为它们内部会调用
+        # _refresh_script_statuses() → _status_poller.request_poll()。
+        self._status_poller = StatusPoller(self.process_service, interval=2.0, parent=self)
+        self._status_poller.status_refreshed.connect(self._apply_script_statuses)
+        self._status_poller.start()
+
         self._init_ui()
+        self._init_tray()
         self._load_saved_paths()
         self._restore_service_state()
-
-        # 多服务器：每 2s 轮询刷新脚本列表状态列与控制面板
-        self._status_timer = QTimer(self)
-        self._status_timer.setInterval(2000)
-        self._status_timer.timeout.connect(self._refresh_script_statuses)
-        self._status_timer.start()
 
         self.monitor_service.start()
         ensure_webui()
         self._start_bridge()
 
     def closeEvent(self, event):
-        self._status_timer.stop()
+        # 托盘可用且非主动退出时，关闭仅隐藏到系统托盘，不终止进程
+        if self.tray_icon is not None and not self._force_quit:
+            self.hide()
+            event.ignore()
+            return
+        self._status_poller.stop()
         if self._bridge_server:
             self._bridge_server.shutdown()
         self.monitor_service.stop()
         super().closeEvent(event)
+
+    def _init_tray(self):
+        """初始化系统托盘图标（系统不支持时静默跳过）。"""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray_icon = QSystemTrayIcon(self)
+        icon = self._create_app_icon()
+        self.setWindowIcon(icon)
+        self.tray_icon.setIcon(icon)
+        self.tray_icon.setToolTip("llama.cpp GUI Client")
+        self.tray_icon.activated.connect(self._on_tray_activated)
+
+        menu = QMenu()
+        show_action = QAction("显示主窗口", self)
+        show_action.triggered.connect(self._show_from_tray)
+        menu.addAction(show_action)
+
+        self.auto_start_action = QAction("开机自启动", self)
+        self.auto_start_action.setCheckable(True)
+        self.auto_start_action.setChecked(autostart_service.is_enabled())
+        self.auto_start_action.toggled.connect(self._on_auto_start_toggled)
+        menu.addAction(self.auto_start_action)
+
+        menu.addSeparator()
+        quit_action = QAction("退出", self)
+        quit_action.triggered.connect(self._quit_app)
+        menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.show()
+
+    def _create_app_icon(self):
+        """用绘制方式生成托盘/窗口图标（避免依赖外部图标资源）。"""
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor("#2d8cf0"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(4, 4, 56, 56, 12, 12)
+        painter.setPen(QColor("#ffffff"))
+        painter.setFont(QFont("Microsoft YaHei", 16, QFont.Weight.Bold))
+        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "llm")
+        painter.end()
+        return QIcon(pixmap)
+
+    def _on_tray_activated(self, reason):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._show_from_tray()
+
+    def _show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_auto_start_toggled(self, checked):
+        autostart_service.set_enabled(checked)
+        info(f"开机自启动已{'启用' if checked else '关闭'}")
+
+    def _quit_app(self):
+        """从托盘菜单真正退出。"""
+        self._force_quit = True
+        self.close()
 
     def _init_ui(self):
         # 菜单：设置入口
@@ -128,14 +210,30 @@ class MainWindow(QMainWindow):
         layout.addLayout(row1)
 
         row2 = QHBoxLayout()
-        row2.addWidget(QLabel("模型文件 (.gguf):"))
+        row2.addWidget(QLabel("模型目录:"))
+        self.model_dir_edit = QLineEdit()
+        self.model_dir_edit.setPlaceholderText("选择目录后自动扫描其中 .gguf 模型")
+        self.model_dir_edit.setReadOnly(True)
+        row2.addWidget(self.model_dir_edit)
+        browse_dir_btn = QPushButton("选择目录...")
+        browse_dir_btn.clicked.connect(self._select_model_dir)
+        row2.addWidget(browse_dir_btn)
+        layout.addLayout(row2)
+
+        row2b = QHBoxLayout()
+        row2b.addWidget(QLabel("模型文件 (.gguf):"))
         self.model_path_edit = QLineEdit()
         self.model_path_edit.setReadOnly(True)
-        row2.addWidget(self.model_path_edit)
-        browse_btn2 = QPushButton("选择...")
+        row2b.addWidget(self.model_path_edit)
+        self.model_combo = QComboBox()
+        self.model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.model_combo.setEnabled(False)
+        self.model_combo.currentIndexChanged.connect(self._on_model_combo_selected)
+        row2b.addWidget(self.model_combo)
+        browse_btn2 = QPushButton("浏览...")
         browse_btn2.clicked.connect(self._select_model_file)
-        row2.addWidget(browse_btn2)
-        layout.addLayout(row2)
+        row2b.addWidget(browse_btn2)
+        layout.addLayout(row2b)
 
         row3 = QHBoxLayout()
         row3.addWidget(QLabel("外挂视觉模型 (.gguf):"))
@@ -194,7 +292,9 @@ class MainWindow(QMainWindow):
 
     def _create_control_panel(self):
         group = QGroupBox("控制面板")
-        layout = QHBoxLayout(group)
+        root = QVBoxLayout(group)
+        layout = QHBoxLayout()
+        root.addLayout(layout)
 
         self.run_btn = QPushButton("运行")
         self.run_btn.clicked.connect(self._run_script)
@@ -242,6 +342,22 @@ class MainWindow(QMainWindow):
         self.cleanup_all_btn.clicked.connect(self._cleanup_all_processes)
         layout.addWidget(self.cleanup_all_btn)
 
+        # 外网访问地址行（Tailscale）：服务以 0.0.0.0 或 Tailscale IP 监听时显示
+        ext_row = QHBoxLayout()
+        ext_row.addWidget(QLabel("外网访问:"))
+        self.ts_url_label = QLabel("")
+        self.ts_url_label.setStyleSheet(
+            "color: #2d8cf0; font-size: 12px; font-weight: bold;"
+        )
+        self.ts_url_label.setVisible(False)
+        ext_row.addWidget(self.ts_url_label)
+        self.ts_copy_btn = QPushButton("复制")
+        self.ts_copy_btn.setVisible(False)
+        self.ts_copy_btn.clicked.connect(self._copy_ts_url)
+        ext_row.addWidget(self.ts_copy_btn)
+        ext_row.addStretch()
+        root.addLayout(ext_row)
+
         return group
 
     def _create_log_panel(self):
@@ -268,6 +384,9 @@ class MainWindow(QMainWindow):
             self.model_path_edit.setText(self.settings.model_path)
         if self.settings.visual_model_path:
             self.visual_model_path_edit.setText(self.settings.visual_model_path)
+        if self.settings.model_dir:
+            self.model_dir_edit.setText(self.settings.model_dir)
+        self._reload_model_combo()
         self._refresh_script_list()
 
     def _restore_service_state(self):
@@ -310,14 +429,15 @@ class MainWindow(QMainWindow):
             self.script_list.addTopLevelItem(item)
 
     def _refresh_script_statuses(self):
-        """2s 轮询：一次批量 tasklist 探测所有脚本 pid 的存活，刷新状态列与控制面板。"""
-        runtime = self.process_service.load_runtime()
-        pids = {
-            entry.get("pid")
-            for entry in runtime.values()
-            if isinstance(entry.get("pid"), int) and entry.get("pid") > 0
-        }
-        alive_set = self.process_service.alive_pids(pids)
+        """立即刷新脚本列表状态列与控制面板。
+
+        旧实现在这里同步跑 tasklist（阻塞 ~0.6s）导致 GUI 卡顿；现改为
+        向后台 StatusPoller 请求一轮探测，探测结果经 _apply_script_statuses 回传。
+        """
+        self._status_poller.request_poll()
+
+    def _apply_script_statuses(self, runtime, alive_set):
+        """GUI 线程：把后台探测到的存活集合渲染到列表与面板（纯内存操作，不卡顿）。"""
         for i in range(self.script_list.topLevelItemCount()):
             item = self.script_list.topLevelItem(i)
             name = item.text(0)
@@ -405,6 +525,48 @@ class MainWindow(QMainWindow):
                 self._append_log(f"模型文件已设置: {path}")
             else:
                 QMessageBox.warning(self, "验证失败", "请选择 .gguf 格式的模型文件。")
+
+    def _select_model_dir(self):
+        """选择本地模型目录 → 递归扫描填充下拉。"""
+        start = self.settings.model_dir or os.path.expanduser("~")
+        path = QFileDialog.getExistingDirectory(
+            self, "选择模型目录", start,
+        )
+        if not path:
+            return
+        self.model_dir_edit.setText(path)
+        self.settings.model_dir = path
+        self.settings.save()
+        self._reload_model_combo()
+        self._append_log(f"模型目录已设置: {path}")
+
+    def _reload_model_combo(self):
+        """扫描已保存的模型目录，填充下拉并同步当前选中项。"""
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        files = scan_gguf_files(self.settings.model_dir)
+        self.model_combo.addItems(files)
+        self.model_combo.setEnabled(bool(files))
+        # 当前已选模型若存在于列表则定位到对应项
+        idx = self.model_combo.findText(
+            self.settings.model_path, Qt.MatchFlag.MatchExactly
+        )
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
+        self.model_combo.blockSignals(False)
+
+    def _on_model_combo_selected(self, index):
+        """下拉选中模型 → 写入当前模型路径。"""
+        path = self.model_combo.itemText(index)
+        if not path:
+            return
+        if validate_gguf(path):
+            self.model_path_edit.setText(path)
+            self.settings.model_path = path
+            self.settings.save()
+            self._append_log(f"模型已选择: {path}")
+        else:
+            QMessageBox.warning(self, "验证失败", "请选择 .gguf 格式的模型文件。")
 
     def _select_visual_model_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -533,6 +695,7 @@ class MainWindow(QMainWindow):
 
         # 端口预检：解析 .bat 的 --port（默认 8080），bind 探测；被占则询问
         port = extract_port(content, default=8080)
+        host = extract_host(content, default="127.0.0.1")
         if self.process_service.is_port_in_use(port):
             reply = QMessageBox.question(
                 self, "端口占用",
@@ -545,7 +708,7 @@ class MainWindow(QMainWindow):
         self._server_url = ""
         worker = LogWorker(
             bat_path, self.process_service,
-            self.current_script_name, port,
+            self.current_script_name, port, host,
         )
         self.log_worker = worker
         self.log_workers.append(worker)
@@ -575,6 +738,35 @@ class MainWindow(QMainWindow):
         url = url.replace("0.0.0.0", "127.0.0.1")
         self._server_url = url
         self._append_log(f"检测到服务已就绪: {url}")
+        self._update_external_url()
+
+    def _update_external_url(self):
+        """就绪后按当前脚本的 --host 显示 Tailscale 外网访问地址（含复制按钮）。
+
+        仅当服务以 0.0.0.0（所有接口）或 Tailscale IP 监听，且检测到 Tailscale
+        时显示；其余情况（仅本机 127.0.0.1）隐藏，避免误导。
+        """
+        ts_ip = get_tailscale_ipv4()
+        content = self.script_editor.toPlainText()
+        host = extract_host(content, default="127.0.0.1")
+        if ts_ip and host in ("0.0.0.0", ts_ip):
+            port = extract_port(content, default=8080)
+            self._ts_url = f"http://{ts_ip}:{port}"
+            self.ts_url_label.setText(self._ts_url)
+            self.ts_url_label.setVisible(True)
+            self.ts_copy_btn.setVisible(True)
+        else:
+            self._hide_external_url()
+
+    def _hide_external_url(self):
+        self._ts_url = ""
+        self.ts_url_label.setVisible(False)
+        self.ts_copy_btn.setVisible(False)
+
+    def _copy_ts_url(self):
+        if self._ts_url:
+            QApplication.clipboard().setText(self._ts_url)
+            self._append_log(f"已复制外网访问地址: {self._ts_url}")
 
     def _on_run_finished(self, worker=None):
         # 多服务器：某脚本的进程退出 → 清除该脚本运行时记录，刷新状态
@@ -583,6 +775,7 @@ class MainWindow(QMainWindow):
             if name:
                 self.process_service.clear_runtime(name)
             self.log_workers = [w for w in self.log_workers if w is not worker]
+        self._hide_external_url()
         self._sync_control_panel()
         self._refresh_script_statuses()
 
@@ -655,7 +848,9 @@ class MainWindow(QMainWindow):
 
     def _start_bridge(self):
         try:
-            self._bridge_server, self._bridge_port = start_bridge()
+            self._bridge_server, self._bridge_port = start_bridge(
+                llm_url_provider=self._current_llm_url
+            )
             self._append_log(f"聊天桥服务已启动，端口: {self._bridge_port}")
             webui_file = os.path.abspath(os.path.join("data", "webui", "chat.html"))
             if os.path.isfile(webui_file):
@@ -666,6 +861,24 @@ class MainWindow(QMainWindow):
             self._bridge_server = None
             self._bridge_port = None
             self._append_log(f"聊天桥服务启动失败: {e}")
+
+    def _current_llm_url(self):
+        """返回当前运行中模型的 API 地址（供聊天页自动填充）。
+
+        优先使用服务就绪时解析到的实际地址（最准确，含实际端口）；
+        未就绪时回退 pids.json 中记录的脚本端口 + host 推导地址
+        （--host 为 Tailscale IP 时用该 IP，保证本地浏览器可达）。
+        """
+        if self._server_url:
+            return self._server_url
+        for entry in self.process_service.load_runtime().values():
+            port = entry.get("port")
+            if isinstance(port, int) and port > 0:
+                host = entry.get("host") or "127.0.0.1"
+                if host in ("0.0.0.0", ""):
+                    host = "127.0.0.1"
+                return f"http://{host}:{port}"
+        return ""
 
     def _open_settings(self):
         dialog = SettingsDialog(self)

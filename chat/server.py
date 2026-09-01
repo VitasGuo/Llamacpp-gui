@@ -5,7 +5,7 @@ import threading
 import time
 from http.server import ThreadingHTTPServer
 
-from .handlers import BridgeHandler
+from .handlers import BridgeHandler, set_bridge_info
 from .log import error
 from .repository import (
     CHAT_DIR,
@@ -65,8 +65,11 @@ def _read_old_port():
     return p
 
 
-def start_bridge():
+def start_bridge(llm_url_provider=None):
     """启动聊天桥 HTTP 服务器（守护线程）。返回 (server, port)。
+
+    llm_url_provider 为可调用对象：返回当前运行的模型 API 地址（供前端自动填充），
+    由 GUI 注入（chat/ 不自知模型服务细节，保持子系统自包含）。
 
     优先 bind PORT_FILE 记录的旧端口（重启后端口稳定，消除探测-bind 竞态）；
     旧端口被占用（OSError）或首次运行（无文件）时回退 find_free_port 找新端口。
@@ -94,6 +97,9 @@ def start_bridge():
 
     with open(PORT_FILE, "w", encoding="utf-8") as f:
         f.write(str(port))
+
+    # 把 llm_url_provider 与桥端口注入 handlers，供 GET /bridge/info 使用
+    set_bridge_info(llm_url_provider=llm_url_provider, bridge_port=port)
 
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()

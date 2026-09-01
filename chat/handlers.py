@@ -28,6 +28,27 @@ from .repository import (
 
 WEBUI_DIR = os.path.abspath("data/webui")
 
+# 由 server.start_bridge 注入：llm_url_provider 返回当前运行的模型 API 地址，
+# bridge_port 为桥服务实际绑定端口。供 GET /bridge/info 返回给前端自动填充。
+_llm_url_provider = None
+_bridge_port = None
+
+
+def set_bridge_info(llm_url_provider=None, bridge_port=None):
+    global _llm_url_provider, _bridge_port
+    _llm_url_provider = llm_url_provider
+    _bridge_port = bridge_port
+
+
+def _default_llm_url():
+    """调用 GUI 注入的 provider 获取当前模型 API 地址；未注入/异常时返回空串。"""
+    if _llm_url_provider is None:
+        return ""
+    try:
+        return _llm_url_provider() or ""
+    except Exception:
+        return ""
+
 
 def _read_body(handler):
     length = int(handler.headers.get("Content-Length", 0))
@@ -118,6 +139,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         elif path == "/settings":
             self._json(200, read_settings())
+
+        elif path == "/bridge/info":
+            # 前端自动获取默认模型 API 地址：返回桥端口 + 当前运行的模型地址
+            self._json(200, {
+                "bridge_port": _bridge_port,
+                "llm_url": _default_llm_url(),
+            })
 
         elif re.match(r"^/agents/[^/]+/memory$", path):
             # 纯读取：清理逻辑已挪到 server.py 的 6h 周期任务，GET 不再有副作用

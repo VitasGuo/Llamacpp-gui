@@ -14,12 +14,16 @@
 | 💬 **聊天界面** | 服务器就绪后一键在浏览器中打开 Web 聊天 UI |
 | 🤖 **AI 聊天后端** | 支持多角色对话、长期记忆、定时任务调度的 HTTP 桥服务 |
 | 🔄 **版本检查** | 检查 llama.cpp 和本应用的最新 GitHub 版本 |
+| 🛡 **系统托盘** | 关闭窗口最小化到托盘，托盘菜单可显示/退出/切换开机自启动 |
+| 🚀 **开机自启动** | 一键注册/取消开机自动启动（HKCU Run，源码用 pythonw，打包后自启 exe） |
+| 🗂 **本地模型检索** | 指定本地目录自动递归扫描 .gguf，下拉菜单快速选择模型，无需手动逐个选择 |
+| 🌐 **Tailscale 外网接入** | 新建脚本时 `--host` 可选"仅本机 / 所有接口 / Tailscale 专用"（自动检测本机 Tailscale IP），服务就绪后显示外网访问地址并可一键复制 |
 
 ### 支持的推理参数
 
 | 类别 | 参数 |
 |------|------|
-| 通用 | `--gpu-layers` GPU 层数、`--port` 端口、`--ctx-size` 上下文大小、`--alias` 别名、`--host` 主机 |
+| 通用 | `--gpu-layers` GPU 层数、`--port` 端口、`--ctx-size` 上下文大小、`--alias` 别名、`--host` 监听方式（仅本机/所有接口/Tailscale 专用） |
 | 模型 | `--mmproj` 视觉模型、`--reasoning off` 关闭思考、`--main-gpu` 主 GPU、`-ts` 多卡负载 |
 | MTP | `--spec-type` 预测类型、`--spec-draft-n-max` 草稿长度 |
 | 量化 | `--cache-type-k`、`--cache-type-v` KV 缓存量化 |
@@ -77,6 +81,7 @@ main.py
 │   ├── script_builder.py   启动脚本参数模板与 .bat 生成
 │   ├── script_service.py   脚本 CRUD
 │   ├── process_service.py  进程生命周期管理
+│   ├── tailscale.py        Tailscale IP 检测（外网接入）
 │   ├── modelscope.py       ModelScope API 客户端
 │   ├── download_service.py 下载管理器
 │   └── monitor_service.py  系统资源采样

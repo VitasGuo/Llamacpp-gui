@@ -10,12 +10,13 @@ class LogWorker(QThread):
     server_ready_signal = pyqtSignal(str)
     tps_signal = pyqtSignal(str, float)  # (script_name, tps)：多服务器按脚本归属
 
-    def __init__(self, bat_path, process_service, script_name="", port=None):
+    def __init__(self, bat_path, process_service, script_name="", port=None, host=None):
         super().__init__()
         self.bat_path = bat_path
         self.process_service = process_service
         self.script_name = script_name
         self.port = port
+        self.host = host
         self._running = False
         self._process = None
         self._url_emitted = False
@@ -25,7 +26,7 @@ class LogWorker(QThread):
     def run(self):
         self._running = True
         result = self.process_service.start_script(
-            self.bat_path, self.script_name, self.port
+            self.bat_path, self.script_name, self.port, self.host
         )
         if result["success"]:
             self._process = result.get("process")

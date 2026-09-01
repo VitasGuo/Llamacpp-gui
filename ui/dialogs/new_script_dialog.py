@@ -2,10 +2,35 @@
 from PyQt6.QtGui import QIntValidator
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
-    QPushButton, QCheckBox, QDialog, QDialogButtonBox, QScrollArea,
+    QPushButton, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QScrollArea,
 )
 
 from service.script_builder import CATEGORIES, get_switch_default
+from service.tailscale import get_tailscale_ipv4
+
+
+def _build_choice_widget(choices, saved):
+    """构建下拉框：解析哨兵值 __tailscale__ 为实际 Tailscale IP。
+
+    返回 (QComboBox, tailscale_ip)；未检测到 Tailscale 时该项回退 0.0.0.0。
+    """
+    combo = QComboBox()
+    ts_ip = get_tailscale_ipv4()
+    for choice in choices:
+        value, label = choice["value"], choice["label"]
+        if value == "__tailscale__":
+            if ts_ip:
+                value, label = ts_ip, f"Tailscale 专用 ({ts_ip})"
+            else:
+                value, label = "0.0.0.0", "Tailscale 专用 (未检测到，回退 0.0.0.0)"
+        combo.addItem(label, value)
+    idx = combo.findData(saved)
+    if idx < 0:
+        idx = combo.findData("0.0.0.0")
+    if idx < 0:
+        idx = 0
+    combo.setCurrentIndex(idx)
+    return combo, ts_ip
 
 
 class NewScriptDialog(QDialog):
@@ -51,7 +76,13 @@ class NewScriptDialog(QDialog):
                 cb.setChecked(sw.get("checked", cat["checked"]))
                 self.checkboxes[sw["key"]] = cb
 
-                if sw.get("show_input", sw["default"] != ""):
+                if sw.get("choices"):
+                    # 下拉选项（如 --host 监听方式）：预填 Settings 用户值，Tailscale 哨兵自动解析
+                    combo, _ = _build_choice_widget(
+                        sw["choices"], get_switch_default(sw["key"])
+                    )
+                    val_widget = combo
+                elif sw.get("show_input", sw["default"] != ""):
                     # 默认值预填：Settings 用户设置优先，否则 CATEGORIES 内置默认
                     val_widget = QLineEdit(get_switch_default(sw["key"]))
                     if sw.get("numeric"):

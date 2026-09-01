@@ -49,6 +49,14 @@ class Settings:
         self.config["model_path"] = value
 
     @property
+    def model_dir(self):
+        return self.config.get("model_dir", "")
+
+    @model_dir.setter
+    def model_dir(self, value):
+        self.config["model_dir"] = value
+
+    @property
     def visual_model_path(self):
         return self.config.get("visual_model_path", "")
 

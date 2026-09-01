@@ -47,6 +47,9 @@ class GpuCard(QFrame):
         self.util_bar = QProgressBar()
         self.util_bar.setRange(0, 100)
         self.util_bar.setFixedHeight(18)
+        # 关闭进度条内建文本（条中间跳动的百分比在此环境渲染乱码），
+        # 百分比由右侧 util_label 显示，避免乱码且不重复显示
+        self.util_bar.setTextVisible(False)
         self.util_label = QLabel("0%")
         self.util_label.setFixedWidth(60)
         util_row = QHBoxLayout()
@@ -59,6 +62,7 @@ class GpuCard(QFrame):
         self.mem_bar = QProgressBar()
         self.mem_bar.setRange(0, 100)
         self.mem_bar.setFixedHeight(18)
+        self.mem_bar.setTextVisible(False)
         self.mem_label = QLabel("0 / 0 GB")
         self.mem_label.setFixedWidth(150)
         mem_row = QHBoxLayout()
@@ -72,6 +76,7 @@ class GpuCard(QFrame):
         self.temp_bar = QProgressBar()
         self.temp_bar.setRange(0, 100)
         self.temp_bar.setFixedHeight(18)
+        self.temp_bar.setTextVisible(False)
         self.temp_label = QLabel("--°C")
         self.temp_label.setFixedWidth(60)
         temp_row = QHBoxLayout()
@@ -425,6 +430,7 @@ class MonitorTab(QWidget):
 
         self._cpu_bar = QProgressBar()
         self._cpu_bar.setRange(0, 100)
+        self._cpu_bar.setTextVisible(False)
         self._cpu_text = QLabel("0%")
         self._cpu_text.setFixedWidth(60)
         grid.addWidget(QLabel("CPU"), 0, 0)
@@ -433,6 +439,7 @@ class MonitorTab(QWidget):
 
         self._ram_bar = QProgressBar()
         self._ram_bar.setRange(0, 100)
+        self._ram_bar.setTextVisible(False)
         self._ram_text = QLabel("0%  0 / 0 GB")
         self._ram_text.setFixedWidth(200)
         grid.addWidget(QLabel("RAM"), 1, 0)

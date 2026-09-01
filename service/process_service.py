@@ -9,6 +9,10 @@ from config import LAST_PID_FILE, RUNTIME_FILE
 from utils.atomic_io import atomic_write_json
 from utils.logger import error
 
+# 隐藏子进程控制台窗口。GUI 以 pythonw（无控制台）启动时，若子进程（tasklist/taskkill）
+# 不指定该标志，每次都会闪现一个黑色 cmd 窗口；也避免每 2s 状态轮询创建窗口造成卡顿。
+NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
+
 
 class ProcessService:
     def __init__(self):
@@ -18,15 +22,19 @@ class ProcessService:
         self.current_process = None
         self.current_pid = None
 
-    def start_script(self, bat_path, script_name="", port=None):
+    def start_script(self, bat_path, script_name="", port=None, host=None):
         bat_path = os.path.abspath(bat_path)
         if not os.path.exists(bat_path):
             return {"success": False, "error": f"脚本文件不存在: {bat_path}"}
         try:
+            # cmd /c 后紧跟以引号开头的参数会被特殊剥离引号，且 && 会被拆成命令，
+            # 导致 '"...bat"' 整体被当作一条命令找不到。改用 /d /s /c + call + 整串命令，
+            # chcp 保证输出按 UTF-8 解析；call 让 .bat 在同一个 cmd 内运行。
+            # 注意：cmd 不把单引号当引号用，必须双引号包裹 bat 路径，故 replace 统一成双引号。
+            cmdline = f'cmd /d /s /c "chcp 65001>nul && call \'{bat_path}\'"'.replace("'", '"')
             process = subprocess.Popen(
-                # 路径加引号：bat 路径含空格（如 C:\Users\John Doe\...）时 cmd 不会在空格处截断
-                ["cmd", "/c", f'chcp 65001 >nul && "{bat_path}"'],
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000,
+                cmdline,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | NO_WINDOW,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -38,7 +46,7 @@ class ProcessService:
             self.current_pid = process.pid
             self._save_pid(process.pid)  # 兼容旧 data/last_pid.pid（回退/旧版本）
             if script_name:
-                self.save_runtime(script_name, process.pid, port)
+                self.save_runtime(script_name, process.pid, port, host)
             return {"success": True, "pid": process.pid, "process": process}
         except Exception as e:
             error(f"启动脚本失败 {bat_path}: {e}")
@@ -55,6 +63,7 @@ class ProcessService:
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(pid)],
                     capture_output=True,
+                    creationflags=NO_WINDOW,
                 )
             except Exception as e:
                 error(f"stop_by_pid 结束进程失败 script={script_name} PID={pid}: {e}")
@@ -70,6 +79,7 @@ class ProcessService:
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(self.current_pid)],
                     capture_output=True,
+                    creationflags=NO_WINDOW,
                 )
                 self._clear_pid()
                 self.current_pid = None
@@ -87,6 +97,7 @@ class ProcessService:
                     ["tasklist", "/FI", f"IMAGENAME eq {keyword}", "/FO", "CSV", "/NH"],
                     capture_output=True,
                     text=True,
+                    creationflags=NO_WINDOW,
                 )
                 for line in result.stdout.strip().split("\n"):
                     line = line.strip().strip('"')
@@ -99,6 +110,7 @@ class ProcessService:
                             subprocess.run(
                                 ["taskkill", "/F", "/PID", pid],
                                 capture_output=True,
+                                creationflags=NO_WINDOW,
                             )
                             killed.append({"name": keyword, "pid": pid})
                         except Exception as e:
@@ -139,6 +151,7 @@ class ProcessService:
                 ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                 capture_output=True,
                 text=True,
+                creationflags=NO_WINDOW,
             )
             for line in result.stdout.strip().split("\n"):
                 line = line.strip()
@@ -172,6 +185,7 @@ class ProcessService:
                 ["tasklist", "/FO", "CSV", "/NH"],
                 capture_output=True,
                 text=True,
+                creationflags=NO_WINDOW,
             )
             found = set()
             for line in result.stdout.strip().split("\n"):
@@ -236,7 +250,7 @@ class ProcessService:
         except OSError as e:
             error(f"写入 {self.runtime_file} 失败: {e}")
 
-    def save_runtime(self, name, pid, port=None):
+    def save_runtime(self, name, pid, port=None, host=None):
         """记录脚本的运行时信息（启动时调用）。"""
         if not name:
             return
@@ -245,6 +259,7 @@ class ProcessService:
             "pid": int(pid),
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "port": port,
+            "host": host,
         }
         self._write_runtime(runtime)
 

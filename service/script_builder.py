@@ -3,6 +3,15 @@ import re
 
 from config.config import Settings
 
+# 监听方式下拉选项（新建脚本对话框的 --host）。
+# "__tailscale__" 是哨兵值：对话框打开时解析为检测到的 Tailscale IP，
+# 未检测到则回退 0.0.0.0，保证脚本仍可启动。
+HOST_CHOICES = [
+    {"label": "仅本机 (127.0.0.1)", "value": "127.0.0.1"},
+    {"label": "所有接口 (0.0.0.0)", "value": "0.0.0.0"},
+    {"label": "Tailscale 专用", "value": "__tailscale__"},
+]
+
 CATEGORIES = [
     {
         "title": "通用参数",
@@ -13,7 +22,7 @@ CATEGORIES = [
             {"key": "port", "label": "--port (端口号)", "default": "8080"},
             {"key": "ctx_size", "label": "--ctx-size (上下文大小)", "default": "32768"},
             {"key": "alias", "label": "--alias (模型别名)", "default": "qwen"},
-            {"key": "host", "label": "--host (监听地址)", "default": "0.0.0.0"},
+            {"key": "host", "label": "--host (监听方式)", "default": "0.0.0.0", "choices": HOST_CHOICES},
         ],
     },
     {
@@ -99,6 +108,18 @@ def extract_port(content, default=8080):
                 return port
         except ValueError:
             pass
+    return default
+
+
+def extract_host(content, default="127.0.0.1"):
+    """解析 .bat 内容中的 --host 值（运行时记录 host 用）；缺失时返回默认 127.0.0.1
+    （llama.cpp 未指定 --host 时的默认监听地址）。
+
+    兼容 `--host x.x.x.x` 与 `--host=x.x.x.x` 两种写法。
+    """
+    m = re.search(r"--host[=\s]+([0-9a-fA-F.:]+)", content or "")
+    if m:
+        return m.group(1).strip()
     return default
 
 
