@@ -27,16 +27,15 @@ class ProcessService:
         if not os.path.exists(bat_path):
             return {"success": False, "error": f"脚本文件不存在: {bat_path}"}
         try:
+            # 整条命令以字符串形式传入：Popen 对字符串参数不做 list2cmdline
+            # 的 MSVC 式转义（内部 " 会被转成 \"），而 cmd.exe 不认 \" 转义，
+            # 会把反斜杠当字面字符，导致 bat 路径被破坏、报“不是内部或外部命令”。
+            # 字符串形式原样交给 cmd 解析 && 与引号，路径中的空格/中文均安全。
             process = subprocess.Popen(
-                # 路径加引号：bat 路径含空格（如 C:\Users\John Doe\...）时 cmd 不会在空格处截断
-                ["cmd", "/c", f'chcp 65001 >nul && "{bat_path}"'],
+                f'cmd /d /c chcp 65001 >nul && "{bat_path}"',
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                encoding="utf-8",
-                errors="replace",
             )
             self.current_process = process
             self.current_pid = process.pid
@@ -131,8 +130,18 @@ class ProcessService:
         if process and process.stdout:
             line = process.stdout.readline()
             if line:
-                return line.rstrip("\n\r")
+                return self._decode_line(line)
         return None
+
+    @staticmethod
+    def _decode_line(data: bytes) -> str:
+        """按行解码子进程输出：优先 UTF-8（llama-server 输出）；
+        解码失败回退 GBK（无控制台且输出重定向到管道时 chcp 65001 对 cmd
+        无效，中文系统下 cmd 报错/回显按 GBK 输出，强解 UTF-8 会出乱码）。"""
+        try:
+            return data.decode("utf-8").rstrip("\n\r")
+        except UnicodeDecodeError:
+            return data.decode("gbk", errors="replace").rstrip("\n\r")
 
     def is_process_alive(self, process=None):
         process = process if process is not None else self.current_process
