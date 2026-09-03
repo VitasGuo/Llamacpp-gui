@@ -9,6 +9,10 @@ from config import LAST_PID_FILE, RUNTIME_FILE
 from utils.atomic_io import atomic_write_json
 from utils.logger import error
 
+# Windows：子进程不分配控制台窗口。GUI（打包 exe/pythonw，无控制台）每派生一个
+# 控制台子进程（tasklist/taskkill）都会临时弹出一个一闪即逝的黑框；加此标志消除闪烁。
+CREATE_NO_WINDOW = 0x08000000
+
 
 class ProcessService:
     def __init__(self):
@@ -26,7 +30,7 @@ class ProcessService:
             process = subprocess.Popen(
                 # 路径加引号：bat 路径含空格（如 C:\Users\John Doe\...）时 cmd 不会在空格处截断
                 ["cmd", "/c", f'chcp 65001 >nul && "{bat_path}"'],
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -55,6 +59,7 @@ class ProcessService:
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(pid)],
                     capture_output=True,
+                    creationflags=CREATE_NO_WINDOW,
                 )
             except Exception as e:
                 error(f"stop_by_pid 结束进程失败 script={script_name} PID={pid}: {e}")
@@ -70,6 +75,7 @@ class ProcessService:
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(self.current_pid)],
                     capture_output=True,
+                    creationflags=CREATE_NO_WINDOW,
                 )
                 self._clear_pid()
                 self.current_pid = None
@@ -87,6 +93,7 @@ class ProcessService:
                     ["tasklist", "/FI", f"IMAGENAME eq {keyword}", "/FO", "CSV", "/NH"],
                     capture_output=True,
                     text=True,
+                    creationflags=CREATE_NO_WINDOW,
                 )
                 for line in result.stdout.strip().split("\n"):
                     line = line.strip().strip('"')
@@ -99,6 +106,7 @@ class ProcessService:
                             subprocess.run(
                                 ["taskkill", "/F", "/PID", pid],
                                 capture_output=True,
+                                creationflags=CREATE_NO_WINDOW,
                             )
                             killed.append({"name": keyword, "pid": pid})
                         except Exception as e:
@@ -139,6 +147,7 @@ class ProcessService:
                 ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                 capture_output=True,
                 text=True,
+                creationflags=CREATE_NO_WINDOW,
             )
             for line in result.stdout.strip().split("\n"):
                 line = line.strip()
@@ -172,6 +181,7 @@ class ProcessService:
                 ["tasklist", "/FO", "CSV", "/NH"],
                 capture_output=True,
                 text=True,
+                creationflags=CREATE_NO_WINDOW,
             )
             found = set()
             for line in result.stdout.strip().split("\n"):

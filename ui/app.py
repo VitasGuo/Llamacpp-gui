@@ -28,6 +28,7 @@ from ui.monitor_tab import MonitorTab
 from ui.dialogs.new_script_dialog import NewScriptDialog
 from ui.dialogs.settings_dialog import SettingsDialog
 from ui.workers.log_worker import LogWorker
+from ui.workers.status_poll_worker import StatusPollWorker
 from ui.workers.update_workers import CheckUpdateWorker, CheckAppUpdateWorker
 
 # 日志面板行数上限：保留最近 N 个块（行）；每追加 M 条检查一次，避免刷屏时频繁裁剪
@@ -50,6 +51,7 @@ class MainWindow(QMainWindow):
         self._bridge_server = None
         self._bridge_port = None
         self._log_append_count = 0
+        self._status_poll_worker = None  # 后台存活轮询 QThread（保持引用防 GC）
 
         self.setWindowTitle("llama.cpp GUI Client")
         self.resize(960, 700)
@@ -73,6 +75,13 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._status_timer.stop()
+        # 后台存活轮询线程可能正在跑 tasklist：等一下再退出，避免
+        # "QThread: Destroyed while thread is still running"。
+        if (
+            self._status_poll_worker is not None
+            and self._status_poll_worker.isRunning()
+        ):
+            self._status_poll_worker.wait(3000)
         if self._bridge_server:
             self._bridge_server.shutdown()
         self.monitor_service.stop()
@@ -310,14 +319,34 @@ class MainWindow(QMainWindow):
             self.script_list.addTopLevelItem(item)
 
     def _refresh_script_statuses(self):
-        """2s 轮询：一次批量 tasklist 探测所有脚本 pid 的存活，刷新状态列与控制面板。"""
+        """2s 轮询：后台 QThread 批量 tasklist 探测存活（不阻塞 UI 主线程），
+        结果回传后经 _apply_alive_set 刷新状态列与控制面板。
+
+        需探测的 pid = 所有脚本运行时 pid + 全局 current_pid（无选中脚本时的
+        回退判定）。上一轮未结束（系统繁忙 tasklist 慢）则跳过本轮，避免线程堆积。
+        """
+        if (
+            self._status_poll_worker is not None
+            and self._status_poll_worker.isRunning()
+        ):
+            return
         runtime = self.process_service.load_runtime()
         pids = {
             entry.get("pid")
             for entry in runtime.values()
             if isinstance(entry.get("pid"), int) and entry.get("pid") > 0
         }
-        alive_set = self.process_service.alive_pids(pids)
+        if self.process_service.current_pid:
+            pids.add(self.process_service.current_pid)
+        worker = StatusPollWorker(pids, self.process_service)
+        worker.alive_signal.connect(self._apply_alive_set)
+        self._status_poll_worker = worker
+        worker.start()
+
+    def _apply_alive_set(self, alive_list):
+        """后台轮询结果回传（UI 线程）：刷新状态列 + 控制面板。"""
+        alive_set = set(alive_list)
+        runtime = self.process_service.load_runtime()
         for i in range(self.script_list.topLevelItemCount()):
             item = self.script_list.topLevelItem(i)
             name = item.text(0)
@@ -332,12 +361,14 @@ class MainWindow(QMainWindow):
                 item.setText(1, "已停止")
                 item.setForeground(0, QBrush(QColor("#999999")))
                 item.setForeground(1, QBrush(QColor("#999999")))
-        self._sync_control_panel()
+        self._sync_control_panel(alive_set)
 
-    def _sync_control_panel(self):
+    def _sync_control_panel(self, alive_set=None):
         """运行/结束按钮与状态标签反映选中脚本的运行状态（多服务器按脚本独立）。
 
         无选中脚本时回退全局 current_pid（旧版本启动/last_pid 恢复的进程）。
+        alive_set 提供时（后台轮询回传）直接查集合判存活，避免再 spawn tasklist；
+        为 None 时（用户操作/启动恢复触发）回退 is_running() 同步判定（一次性，可接受）。
         """
         name = self.current_script_name
         if name:
@@ -346,9 +377,17 @@ class MainWindow(QMainWindow):
                 getattr(w, "script_name", None) == name for w in self.log_workers
             )
             if not running:
-                running = self.process_service.is_running(name)
+                if alive_set is not None:
+                    pid = self.process_service.load_runtime().get(name, {}).get("pid")
+                    running = isinstance(pid, int) and pid > 0 and pid in alive_set
+                else:
+                    running = self.process_service.is_running(name)
         else:
-            running = self.process_service.is_running()
+            if alive_set is not None:
+                pid = self.process_service.current_pid
+                running = isinstance(pid, int) and pid > 0 and pid in alive_set
+            else:
+                running = self.process_service.is_running()
         self.is_running = running
         self.run_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
