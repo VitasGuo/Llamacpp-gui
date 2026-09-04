@@ -6,12 +6,13 @@ Settings.get_instance() 属性修改 + save()，取消不保存。
 """
 from PyQt6.QtGui import QIntValidator
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QFormLayout, QLabel, QLineEdit,
+    QDialog, QVBoxLayout, QFormLayout, QLabel, QLineEdit, QComboBox,
     QDialogButtonBox, QScrollArea, QWidget, QCheckBox,
 )
 
 from config.config import Settings
 from service import autostart_service
+from service.script_builder import HOST_CHOICES
 
 # (分组标题, [(Settings 字段名, 显示标签), ...]) —— 分组与 script_builder.CATEGORIES 对应
 SECTIONS = [
@@ -68,6 +69,10 @@ class SettingsDialog(QDialog):
         self.auto_start_check = QCheckBox("开机自动启动（关闭窗口时最小化到系统托盘）")
         self.auto_start_check.setChecked(autostart_service.is_enabled())
         layout.addWidget(self.auto_start_check)
+        # 服务就绪后自动打开聊天页（无需手动切换到聊天 URL）
+        self.auto_open_chat_check = QCheckBox("模型服务就绪后自动打开聊天页")
+        self.auto_open_chat_check.setChecked(settings.auto_open_chat)
+        layout.addWidget(self.auto_open_chat_check)
 
         form = QFormLayout()
         self.inputs = {}
@@ -76,6 +81,21 @@ class SettingsDialog(QDialog):
             section_label.setStyleSheet("font-weight: bold; font-size: 12px; padding: 8px 0 2px 0;")
             form.addRow(section_label)
             for key, text in fields:
+                if key == "host":
+                    # --host 与新建脚本对话框一致：三选项下拉（文本框与
+                    # 新建对话框语义不一致，且存哨兵值时用户无法理解）
+                    edit = QComboBox()
+                    current = str(getattr(settings, key, "")) or "127.0.0.1"
+                    for choice in HOST_CHOICES:
+                        edit.addItem(choice["label"], choice["value"])
+                    # 当前值不在预设选项（如历史存的 Tailscale IP/自定义地址）：
+                    # 追加为额外选项，保存时原样保留，避免被静默改写
+                    if edit.findData(current) < 0:
+                        edit.addItem(current, current)
+                    edit.setCurrentIndex(max(0, edit.findData(current)))
+                    self.inputs[key] = edit
+                    form.addRow(QLabel(text), edit)
+                    continue
                 edit = QLineEdit(str(getattr(settings, key, "")))
                 if key in _INT_KEYS:
                     edit.setValidator(QIntValidator(0, 1000000000))
@@ -100,7 +120,12 @@ class SettingsDialog(QDialog):
     def _save(self):
         settings = Settings.get_instance()
         for key, edit in self.inputs.items():
-            setattr(settings, key, edit.text().strip())
+            if isinstance(edit, QComboBox):
+                value = edit.currentData()
+            else:
+                value = edit.text().strip()
+            setattr(settings, key, value)
+        settings.auto_open_chat = self.auto_open_chat_check.isChecked()
         settings.save()
         autostart_service.set_enabled(self.auto_start_check.isChecked())
         self.accept()

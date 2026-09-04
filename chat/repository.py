@@ -313,9 +313,17 @@ def rebuild_task_index():
 
 # ─── LLM 调用 ────────────────────────────────────────────
 
-def call_llm(llm_url, messages):
+def call_llm(llm_url, messages, sampling=None):
+    """调用 llama-server 的 OpenAI 兼容接口（非流式）。
+
+    sampling：可选的采样参数 dict（temperature/top_p/top_k/…），
+    传入的字段会覆盖默认 temperature=0.7；None/空 dict 时保持原默认。
+    """
+    payload = {"messages": messages, "stream": False, "temperature": 0.7}
+    if sampling:
+        payload.update(sampling)
     url = llm_url.rstrip("/") + "/v1/chat/completions"
-    body = json.dumps({"messages": messages, "stream": False, "temperature": 0.7}).encode()
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=body, method="POST",
         headers={"Content-Type": "application/json"},

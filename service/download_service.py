@@ -113,9 +113,23 @@ class DownloadManager(QObject):
         local_size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
 
         if existing and existing.status in ("paused", "downloading", "pending"):
-            # 暂停/进行中/待下载的续传保持现状：沿用 entry.downloaded
+            # 恢复暂停/进行中/待下载的任务。续传基线必须以本地实际文件为准：
+            # 下载目录可能在暂停期间被修改（dest_path 变了，旧目录的
+            # entry.downloaded 在新目录没有对应字节），直接沿用会把 Range
+            # 起点/追加模式对到错误文件上，产出缺头的损坏 GGUF
             entry = existing
             entry.status = "downloading"
+            if file_size > 0 and local_size >= file_size:
+                # 新目录里已有完整同名文件 → 直接标记完成
+                entry.status = "completed"
+                entry.downloaded = local_size
+                entry.dest_path = dest_path
+                self.download_queue.update(entry)
+                return True
+            if (0 < local_size < file_size) or (file_size == 0 and local_size > 0):
+                entry.downloaded = local_size
+            else:
+                entry.downloaded = 0
         elif existing and existing.status == "failed":
             entry = existing
             if file_size > 0 and local_size == file_size:
@@ -240,15 +254,25 @@ class DownloadManager(QObject):
     def remove_download(self, entry):
         # 若仍有活动 worker，先取消，避免 UI 行已删除但后台继续下载（幽灵下载）；
         # worker 会在下个 chunk 停止并经 cancel 路径自行删除半成品
-        if self.is_worker_active(entry.source, entry.file_path):
-            self._workers[(entry.source, entry.file_path)].cancel()
+        worker_key = (entry.source, entry.file_path)
+        worker = self._workers.get(worker_key)
+        worker_active = worker is not None and worker.isRunning()
+        if worker_active:
+            worker.cancel()
         self.download_queue.remove(entry)
-        self._workers.pop((entry.source, entry.file_path), None)
-        if entry.dest_path and os.path.exists(entry.dest_path):
-            try:
-                os.remove(entry.dest_path)
-            except OSError as e:
-                error(f"移除下载后删除文件失败 {entry.dest_path}: {e}")
+        if worker_active:
+            # worker 仍在运行：不能弹出其最后引用（QThread 运行中被 GC 会崩溃），
+            # 也不能与其并发删除文件；留给 worker 结束时自行移除/清理
+            worker.finished_signal.connect(
+                lambda *args, key=worker_key: self._workers.pop(key, None)
+            )
+        else:
+            self._workers.pop(worker_key, None)
+            if entry.dest_path and os.path.exists(entry.dest_path):
+                try:
+                    os.remove(entry.dest_path)
+                except OSError as e:
+                    error(f"移除下载后删除文件失败 {entry.dest_path}: {e}")
 
     def _find_entry_by_path(self, source, file_path):
         for e in self.download_queue.entries:

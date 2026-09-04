@@ -145,14 +145,14 @@ class MonitorService(QObject):
             return
 
         targets = [
-            (name, entry.get("port"))
+            (name, entry.get("port"), entry.get("host"))
             for name, entry in runtime.items()
             if isinstance(entry.get("port"), int) and 0 < entry["port"] <= 65535
         ]
         seen = set()
-        for name, port in targets:
+        for name, port, host in targets:
             seen.add(name)
-            tps, ok = self._fetch_server_tps(name, port)
+            tps, ok = self._fetch_server_tps(name, port, host)
             with self._lock:
                 self._server_tps[name] = {
                     "name": name,
@@ -168,21 +168,25 @@ class MonitorService(QObject):
                     self._server_tps.pop(name, None)
                     self._gen_state.pop(name, None)
 
-    def _fetch_server_tps(self, name, port):
+    def _fetch_server_tps(self, name, port, host=None):
         """抓取单个服务器的 /metrics 并计算 t/s = Δgen_tokens/Δt。
 
+        host 用 pids.json 记录的实际 --host：绑定 Tailscale IP 的服务在
+        127.0.0.1 上不可达，必须用实际地址请求（否则精确计数恒失效）。
         返回 (tps, ok)：ok=False 表示 /metrics 不可用（服务未起/旧版本无端点/
         缺 token 计数器）→ UI 回退日志正则 t/s；ok=True 且 tps=None 表示
         本轮为基线/计数器回退重基线，暂无值。
         计数器回退（服务器重启）时重新基线，不算负值。
-        必须绕过代理：127.0.0.1 端点显式 ProxyHandler({})。
+        必须绕过代理：本地端点显式 ProxyHandler({})。
         """
+        if host in (None, "", "0.0.0.0"):
+            host = "127.0.0.1"
         try:
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({})
             )
             with opener.open(
-                f"http://127.0.0.1:{port}/metrics", timeout=METRICS_TIMEOUT
+                f"http://{host}:{port}/metrics", timeout=METRICS_TIMEOUT
             ) as resp:
                 text = resp.read().decode("utf-8", errors="replace")
         except Exception as e:
@@ -192,7 +196,7 @@ class MonitorService(QObject):
                 self._last_metrics_err_log_ts is None
                 or now - self._last_metrics_err_log_ts >= 60
             ):
-                error(f"/metrics 抓取失败 [{name}] 127.0.0.1:{port}: {e}")
+                error(f"/metrics 抓取失败 [{name}] {host}:{port}: {e}")
                 self._last_metrics_err_log_ts = now
             return None, False
 

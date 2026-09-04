@@ -24,7 +24,11 @@ class Settings:
         if os.path.exists(APP_CONFIG_FILE):
             try:
                 with open(APP_CONFIG_FILE, "r", encoding="utf-8") as f:
-                    self.config = json.load(f)
+                    data = json.load(f)
+                # 类型防御：配置损坏成 list/str 时保留默认值，而不是让
+                # 后续所有 .get 访问抛 TypeError（GUI 静默崩溃）
+                if isinstance(data, dict):
+                    self.config.update(data)
             except (json.JSONDecodeError, IOError):
                 pass
 
@@ -71,6 +75,15 @@ class Settings:
     @download_path.setter
     def download_path(self, value):
         self.config["download_path"] = value
+
+    @property
+    def auto_open_chat(self) -> bool:
+        """服务就绪后自动打开聊天页（默认关闭）。"""
+        return bool(self.config.get("auto_open_chat", False))
+
+    @auto_open_chat.setter
+    def auto_open_chat(self, value: bool):
+        self.config["auto_open_chat"] = bool(value)
 
     # ── 启动脚本默认参数（设置对话框可修改；未配置时用内置默认，与历史硬编码一致）──
 
@@ -185,3 +198,32 @@ class Settings:
     @cache_type_v.setter
     def cache_type_v(self, value):
         self.config["cache_type_v"] = value
+
+    # ── 版本管理（llama.cpp 更新）──
+
+    @property
+    def gh_mirror_prefix(self):
+        """GitHub 下载镜像前缀（空串 = 直连）。拼接方式：{prefix}https://github.com/..."""
+        return self.config.get("gh_mirror_prefix", "")
+
+    @gh_mirror_prefix.setter
+    def gh_mirror_prefix(self, value):
+        self.config["gh_mirror_prefix"] = value or ""
+
+    @property
+    def llamacpp_install_root(self):
+        """llama.cpp 版本化安装根目录（每个版本一个子目录 {tag}-{variant}/）。"""
+        return self.config.get("llamacpp_install_root", "data/llamacpp")
+
+    @llamacpp_install_root.setter
+    def llamacpp_install_root(self, value):
+        self.config["llamacpp_install_root"] = value or "data/llamacpp"
+
+    @property
+    def llamacpp_auto_download(self):
+        """启动时后台静默下载最新版（当前通道 + 推荐变体），就绪后用户手动切换。"""
+        return self.config.get("llamacpp_auto_download", True)
+
+    @llamacpp_auto_download.setter
+    def llamacpp_auto_download(self, value):
+        self.config["llamacpp_auto_download"] = bool(value)

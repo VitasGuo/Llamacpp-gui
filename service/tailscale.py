@@ -7,6 +7,7 @@ import ipaddress
 import os
 import socket
 import subprocess
+import time
 
 import psutil
 
@@ -18,6 +19,12 @@ TAILSCALE_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 # tailscale.exe 的常见安装位置（GUI 进程的 PATH 未必包含 Program Files）
 _KNOWN_EXE = r"C:\Program Files\Tailscale\tailscale.exe"
+
+# 结果 TTL 缓存：探测含 subprocess（timeout 3s），而 GUI 在每次切换
+# 选中脚本时都会调用（外网地址重算）——绝不 tolerate 每次点击都跑子进程
+_CACHE_TTL = 60.0
+_cached_ip = ""
+_cached_at = 0.0
 
 
 def is_tailscale_ip(ip: str) -> bool:
@@ -44,11 +51,22 @@ def _run_tailscale(exe: str):
 def get_tailscale_ipv4() -> str:
     """返回本机 Tailscale IPv4；未安装/未连接/异常时返回空串。
 
+    结果缓存 60s（探测含 subprocess，不应在 GUI 高频路径上反复执行）。
     探测顺序：
     1. PATH 中的 `tailscale` 命令
     2. 已知安装路径 C:\\Program Files\\Tailscale\\tailscale.exe
     3. 枚举网卡，匹配 100.64.0.0/10 段的 IPv4（psutil 兜底）
     """
+    global _cached_ip, _cached_at
+    now = time.monotonic()
+    if now - _cached_at < _CACHE_TTL:
+        return _cached_ip
+    _cached_at = now
+    _cached_ip = _detect_tailscale_ipv4()
+    return _cached_ip
+
+
+def _detect_tailscale_ipv4() -> str:
     # 方式 1/2：tailscale 命令（含精确段校验，避免误收）
     candidates = ["tailscale"]
     if os.path.exists(_KNOWN_EXE):

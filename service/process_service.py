@@ -52,6 +52,20 @@ class ProcessService:
             error(f"启动脚本失败 {bat_path}: {e}")
             return {"success": False, "error": str(e)}
 
+    def _kill_pid(self, pid) -> bool:
+        """taskkill 结束进程树；结果以"进程是否真的没了"为准（taskkill 返回码
+        在进程已提前退出等场景也会非 0，不能只看返回码）。"""
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                creationflags=NO_WINDOW,
+            )
+        except Exception as e:
+            error(f"taskkill 执行失败 PID={pid}: {e}")
+            return False
+        return not self._pid_alive(pid)
+
     def stop_by_pid(self, script_name=None):
         if script_name:
             # 多服务器：按脚本名查 pids.json 中的 pid 并结束
@@ -59,14 +73,8 @@ class ProcessService:
             pid = entry.get("pid")
             if not isinstance(pid, int):
                 return False
-            try:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(pid)],
-                    capture_output=True,
-                    creationflags=NO_WINDOW,
-                )
-            except Exception as e:
-                error(f"stop_by_pid 结束进程失败 script={script_name} PID={pid}: {e}")
+            if not self._kill_pid(pid):
+                error(f"stop_by_pid 结束进程失败 script={script_name} PID={pid}")
                 return False
             self.clear_runtime(script_name)
             if self.current_pid == pid:
@@ -75,18 +83,13 @@ class ProcessService:
                 self._clear_pid()
             return True
         if self.current_pid:
-            try:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(self.current_pid)],
-                    capture_output=True,
-                    creationflags=NO_WINDOW,
-                )
-                self._clear_pid()
-                self.current_pid = None
-                self.current_process = None
-                return True
-            except Exception as e:
-                error(f"stop_by_pid 结束进程失败 PID={self.current_pid}: {e}")
+            if not self._kill_pid(self.current_pid):
+                error(f"stop_by_pid 结束进程失败 PID={self.current_pid}")
+                return False
+            self._clear_pid()
+            self.current_pid = None
+            self.current_process = None
+            return True
         return False
 
     def stop_by_name(self):
@@ -292,14 +295,25 @@ class ProcessService:
                 self.clear_runtime(name)
         return alive
 
-    def is_port_in_use(self, port) -> bool:
-        """socket bind 探测端口是否被占用（启动前预检）。"""
+    def is_port_in_use(self, port, host="0.0.0.0") -> bool:
+        """socket bind 探测端口是否被占用（启动前预检）。
+
+        host 应传脚本实际的 --host（如 Tailscale IP）——绑定地址不同，
+        冲突判定结果也不同；默认 0.0.0.0 表示任意接口被占即视为冲突。
+        """
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("0.0.0.0", int(port)))
+                s.bind((host, int(port)))
                 return False
         except (OSError, ValueError):
             return True
+
+    def find_free_port(self, start, host="0.0.0.0", max_attempts=10):
+        """从 start+1 起找第一个未占用端口；找不到返回 None。"""
+        for port in range(start + 1, start + 1 + max_attempts):
+            if not self.is_port_in_use(port, host):
+                return port
+        return None
 
     def _save_pid(self, pid):
         with open(self.pid_file, "w") as f:

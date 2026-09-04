@@ -1,4 +1,5 @@
 """启动脚本参数构建逻辑。"""
+import os
 import re
 
 from config.config import Settings
@@ -123,6 +124,26 @@ def extract_host(content, default="127.0.0.1"):
     return default
 
 
+def find_mmproj(model_path):
+    """在模型同目录查找视觉编码器 mmproj 文件（文件名含 mmproj，不区分大小写）。
+
+    返回第一个匹配文件的完整路径；目录不存在或未找到时返回空串。
+    llama-server 的 --mmproj 指定多模态模型的视觉编码器，通常与主模型同目录存放；
+    命名有两种常见形式：`mmproj-<模型>.gguf` 或 `<模型>-mmproj-<精度>.gguf`。
+    """
+    if not model_path:
+        return ""
+    directory = os.path.dirname(model_path)
+    try:
+        for f in sorted(os.listdir(directory)):
+            low = f.lower()
+            if "mmproj" in low and low.endswith(".gguf"):
+                return os.path.join(directory, f)
+    except OSError:
+        pass
+    return ""
+
+
 def build_bat_content(exe_dir, model_path, config, visual_model_path=""):
     """根据配置生成 .bat 启动脚本内容。"""
     lines = [
@@ -151,6 +172,8 @@ def build_bat_content(exe_dir, model_path, config, visual_model_path=""):
     if "no_mmproj_offload" in config:
         parts.append("--no-mmproj-offload ^")
     if "mmproj" in config:
+        # 未手动指定视觉模型时，自动绑定同目录的 mmproj 文件，保证多模态能力开箱即用
+        visual_model_path = visual_model_path or find_mmproj(model_path)
         if visual_model_path:
             parts.append(f'--mmproj "{visual_model_path}" ^')
     if "reasoning" in config:

@@ -18,6 +18,7 @@
 | 🚀 **开机自启动** | 一键注册/取消开机自动启动（HKCU Run，源码用 pythonw，打包后自启 exe） |
 | 🗂 **本地模型检索** | 指定本地目录自动递归扫描 .gguf，下拉菜单快速选择模型，无需手动逐个选择 |
 | 🌐 **Tailscale 外网接入** | 新建脚本时 `--host` 可选"仅本机 / 所有接口 / Tailscale 专用"（自动检测本机 Tailscale IP），服务就绪后显示外网访问地址并可一键复制 |
+| 🔄 **llama.cpp 版本管理** | 检测更新（对比本地 build 号与 GitHub 最新版）、按显卡驱动推荐构建变体（CUDA 12.4 / 13.x / CPU / Vulkan 等）、断点续传下载安装（直连或自定义镜像前缀）、版本化目录 + 一键切换回滚（自动批量更新启动脚本路径）、启动时后台静默下载最新版（当前通道 + 推荐变体，就绪后进页一键切换） |
 
 ### 支持的推理参数
 
@@ -68,8 +69,10 @@ pyinstaller -D -w --name='Lammacpp启动器' --add-data "ui/chat_webui;data/webu
 | `data/scripts.json` + `data/scripts/*.bat` | 启动脚本 |
 | `data/downloads/queue.json` | 下载队列状态 |
 | `data/chat/` | 聊天数据（对话、角色、记忆、定时任务） |
-| `data/last_pid.pid` | 运行中的服务器进程 ID |
+| `data/last_pid.pid` | 旧版本运行中服务器进程 ID（多服务器架构下仅回退用途） |
+| `data/app.lock` | 单实例锁（防止多个 GUI 并发运行） |
 | `data/webui/` | 聊天前端静态文件 |
+| `data/llamacpp/` | llama.cpp 版本管理默认根目录：`{tag}-{variant}/` 每版本一目录（可配置到其他盘），`zips/` 为下载缓存（断点续传） |
 
 ## 项目结构
 
@@ -82,6 +85,7 @@ main.py
 │   ├── script_service.py   脚本 CRUD
 │   ├── process_service.py  进程生命周期管理
 │   ├── tailscale.py        Tailscale IP 检测（外网接入）
+│   ├── llamacpp_update_service.py  llama.cpp 版本管理（检测/下载/安装/切换）
 │   ├── modelscope.py       ModelScope API 客户端
 │   ├── download_service.py 下载管理器
 │   └── monitor_service.py  系统资源采样
@@ -90,9 +94,17 @@ main.py
 │   ├── app.py              主窗口
 │   ├── model_tab.py        模型搜索与下载标签页
 │   ├── monitor_tab.py      性能监控标签页
+│   ├── update_tab.py       llama.cpp 版本管理标签页
 │   ├── dialogs/            对话框
-│   └── workers/            后台工作线程
+│   └── workers/            后台工作线程（日志/状态轮询/搜索/版本检查/版本安装）
+├── tests/                  冒烟测试（unittest，offscreen 可跑）
 └── utils/                  通用工具
+```
+
+## 测试
+
+```powershell
+.venv\Scripts\python.exe -m unittest discover tests
 ```
 
 ## 系统要求

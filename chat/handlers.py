@@ -60,8 +60,32 @@ def _read_body(handler):
 
 class BridgeHandler(BaseHTTPRequestHandler):
 
+    def _origin_allowed(self) -> bool:
+        """同源校验：跨站请求必须来自本机桥自身地址。
+
+        聊天页由本桥直接伺服（同源），无需 CORS 放行；浏览器发起的跨站请求
+        会带 Origin 头——只放行 127.0.0.1/localhost 的同端口来源，否则 403。
+        这防止用户浏览的任意网页直接读写本地桥的全部聊天数据。
+        不带 Origin 的请求（curl/同源 GET）不受影响。
+        """
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        port = self.server.server_address[1]
+        allowed = (f"http://127.0.0.1:{port}", f"http://localhost:{port}")
+        if origin in allowed:
+            return True
+        self.send_response(403)
+        self.end_headers()
+        return False
+
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # 只对同源来源回显（跨站已被 _origin_allowed 拦截），
+        # 不再使用通配符 *（那等于把本地聊天数据开放给任意网页）
+        origin = self.headers.get("Origin")
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
@@ -74,11 +98,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_OPTIONS(self):
+        if not self._origin_allowed():
+            return
         self.send_response(204)
         self._cors()
         self.end_headers()
 
     def do_GET(self):
+        if not self._origin_allowed():
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
@@ -180,8 +208,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if path == "" or path == "/":
             path = "/chat.html"
         safe = os.path.normpath(path).strip("/\\")
-        filepath = os.path.join(WEBUI_DIR, safe)
-        if not filepath.startswith(os.path.normpath(WEBUI_DIR)):
+        # 防目录穿越：join 后必须再 normpath 一次再用 commonpath 严格比较。
+        # 只对原始 path normpath 不够——join(WEBUI_DIR, "..\\x") 的结果字符串
+        # 仍以 WEBUI_DIR 开头（startswith 检查可被 "webui\..\..\x" 绕过），
+        # 可读到 webui 之外的任意本机文件
+        filepath = os.path.normpath(os.path.join(WEBUI_DIR, safe))
+        webui_root = os.path.normpath(WEBUI_DIR)
+        try:
+            inside = os.path.commonpath([filepath, webui_root]) == webui_root
+        except ValueError:  # 不同盘符等
+            inside = False
+        if not inside:
             self._json(403, {"error": "forbidden"})
             return
         if not os.path.isfile(filepath):
@@ -199,6 +236,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.wfile.write(f.read())
 
     def do_POST(self):
+        if not self._origin_allowed():
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         try:
@@ -285,6 +324,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_PUT(self):
+        if not self._origin_allowed():
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         try:
@@ -387,6 +428,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_DELETE(self):
+        if not self._origin_allowed():
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 

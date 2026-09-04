@@ -553,7 +553,8 @@ class MonitorTab(QWidget):
         """
         if self._focus_name and self._focus_name in self._running:
             self._status_label.setText("状态: \u25cf 运行中")
-            self._status_label.setStyleSheet("color: #27ae60; font-weight: bold;")
+            # 与主控制页一致：运行中用橙色（绿色表示"就绪"语义，避免同状态两色）
+            self._status_label.setStyleSheet("color: orange; font-weight: bold;")
         elif self._running:
             n = len(self._running)
             self._status_label.setText(f"状态: \u25cf {n} 个服务运行中")

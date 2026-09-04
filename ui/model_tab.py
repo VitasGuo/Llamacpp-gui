@@ -8,10 +8,12 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
 )
 from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QSystemTrayIcon
 
 from config.config import Settings
 from service import model_sources
 from service.download_service import DownloadManager
+from ui.workers.search_worker import SearchWorker, FileListWorker
 
 
 def _format_size(size_bytes):
@@ -238,14 +240,22 @@ class ModelTab(QWidget):
         self._load_search_page()
 
     def _load_search_page(self):
+        # 网络请求放到后台 QThread：GUI 线程同步执行（超时可到 15s）
+        # 会冻结整个窗口，搜索期间无法操作也无法取消
         self.search_btn.setEnabled(False)
         self.search_btn.setText("搜索中...")
-        result = model_sources.search_models(
+        self.prev_btn.setEnabled(False)
+        self.next_btn.setEnabled(False)
+        self._search_worker = SearchWorker(
             self._current_source,
             self._current_keyword,
             self._current_page,
             self._page_size,
         )
+        self._search_worker.result_signal.connect(self._on_search_result)
+        self._search_worker.start()
+
+    def _on_search_result(self, result):
         self.search_btn.setEnabled(True)
         self.search_btn.setText("搜索")
         error = result.get("error")
@@ -323,8 +333,23 @@ class ModelTab(QWidget):
         self.filelist_model_label.setText(f"当前模型 [{source_label}]: {model_id}")
         self.filelist_model_label.setStyleSheet("font-weight: bold;")
 
+        # 文件列表同样是网络请求 → 后台线程加载，先显示占位行
+        self.file_table.setRowCount(1)
+        self.file_table.setItem(0, 1, QTableWidgetItem("文件列表加载中..."))
+        self.stack.setCurrentIndex(1)
+        self._filelist_worker = FileListWorker(self._current_source, model_id)
+        self._filelist_worker.result_signal.connect(self._on_filelist_result)
+        self._filelist_worker.start()
+
+    def _on_filelist_result(self, model_id, files):
+        # 迟到的结果（用户已切走/换了模型）直接丢弃
+        if model_id != self._current_model_id:
+            return
         self.file_table.setRowCount(0)
-        files = model_sources.list_model_files(self._current_source, model_id)
+        if files is None:
+            self.file_table.insertRow(0)
+            self.file_table.setItem(0, 1, QTableWidgetItem("文件列表加载失败，请重试"))
+            return
         gguf_files = [f for f in files if f.get("Path", "").lower().endswith(".gguf")]
 
         if not gguf_files:
@@ -518,6 +543,18 @@ class ModelTab(QWidget):
                     break
         else:
             self._refresh_queue_ui()
+        # 下载完成托盘通知：模型页常在后台下载，用户在其他页/最小化时
+        # 无从感知完成（此前只改队列表格里的一行文字）
+        if success:
+            filename = os.path.basename(file_path)
+            mw = self.window()
+            if getattr(mw, "tray_icon", None) is not None:
+                mw.tray_icon.showMessage(
+                    "下载完成",
+                    f"{filename} 已下载完成",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000,
+                )
 
     def _find_entry(self, source, file_path):
         for e in self.download_manager.entries:

@@ -1129,9 +1129,35 @@ function renderContent(content) {
 
 function renderMarkdown(text) {
   if (typeof marked !== 'undefined' && marked.parse) {
-    return marked.parse(text, { breaks: true, gfm: true });
+    return sanitizeHtml(marked.parse(text, { breaks: true, gfm: true }));
   }
   return escapeHtml(text).replace(/\n/g, '<br>');
+}
+
+/**
+ * HTML 消毒：marked 自身不消毒（v4+ 移除内置 sanitize），
+ * 模型输出/用户消息可能包含 <script>/<img onerror=...> 等 XSS 载荷，
+ * 而聊天页持有 bridge API 全权限，必须过滤后再 innerHTML。
+ */
+function sanitizeHtml(html) {
+  if (typeof DOMParser === 'undefined') return html; // 极端环境兜底
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  doc.querySelectorAll('script,style,iframe,object,embed,form,link,meta,base')
+    .forEach(el => el.remove());
+  doc.querySelectorAll('*').forEach(el => {
+    [...el.attributes].forEach(attr => {
+      const name = attr.name.toLowerCase();
+      const value = (attr.value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+      if (name.startsWith('on')) {
+        el.removeAttribute(attr.name); // onerror=... 等事件属性
+      } else if ((name === 'href' || name === 'src' || name === 'xlink:href')
+        && (value.startsWith('javascript:') || value.startsWith('vbscript:')
+          || value.startsWith('data:text/html'))) {
+        el.removeAttribute(attr.name); // 危险 URL 协议
+      }
+    });
+  });
+  return doc.body.innerHTML;
 }
 
 function escapeHtml(str) { const d = document.createElement('div'); d.textContent = str; return d.innerHTML; }

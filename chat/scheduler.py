@@ -92,12 +92,15 @@ class SchedulerService:
             settings = read_settings()
             llm_url = settings.get("llm_url", "")
             if not llm_url:
-                # 任务到期后每秒都会进到这里，日志 60s 内至多记一条，避免刷量
+                # 未配置模型地址：按失败退避推进 next_run_time，而不是原样返回。
+                # 原样返回时 next_run_time 已过期 → 每个 tick(1s) 都派线程空转
+                summary = "未配置模型 API 地址（llm_url 为空），任务跳过"
                 now = time.monotonic()
                 last = self._last_skip_log_ts.get(task_id)
                 if last is None or now - last >= 60:
                     self._last_skip_log_ts[task_id] = now
                     error(f"[scheduler] No llm_url，跳过任务 {task_id}")
+                self._record_task_error(conv_id, task_id, summary)
                 return
 
             conv = None
@@ -134,7 +137,17 @@ class SchedulerService:
 
             messages.append({"role": "user", "content": task.get("instruction", "")})
 
-            response = call_llm(llm_url, messages)
+            # 应用角色配置的采样参数（temperature/top_p/…），与聊天页行为一致；
+            # 未配置的字段不传，由 call_llm 内部使用服务端默认
+            sampling = {}
+            for key in (
+                "temperature", "top_p", "top_k", "min_p",
+                "repeat_penalty", "presence_penalty", "frequency_penalty",
+            ):
+                value = agent.get(key)
+                if value is not None:
+                    sampling[key] = value
+            response = call_llm(llm_url, messages, sampling=sampling)
 
             conv["messages"].append({
                 "role": "assistant",

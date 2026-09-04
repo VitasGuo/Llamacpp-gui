@@ -8,11 +8,14 @@ from config import LOGS_DIR
 logger = logging.getLogger("llamacpp_gui")
 logger.setLevel(logging.DEBUG)
 
-_handler = logging.StreamHandler(sys.stdout)
-_handler.setLevel(logging.DEBUG)
-_formatter = logging.Formatter("[%(asctime)s] %(levelname)s %(message)s", "%H:%M:%S")
-_handler.setFormatter(_formatter)
-logger.addHandler(_handler)
+# 控制台输出：pythonw 运行时 stdout/stderr 为 None，StreamHandler(None)
+# 会静默失败甚至报错；此时只保留文件日志
+if sys.stdout is not None:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setLevel(logging.DEBUG)
+    _formatter = logging.Formatter("[%(asctime)s] %(levelname)s %(message)s", "%H:%M:%S")
+    _handler.setFormatter(_formatter)
+    logger.addHandler(_handler)
 
 # 文件日志: data/logs/app.log，单文件 2MB，最多 3 个备份（轮转 app.log.1 ~ app.log.3）
 os.makedirs(LOGS_DIR, exist_ok=True)

@@ -113,3 +113,4 @@ config/local_*.py
 打包命令.txt
 需求.md
 .agent-teams
+.trae/

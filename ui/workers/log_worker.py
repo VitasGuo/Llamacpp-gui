@@ -23,6 +23,15 @@ class LogWorker(QThread):
         self._url_pattern = re.compile(r"https?://\d+\.\d+\.\d+\.\d+:\d+")
         self._tps_pattern = re.compile(r"([\d.]+)\s+tokens?\s+per\s+second")
 
+    def stop(self):
+        """请求线程退出（应用关闭时调用）。
+
+        注意：readline 可能阻塞到进程输出下一行或退出，线程未必立即结束；
+        调用方（closeEvent）不应无限等待，只需保留对象引用避免 QThread
+        在运行中被销毁即可（进程退出时线程随之终止）。
+        """
+        self._running = False
+
     def run(self):
         self._running = True
         result = self.process_service.start_script(

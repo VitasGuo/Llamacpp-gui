@@ -34,10 +34,11 @@ def _build_choice_widget(choices, saved):
 
 
 class NewScriptDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, visual_model_path=""):
         super().__init__(parent)
         self.setWindowTitle("新建启动脚本 - 选择参数")
         self.setFixedWidth(620)
+        self._visual_model_path = visual_model_path
         self._init_ui()
 
     def _init_ui(self):
@@ -117,17 +118,27 @@ class NewScriptDialog(QDialog):
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
 
+        # 当前模型已绑定视觉编码器时，默认勾选 --mmproj，多模态能力开箱即用
+        if self._visual_model_path and "mmproj" in self.checkboxes:
+            self.checkboxes["mmproj"].setChecked(True)
+
     def get_config(self):
         result = {}
         for cat in CATEGORIES:
             for sw in cat["switches"]:
                 cb = self.checkboxes[sw["key"]]
-                if cb.isChecked():
-                    if sw.get("show_input", sw["default"] != ""):
-                        val = self.value_inputs[sw["key"]].text().strip()
-                        if not val:
-                            continue
-                    else:
-                        val = ""
-                    result[sw["key"]] = val
+                if not cb.isChecked():
+                    continue
+                val_widget = self.value_inputs[sw["key"]]
+                if sw.get("choices"):
+                    # 下拉控件（如 --host）：必须用 currentData() 取值，
+                    # QComboBox 没有 text() 方法，误调会直接 AttributeError 崩溃
+                    val = val_widget.currentData() or ""
+                elif sw.get("show_input", sw["default"] != ""):
+                    val = val_widget.text().strip()
+                else:
+                    val = ""
+                if not val and (sw.get("choices") or sw.get("show_input", sw["default"] != "")):
+                    continue  # 勾选了但值为空：跳过该参数
+                result[sw["key"]] = val
         return result
