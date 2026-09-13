@@ -4,11 +4,12 @@ from datetime import datetime
 
 
 class ScriptEntry:
-    def __init__(self, name="", content="", model_path="", pid=None, started_at="", port=None):
+    def __init__(self, name="", content="", model_path="", pid=None, started_at="", port=None, pinned=False):
         self.name = name
         self.content = content
         self.saved_at = datetime.now().isoformat()
         self.model_path = model_path
+        self.pinned = pinned  # 置顶标记：UI 排序置顶在前，用户可取消
         # 运行时字段（多服务器管理：由 ui 层从 process_service 的 pids.json 合并填充；
         # 持久化在 data/pids.json，不写入 scripts.json —— 后者由 _sync_config 全量重建）
         self.pid = pid
@@ -35,6 +36,7 @@ class ScriptEntry:
             "content": self.content,
             "saved_at": self.saved_at,
             "model_path": self.model_path,
+            "pinned": self.pinned,
             "pid": self.pid,
             "started_at": self.started_at,
             "port": self.port,
@@ -46,6 +48,7 @@ class ScriptEntry:
             name=d.get("name", ""),
             content=d.get("content", ""),
             model_path=d.get("model_path", ""),
+            pinned=bool(d.get("pinned", False)),
         )
         entry.saved_at = d.get("saved_at", "")
         entry.pid = d.get("pid")

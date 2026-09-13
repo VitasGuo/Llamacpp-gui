@@ -331,9 +331,173 @@ GitHub 直连时通时超时（10060）。UI 镜像前缀 placeholder 建议填�
 ② `_refresh_installed()` 收集 `self._installed_dirs = [item["dir"] for item in items]`；
 ③ `_start_next_auto()` 调 `_start_install(..., silent=True)` **之前**先置
 `self._install_silent = True`（`_start_install` 内部同名赋值保留，幂等）。
-教训：跨回调的就绪标志（done/handled 类）必须在其数据源回调里显式置位，
+**教训**：跨回调的就绪标志（done/handled 类）必须在其数据源回调里显式置位，
 且这类"条件永远不满足"的 bug 只能靠链路级冒烟测试暴露——单测纯函数全绿
 不代表 UI 编排层正确。
+
+***
+
+## #15 llama.cpp 新版移除 `--mmap`（改用 `--load-mode`），旧脚本秒退
+
+**现象**：新建 MiniCPM5 脚本启动即失败，日志：
+`error: invalid argument: --mmap` / `进程已结束`（退出码 1，发生在模型加载前）。
+
+**根因**：llama.cpp 在较新版本（本机 b10883）把 `--mmap / --no-mmap` 移除，
+mmap 改为默认行为，由 `--load-mode auto|mmap|mlock|mmap+mlock` 控制。
+旧 build（如 b10819）仍接受 `--mmap`（标记 DEPRECATED），所以切版本后
+存量含 `--mmap` 的脚本全部失效。参数解析失败发生在加载模型之前，表现为"秒退"。
+
+**解决方案**：b10883 环境下去掉所有脚本中的 `--mmap`（新默认 load-mode=auto 即
+mmap 优先，行为等价）。一键批量处理：`re.sub(r"--mmap\s*\^?\r?\n", "", content)`，
+同步写回 `.bat` 与 `scripts.json`；共清理 7 个存量脚本（Qwen3.8-27B、
+gemma-4-12b-heretic-abliterated、GLM-4.7-Flash、gemma-4-26B-A4B、
+qwen3.8-27B-IQ3、Qwen3.8-27B-IQ2、MiniCPM5）。
+
+**教训**：llama.cpp 命令行参数随上游演进不稳定（见 #13 同类教训）。切换安装版本
+（v1.7.0 版本管理）后，旧脚本里的已弃用/已移除参数会导致静默秒退；
+排查"进程秒退"应先核对当前 `llama-server --help` 是否还支持脚本里每个参数，
+不能假设参数一直有效。脚本生成侧应避免写入非稳定参数。
+
+***
+
+## #16 路径分隔符混用：Qt 给 `/`、os.path 给 `\`，脚本与 GUI 显示不统一
+
+**现象**：GUI 模型选择框显示 `C:/modelscope/...`（正斜线），而 `.bat` 里
+`cd /d "C:\Users\..."`（反斜线）、`-m "C:/modelscope\models\..."`（混合）、
+`--mmproj "C:/modelscope\models\...\mmproj-...gguf"`（混合）；scripts.json 的
+model_path 字段也是混合写法。同一套路径三种写法并存。
+
+**根因**：路径从未在"写入点"统一，四个来源混用——
+
+1. `QFileDialog` 返回正斜线（Qt 原生），经 Settings 原样存入 app_config.json；
+2. Python `os.path.join / dirname / normpath` 在 Windows 返回反斜线
+   （`find_mmproj` 拼出 `C:/modelscope\models\...` 混合；版本切换
+   `replace_bat_dir` 的 new_dir 是反斜线）；
+3. 历史一次性生成脚本用 os.path.join 拼接正斜线根路径 + 子目录 → 混合；
+4. 手工编辑的 .bat 反斜线。
+
+Windows 文件 API 对 `/` 和 `\` 都接受，llama-server 也能加载混合路径，
+所以功能一直正常——但观感混乱、字符串比较脆弱（埋雷）。
+
+**解决方案**：确立**正斜线 `/` 为唯一规范形式**（跨平台、JSON 免转义、Qt 原生、
+cmd/llama-server 兼容），在"写入点"统一收口（v1.9.0）：
+
+- 新增 `utils/path_utils.py` 的 `normalize_path()`（`\` → `/`，幂等）；
+- `config/config.py` 所有路径 setter（llamacpp_path / model_path / model_dir /
+  visual_model_path / download_path / llamacpp_install_root）统一规范化；
+- `script_builder.build_bat_content` 对 exe_dir / model_path / visual_model_path
+  入口统一；`find_mmproj` 返回前规范化；
+- `llamacpp_update_service.replace_bat_dir` 的 new_dir 统一正斜线
+  （原本 normpath 产反斜线）；
+- 一次性迁移脚本批量把存量 17 个 .bat + scripts.json + app_config.json 里
+  所有路径分隔符改为 `/`。
+
+**教训**：Windows 路径处理必须有一个全局统一的分隔符规范，在 Qt 返回值、
+os.path 产物、脚本/配置写入点三处收口；不要依赖"Windows 两种都兼容"
+来放任混用。凡是新增写入路径的位置（配置 setter、脚本生成、日志）都要过
+normalize_path()。
+
+***
+
+## #17 脚本名含空格时 name ≠ bat 文件名（sanitize 转下划线），修错文件而不自知
+
+**现象**：用户新建 `Mini CPM5-2B` 脚本（名字带空格）后启动报
+`invalid argument: --mmap`。修复时修改了 `data/scripts/Mini CPM5-2B.bat`
+（空格版），验证脚本也按 `{name}.bat` 读取——全部"通过"，但 GUI 里启动
+MiniCPM5 **依然报错**。
+
+**根因**：`ScriptEntry.sanitize_filename()` 把空格转下划线
+（`Mini CPM5-2B` → `Mini_CPM5-2B`），`ScriptService.get_script_path` /
+`save_to_file` 实际读写的文件是 **`Mini_CPM5-2B.bat`（下划线版）**。
+空格版 .bat 是孤儿（GUI 列表会把它作为孤儿再显示一条）。于是：
+- 修复改了空格版孤儿 → 真正被加载的下划线版仍是旧内容（带 `--mmap`）；
+- 验证脚本按 name 拼路径 → 检查的是孤儿文件 → 误报"一致"。
+
+**解决方案**（v1.9.0 一并修复）：
+- 同步下划线版 bat 内容为 scripts.json 的正确 content，删除空格版孤儿；
+- 涉及脚本文件的读写与验证**必须经 `ScriptEntry.sanitize_filename(name)`**
+  得到真实文件名，不能直接 `{name}.bat`。
+
+**教训**：scripts.json 的 name 是显示名，bat 文件名是 sanitize 后的安全名，
+二者在名字含空格/特殊字符时不一致。任何"按脚本名定位文件"的逻辑（读写、
+删除、一致性验证）都必须先过 sanitize_filename；否则会出现"改了但没生效"
+的静默错位，且验证还会帮你确认它"没问题"。
+
+***
+
+## #18 GitHub release 资产逐步上传：最新版本"只有 cudart"时自动下载静默失效
+
+**现象**：版本管理页显示有新版本（如 b10933），后台自动下载却从不触发；
+点开该版本的"构建变体"下拉是空的，无法下载，而下一个版本（b10932）正常。
+
+**根因**：llama.cpp 发布 release 时资产是**逐步上传**的（先建 release，再
+逐个传 zip）。缓存/API 在资产传完前抓取，会得到"只有 cudart 运行库、
+没有主包"的不完整快照。`plan_auto_download` 里
+`variants = [v for v in assets if not v.startswith("cudart-")]` 恒为空
+→ 静默 `return []`；且 `fetch_releases` 的 1h 缓存 TTL 内直接返回旧快照，
+GitHub 直连超时又回退旧缓存，导致长期"有新版本却不下载"。
+
+**解决方案**（v1.10.1）：
+1. `_release_from_api`：无主包资产（只有 cudart）的 release 直接丢弃；
+2. `fetch_releases`：TTL 内命中缓存时检查最新 release 是否有主资产，
+   不完整 → 视为过期强制重抓（自愈）；
+3. `plan_auto_download` 增强：支持传整个 releases 列表，自动跳过不完整
+   快照，取**第一个可下载的最新推荐版本**（单 dict 传参保持兼容）。
+
+**教训**：外部 API 的"最新条目"可能是发布中不完整状态（GitHub release
+资产、云存储上传、CDN 回源同理）。凡是基于"最新"做决策（自动下载、
+默认选择），都要校验数据完整性并向后回退，不能信任"最新 = 最全"；
+缓存命中时也要校验内容而非只按 TTL。
+
+***
+
+## #19 ModelScope 文件大小元数据失真，下载进度百分比错乱
+
+**现象**：下载进度条百分比离谱（下载到一半就显示 100%，或显示 677% 这类
+超范围值）。实测 MiniCPM5-2B-F16.gguf 元数据 `file_size` 744MB、实际文件
+5GB（相差约 7 倍）；Qwen3.8-27B-UD-IQ4_XS 元数据 1.4GB、实际 14GB。
+
+**根因**：`DownloadEntry.progress` 按 `downloaded / file_size` 计算百分比，
+而 `file_size` 来自 ModelScope 文件列表 API 的元数据（部分文件与实际大小
+不符）。下载中 `_on_progress` 只在 HTTP `total > 0`（有 Content-Length）时
+覆盖 `file_size`；无 Content-Length 时停留在错误元数据上 → 百分比超 100
+（QProgressBar 内部文本直接显示超范围值）。
+
+**解决方案**（v1.10.1）：
+1. `_on_progress`：`total > 0` 时直接用 HTTP 完整大小覆盖 `file_size`
+   （HTTP 值比元数据可靠）；
+2. `_on_finished`：完成后以实际文件大小校准 `file_size`（`max`），保证
+   收敛到 100%；
+3. `DownloadEntry.progress`：百分比 clamp 到 0~100（兜底任何失真输入）。
+
+**教训**：外部元数据（文件大小、版本号等）不能作为进度/比较的可靠基数，
+必须以实际传输内容为准并在边界做 clamp；进度类 UI 永远要防御
+"分子 > 分母"的越界输入。
+
+***
+
+## #20 定时任务线程与 HTTP handler 并发读写同一对话 JSON，更新互相覆盖
+
+**现象**：定时任务执行结果或聊天消息偶发丢失（后写者覆盖先写者）；触发条件
+是任务调度线程与聊天请求线程几乎同时写同一 conversation 文件。
+
+**根因**：`chat/scheduler.py` 的读-改-写（list_conversations → 改 messages/tasks
+→ write_conv_file）与 `chat/handlers.py` 的同类操作无锁并发。两个线程都基于
+旧快照修改后原子替换文件，后写者把先写者的修改整个覆盖掉。
+
+**解决方案**（v1.11.0 审查修复）：
+- `chat/repository.py` 新增模块级 `CONV_LOCK = threading.RLock()`（可重入，
+  scheduler 持锁时内部 write_conv_file 再取锁不死锁），`write_conv_file`
+  整体包锁（写串行化）；
+- `chat/scheduler.py` 成功路径拆两段锁：网络调用（最长 120s）前锁内读
+  conv/task/agent 构造请求，调用后**重新读最新 conv**再写回结果（避免基于
+  旧对象覆盖并发更新）；`_record_task_error` 同样包锁。
+- 已知残余限制：handler 的"读在锁外"仍存在极小覆盖窗口（写已串行化），
+  极端并发下可能丢一次更新，已记录为低概率已知项。
+
+**教训**：多线程 + 文件存储的"读-改-写"必须整体串行化（锁住整个事务），
+只在写函数里加锁不够；网络等长耗时操作绝不能放在锁内。且写回前要重读
+最新状态，不能信任调用前读到的快照。
 
 ***
 

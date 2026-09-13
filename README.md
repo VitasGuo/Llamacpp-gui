@@ -98,8 +98,20 @@ main.py
 │   ├── dialogs/            对话框
 │   └── workers/            后台工作线程（日志/状态轮询/搜索/版本检查/版本安装）
 ├── tests/                  冒烟测试（unittest，offscreen 可跑）
-└── utils/                  通用工具
+└── utils/                  通用工具（logger, validator, atomic_io, path_utils）
 ```
+
+## 路径规范（关键设计决策）
+
+- 所有路径以**正斜线 `/`** 为唯一规范形式存储与展示（`C:/modelscope/...`）。
+- 原因：跨平台一致（POSIX 原生）、JSON 免转义、Qt/QFileDialog 原生返回即正斜线、
+  Windows 文件 API / cmd / llama-server 完全兼容。
+- 统一在**写入点**收口：配置 setter、脚本生成（script_builder）、版本切换
+  （replace_bat_dir）均过 `utils/path_utils.normalize_path()`；
+  `os.path.join` 等产物（Windows 下产 `\`）在进入存储前必须规范化。
+- 脚本名与 .bat 文件名可能不同：`ScriptEntry.sanitize_filename()` 会把空格/
+  特殊字符转为下划线，凡"按脚本名定位文件"必须经 sanitize 后的真实文件名
+  （详见 traps #17）。
 
 ## 测试
 

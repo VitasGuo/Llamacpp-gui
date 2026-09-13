@@ -8,6 +8,7 @@ from service.script_builder import (
     find_mmproj,
     build_bat_content,
 )
+from utils.path_utils import normalize_path
 
 
 class TestExtractPort(unittest.TestCase):
@@ -47,11 +48,12 @@ class TestBuildBat(unittest.TestCase):
         self.assertIn("--host 127.0.0.1", content)
 
     def test_quoted_paths(self):
+        # 路径统一正斜线 /（v1.9.0 路径规范，见 utils/path_utils.py）
         content = build_bat_content(
             exe_dir="C:\\a b", model_path="C:\\path with space\\m.gguf",
             config={},
         )
-        self.assertIn('"C:\\path with space\\m.gguf"', content)
+        self.assertIn('"C:/path with space/m.gguf"', content)
 
 
 class TestFindMmproj(unittest.TestCase):
@@ -67,7 +69,8 @@ class TestFindMmproj(unittest.TestCase):
         open(model, "w").close()
         mm = os.path.join(self._tmp, "mmproj-model.gguf")
         open(mm, "w").close()
-        self.assertEqual(find_mmproj(model), mm)
+        # find_mmproj 返回值统一正斜线 /（v1.9.0 路径规范）
+        self.assertEqual(find_mmproj(model), normalize_path(mm))
 
 
 if __name__ == "__main__":

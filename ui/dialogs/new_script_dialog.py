@@ -34,11 +34,12 @@ def _build_choice_widget(choices, saved):
 
 
 class NewScriptDialog(QDialog):
-    def __init__(self, parent=None, visual_model_path=""):
+    def __init__(self, parent=None, visual_model_path="", default_name=""):
         super().__init__(parent)
         self.setWindowTitle("新建启动脚本 - 选择参数")
         self.setFixedWidth(620)
         self._visual_model_path = visual_model_path
+        self._default_name = default_name
         self._init_ui()
 
     def _init_ui(self):
@@ -51,6 +52,15 @@ class NewScriptDialog(QDialog):
         )
         tip.setWordWrap(True)
         layout.addWidget(tip)
+
+        # 脚本名称：预填所选模型文件名（自动命名），可修改
+        name_row = QHBoxLayout()
+        name_label = QLabel("脚本名称:")
+        name_label.setStyleSheet("font-weight: bold;")
+        name_row.addWidget(name_label)
+        self.name_edit = QLineEdit(self._default_name)
+        name_row.addWidget(self.name_edit)
+        layout.addLayout(name_row)
 
         form = QFormLayout()
         self.checkboxes = {}
@@ -121,6 +131,10 @@ class NewScriptDialog(QDialog):
         # 当前模型已绑定视觉编码器时，默认勾选 --mmproj，多模态能力开箱即用
         if self._visual_model_path and "mmproj" in self.checkboxes:
             self.checkboxes["mmproj"].setChecked(True)
+
+    def get_name(self):
+        """返回脚本名称（去除首尾空白；空名由调用方校验）。"""
+        return self.name_edit.text().strip()
 
     def get_config(self):
         result = {}

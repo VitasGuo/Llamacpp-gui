@@ -252,10 +252,15 @@ class ModelTab(QWidget):
             self._current_page,
             self._page_size,
         )
-        self._search_worker.result_signal.connect(self._on_search_result)
+        self._search_worker.result_signal.connect(
+            lambda result, w=self._search_worker: self._on_search_result(w, result)
+        )
         self._search_worker.start()
 
-    def _on_search_result(self, result):
+    def _on_search_result(self, worker, result):
+        # 过期保护：连续搜索/切来源后，旧 worker 的迟到结果不得覆盖新结果
+        if worker is not self._search_worker:
+            return
         self.search_btn.setEnabled(True)
         self.search_btn.setText("搜索")
         error = result.get("error")

@@ -31,9 +31,11 @@ class UpdateTab(QWidget):
     """llama.cpp 版本管理。
 
     对外信号：version_switched(str) —— 切换版本后发出新 exe 路径，
-    主窗口据此刷新主控制页路径显示。
+    主窗口据此刷新主控制页路径显示；
+    restart_requested() —— 用户选择"立即重启"后发出，主窗口执行重启。
     """
     version_switched = pyqtSignal(str)
+    restart_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -299,18 +301,22 @@ class UpdateTab(QWidget):
     # ── 后台静默下载（当前通道 + 推荐变体）──────────────────────
 
     def _maybe_auto_download(self):
-        """本地信息与 release 列表都就绪后，规划并启动后台静默下载。"""
+        """本地信息与 release 列表都就绪后，规划并启动后台静默下载。
+
+        规划时传整个 releases 列表：若最新 release 资产尚未传完（只有 cudart），
+        plan_auto_download 会自动落到下一个"可下载的最新推荐版本"。
+        """
         if not self.settings.llamacpp_auto_download:
             return
         if not self._local_info_done or not self._releases or self._install_worker:
             return
-        latest = self._releases[0]
-        if not latest or self._auto_handled_tag == latest["tag"]:
+        latest_tag = self._releases[0]["tag"]
+        if not latest_tag or self._auto_handled_tag == latest_tag:
             return
-        self._auto_handled_tag = latest["tag"]
+        self._auto_handled_tag = latest_tag
         installed_keys = {os.path.basename(d) for d in self._installed_dirs}
         plans = svc.plan_auto_download(
-            latest, self._local_build, self._local_variant,
+            self._releases, self._local_build, self._local_variant,
             self._gpu_info, installed_keys)
         if not plans:
             return
@@ -372,30 +378,33 @@ class UpdateTab(QWidget):
         release = self._selected_release()
         self.variant_combo.blockSignals(True)
         self.variant_combo.clear()
-        if not release:
-            self.variant_combo.setEnabled(False)
-            self.download_btn.setEnabled(False)
-            self.cudart_check.setVisible(False)
-            self._update_asset_hint()
-            return
-        variants = [v for v in release["assets"] if not v.startswith("cudart-")]
-        if not variants:
-            self.variant_combo.setEnabled(False)
-            self.download_btn.setEnabled(False)
-            return
-        recommended = svc.recommend_variant(self._gpu_info, variants)
-        for v in variants:
-            label = svc.variant_label(v)
-            size = release["assets"][v].get("size", 0)
-            text = f"{label}（{_format_size(size)}）"
-            if v == recommended:
-                text += "  ← 推荐"
-            self.variant_combo.addItem(text, v)
-            if v == recommended:
-                self.variant_combo.setCurrentIndex(self.variant_combo.count() - 1)
-        self.variant_combo.blockSignals(False)
-        self.variant_combo.setEnabled(True)
-        self.download_btn.setEnabled(True)
+        try:
+            if not release:
+                self.variant_combo.setEnabled(False)
+                self.download_btn.setEnabled(False)
+                self.cudart_check.setVisible(False)
+                self._update_asset_hint()
+                return
+            variants = [v for v in release["assets"] if not v.startswith("cudart-")]
+            if not variants:
+                self.variant_combo.setEnabled(False)
+                self.download_btn.setEnabled(False)
+                return
+            recommended = svc.recommend_variant(self._gpu_info, variants)
+            for v in variants:
+                label = svc.variant_label(v)
+                size = release["assets"][v].get("size", 0)
+                text = f"{label}（{_format_size(size)}）"
+                if v == recommended:
+                    text += "  ← 推荐"
+                self.variant_combo.addItem(text, v)
+                if v == recommended:
+                    self.variant_combo.setCurrentIndex(self.variant_combo.count() - 1)
+            self.variant_combo.setEnabled(True)
+            self.download_btn.setEnabled(True)
+        finally:
+            # 提前 return 分支也必须恢复信号（否则 currentIndexChanged 被永久屏蔽）
+            self.variant_combo.blockSignals(False)
         self._on_variant_changed()
 
     def _on_variant_changed(self):
@@ -612,10 +621,20 @@ class UpdateTab(QWidget):
         self.version_switched.emit(exe_path)
         self._refresh_local_info()
         self._refresh_installed()
-        QMessageBox.information(
-            self, "切换完成",
+        # 切换完成 → 用户选择"立即重启"（重启 GUI 加载新版本）或"稍后重启"
+        msg = QMessageBox(self)
+        msg.setWindowTitle("切换完成")
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setText(
             f"已切换到:\n{exe_path}\n\n自动更新了 {updated} 个启动脚本中的路径。\n"
-            "运行中的服务不受影响，下次启动脚本生效。")
+            "运行中的服务不受影响，重启 GUI 后新版本生效。"
+        )
+        restart_btn = msg.addButton("立即重启", QMessageBox.ButtonRole.YesRole)
+        later_btn = msg.addButton("稍后重启", QMessageBox.ButtonRole.NoRole)
+        msg.setDefaultButton(later_btn)  # 默认稍后重启，避免误触重启打断当前会话
+        msg.exec()
+        if msg.clickedButton() is restart_btn:
+            self.restart_requested.emit()  # 由主窗口执行应用重启
 
     def _open_install_root(self):
         root = self.settings.llamacpp_install_root

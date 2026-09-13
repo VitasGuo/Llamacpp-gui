@@ -22,6 +22,7 @@ from config.config import Settings
 from service.script_service import ScriptService
 from utils.atomic_io import atomic_write_json
 from utils.logger import error
+from utils.path_utils import normalize_path
 
 # 无控制台启动（pythonw / PyInstaller -w）时子进程必须带此标志，否则弹黑窗（traps #5）
 NO_WINDOW = 0x08000000
@@ -166,7 +167,8 @@ def replace_bat_dir(content, old_dir, new_dir):
     """
     if not content or not old_dir:
         return content
-    new_norm = os.path.normpath(new_dir)
+    # 统一为正斜线 /（项目路径规范，见 utils/path_utils.py）
+    new_norm = normalize_path(os.path.normpath(new_dir))
     candidates = {old_dir, old_dir.replace("/", "\\"), old_dir.replace("\\", "/")}
     for old in candidates:
         if not old:
@@ -218,6 +220,10 @@ def _release_from_api(item):
             }
     if not assets:
         return None
+    # 只有 cudart 无主包 = release 资产仍在逐步上传的不完整快照 → 丢弃
+    # （否则最新版本显示为"只有 cudart"，自动下载的 variants 恒为空被静默跳过）
+    if not _release_has_main_asset({"assets": assets}):
+        return None
     date_str = ""
     try:
         date_str = datetime.fromisoformat(published.replace("Z", "+00:00")).strftime("%Y-%m-%d")
@@ -243,7 +249,11 @@ def fetch_releases(per_page=15, force=False):
         try:
             checked = datetime.fromisoformat(entry.get("checked_at", ""))
             if datetime.now() - checked <= RELEASES_CACHE_TTL:
-                return entry.get("releases", []), ""
+                rels = entry.get("releases", [])
+                # 最新 release 只有 cudart（发布中不完整快照）→ 缓存视为过期，
+                # 强制重抓，避免"有新版本却不自动下载"（traps #18）
+                if rels and _release_has_main_asset(rels[0]):
+                    return rels, ""
         except ValueError:
             pass
 
@@ -473,41 +483,58 @@ def _cuda_series(variant):
     return variant
 
 
-def plan_auto_download(latest, local_build, local_variant, gpu_info, installed_keys):
-    """后台静默下载计划：最新 release 的「当前通道」+「推荐变体」。
+def _release_has_main_asset(release):
+    """release 是否含主包资产（只有 cudart 视为发布中不完整快照）。"""
+    assets = (release or {}).get("assets") or {}
+    return any(not k.startswith("cudart-") for k in assets)
 
-    当前通道按 CUDA 大版本系列匹配（本地 "cuda-13" → 资产 "cuda-13.3"；
-    上游小版本随 release 演进，系列内取最新）。返回待安装的 [(tag, variant)]：
+
+def plan_auto_download(latest, local_build, local_variant, gpu_info, installed_keys):
+    """后台静默下载计划：取「可下载的最新 release」的当前通道 + 推荐变体。
+
+    latest 可以是单个 release dict 或 release 列表（从最新开始）：
+    - 列表时自动跳过无主资产/发布中快照（上游资产逐步上传，b10933 可能
+      只有 cudart），取第一个有可下载内容的 release —— "可下载的最新推荐版本"；
+    - 单 dict 时保持历史行为（兼容既有单测）。
+
+    返回待安装的 [(tag, variant)]：
     - 去重（当前通道与推荐相同时只装一次）
     - 跳过已安装的 {tag}-{variant}
     - 当前通道仅在新于本地 build 时更新；推荐变体未安装过即下载（供用户一键切换）
     """
-    if not latest or not latest.get("build") or not latest.get("assets"):
-        return []
-    tag, build = latest["tag"], latest["build"]
-    variants = [v for v in latest["assets"] if not v.startswith("cudart-")]
-    if not variants:
-        return []
-    channel = local_variant
-    if channel and channel not in variants and _cuda_series(channel).startswith("cuda-"):
-        series = _cuda_series(channel)
-        same = sorted((v for v in variants if _cuda_series(v) == series), reverse=True)
-        channel = same[0] if same else ""  # 通道已停产 → 只装推荐
-    recommended = recommend_variant(gpu_info, variants)
-    targets = []
-    if channel and channel in variants:
-        targets.append(channel)
-    if recommended and recommended in variants and recommended not in targets:
-        targets.append(recommended)
-    installed = set(installed_keys or [])
-    plans = []
-    for v in targets:
-        if f"{tag}-{v}" in installed:
+    releases = latest if isinstance(latest, list) else ([latest] if latest else [])
+    for release in releases:
+        if not release or not release.get("build") or not release.get("assets"):
             continue
-        if v == channel and local_build and build <= local_build:
-            continue
-        plans.append((tag, v))
-    return plans
+        tag, build = release["tag"], release["build"]
+        variants = [v for v in release["assets"] if not v.startswith("cudart-")]
+        if not variants:
+            continue  # 只有 cudart = 发布中不完整快照 → 跳过，看下一个版本
+        channel = local_variant
+        if channel and channel not in variants and _cuda_series(channel).startswith("cuda-"):
+            series = _cuda_series(channel)
+            same = sorted((v for v in variants if _cuda_series(v) == series), reverse=True)
+            channel = same[0] if same else ""  # 通道已停产 → 只装推荐
+        recommended = recommend_variant(gpu_info, variants)
+        targets = []
+        if channel and channel in variants:
+            targets.append(channel)
+        if recommended and recommended in variants and recommended not in targets:
+            targets.append(recommended)
+        installed = set(installed_keys or [])
+        plans = []
+        for v in targets:
+            if f"{tag}-{v}" in installed:
+                continue
+            if v == channel and local_build and build <= local_build:
+                continue
+            plans.append((tag, v))
+        if plans:
+            return plans
+        # 该 release 完整（有主资产）但无待下载项（已装齐/通道已最新）→ 就此停止，
+        # 不再降级去下载更旧的版本
+        return []
+    return []
 
 
 def _find_cudart_in(paths, cuda_major=None):
@@ -640,7 +667,8 @@ def list_installed(dest_root):
             "variant": meta.get("variant", ""),
             "date": meta.get("installed_at", "")[:16].replace("T", " "),
         })
-    result.sort(key=lambda r: r["tag"], reverse=True)
+    # 按 build 号排序（tag 字符串排序在跨位数时错乱：b9999 > b10615）
+    result.sort(key=lambda r: tag_to_build(r.get("tag", "")), reverse=True)
     return result
 
 
@@ -658,7 +686,7 @@ def switch_version(new_exe_path, settings=None, script_service=None):
     new_dir = os.path.dirname(os.path.abspath(new_exe_path))
     old_dir = os.path.dirname(os.path.abspath(old_exe)) if old_exe else ""
 
-    settings.llamacpp_path = os.path.normpath(new_exe_path)
+    settings.llamacpp_path = normalize_path(os.path.normpath(new_exe_path))
     settings.save()
 
     if not old_dir or os.path.normcase(old_dir) == os.path.normcase(new_dir):

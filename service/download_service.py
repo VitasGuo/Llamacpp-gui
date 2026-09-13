@@ -179,13 +179,21 @@ class DownloadManager(QObject):
 
         worker.progress_signal.connect(self._on_progress)
         worker.speed_signal.connect(self._on_speed)
-        worker.finished_signal.connect(lambda src, fp, ok, err: self._on_finished(src, fp, ok, err, entry))
+        worker.finished_signal.connect(
+            lambda src, fp, ok, err, w=worker, e=entry: self._on_finished(src, fp, ok, err, e, w)
+        )
         worker.start()
         self.download_queue.update(entry)
         return True
 
     def _on_progress(self, source, file_path, current, total):
-        """转发进度信号并更新队列；queue.json 写盘节流（同一文件至少 1 秒一次）。"""
+        """转发进度信号并更新队列；queue.json 写盘节流（同一文件至少 1 秒一次）。
+
+        total 为 HTTP 提供的文件完整大小（比 ModelScope 元数据可靠——部分
+        文件元数据 file_size 与实际相差数倍，直接沿用会让百分比错乱），
+        total>0 时覆盖 file_size；无 Content-Length（total=0）时保留元数据，
+        百分比由 DownloadEntry.progress 的 clamp 兜底。
+        """
         entry = self._find_entry_by_path(source, file_path)
         if entry:
             # 内存中的 entry 每次回调照常更新
@@ -203,8 +211,13 @@ class DownloadManager(QObject):
     def _on_speed(self, source, file_path, speed):
         self.speed_signal.emit(source, file_path, speed)
 
-    def _on_finished(self, source, file_path, success, error, entry):
-        worker = self._workers.pop((source, file_path), None)
+    def _on_finished(self, source, file_path, success, error, entry, worker=None):
+        # 只弹出仍指向本 worker 的记录：若期间同 key 已新建新 worker（旧 worker
+        # run 已返回但 finished 信号未派发的竞态窗口），不能把新 worker 弹掉
+        # 使其失去引用被 GC（运行中 QThread 被销毁会崩溃）
+        if worker is not None and self._workers.get((source, file_path)) is not worker:
+            return
+        self._workers.pop((source, file_path), None)
         self._last_persist.pop((source, file_path), None)
         if success:
             entry.status = "completed"
@@ -215,6 +228,10 @@ class DownloadManager(QObject):
         else:
             entry.status = "failed"
         entry.downloaded = os.path.getsize(entry.dest_path) if os.path.exists(entry.dest_path) else entry.downloaded
+        # 完成后以实际文件大小校准 file_size（元数据/HTTP 值可能失真），
+        # 保证百分比收敛到 100% 而不是超出量程
+        if entry.file_size <= 0 or entry.downloaded > entry.file_size:
+            entry.file_size = entry.downloaded
         self.download_queue.update(entry)
         self.finished_signal.emit(source, file_path, success, error)
 
@@ -262,9 +279,11 @@ class DownloadManager(QObject):
         self.download_queue.remove(entry)
         if worker_active:
             # worker 仍在运行：不能弹出其最后引用（QThread 运行中被 GC 会崩溃），
-            # 也不能与其并发删除文件；留给 worker 结束时自行移除/清理
+            # 也不能与其并发删除文件；留给 worker 结束时自行移除/清理。
+            # 只移除仍指向本 worker 的记录（同 key 已新建新 worker 时不误弹）
             worker.finished_signal.connect(
-                lambda *args, key=worker_key: self._workers.pop(key, None)
+                lambda *args, w=worker, key=worker_key:
+                    self._workers.pop(key, None) if self._workers.get(key) is w else None
             )
         else:
             self._workers.pop(worker_key, None)

@@ -142,12 +142,14 @@ class TestReplaceBatDir(unittest.TestCase):
     def test_forward_slash(self):
         content = '@echo off\ncd /d "C:/llama-cpp"\nllama-server.exe ^'
         result = svc.replace_bat_dir(content, "C:/llama-cpp", "D:/new/dir")
-        self.assertIn('cd /d "D:\\new\\dir"', result)
+        # v1.9.0 路径规范：new_dir 统一正斜线 /
+        self.assertIn('cd /d "D:/new/dir"', result)
 
     def test_backward_slash(self):
         content = '@echo off\ncd /d "C:\\llama-cpp"\nllama-server.exe ^'
         result = svc.replace_bat_dir(content, "C:/llama-cpp", "D:/new/dir")
-        self.assertIn('cd /d "D:\\new\\dir"', result)
+        # 旧写法（反斜线）同样被替换，且结果统一正斜线 /
+        self.assertIn('cd /d "D:/new/dir"', result)
 
 
 class _StubSettings:
@@ -185,11 +187,11 @@ class TestSwitchVersion(unittest.TestCase):
             "D:/llamacpp/b9999-cpu/llama-server.exe",
             settings=settings, script_service=service)
         self.assertEqual(updated, 1)
-        self.assertIn("D:\\llamacpp\\b9999-cpu", entry.content)
+        self.assertIn("D:/llamacpp/b9999-cpu", entry.content)
         self.assertNotIn("C:/llama-cpp", entry.content)
         self.assertEqual(len(service.saved), 1)
         self.assertTrue(settings.saved)
-        self.assertEqual(settings.llamacpp_path, "D:\\llamacpp\\b9999-cpu\\llama-server.exe")
+        self.assertEqual(settings.llamacpp_path, "D:/llamacpp/b9999-cpu/llama-server.exe")
 
     def test_same_dir_no_script_update(self):
         settings = _StubSettings("C:/llama-cpp/llama-server.exe")
@@ -364,6 +366,55 @@ class TestPlanAutoDownload(unittest.TestCase):
         plans = svc.plan_auto_download(
             _LATEST, 10453, "cuda-13", {"nvidia": False}, installed_keys=[])
         self.assertEqual(plans, [("b10793", "cuda-13.3"), ("b10793", "cpu")])
+
+    def test_list_skips_incomplete_latest(self):
+        """releases 列表：最新 release 只有 cudart（发布中快照）→ 自动落到下一个可下载版本。"""
+        incomplete = {
+            "tag": "b99999", "build": 99999,
+            "assets": {"cudart-cuda-13.3": {"name": "c", "size": 1}},
+        }
+        plans = svc.plan_auto_download(
+            [incomplete, _LATEST], 10453, "cuda-12.4", self.GPU_NEW, installed_keys=[])
+        # 跳过 b99999，落到 b10793
+        self.assertEqual(plans, [("b10793", "cuda-12.4"), ("b10793", "cuda-13.3")])
+
+    def test_list_single_dict_backward_compat(self):
+        """单 dict 传参保持历史行为（不因列表化而破坏既有调用）。"""
+        plans = svc.plan_auto_download(
+            _LATEST, 10453, "cuda-12.4", self.GPU_NEW, installed_keys=[])
+        self.assertEqual(plans, [("b10793", "cuda-12.4"), ("b10793", "cuda-13.3")])
+
+    def test_list_all_incomplete_returns_empty(self):
+        plans = svc.plan_auto_download(
+            [{"tag": "b1", "build": 1,
+              "assets": {"cudart-cuda-13.3": {"name": "c", "size": 1}}}],
+            100, "cpu", self.GPU_NEW, installed_keys=[])
+        self.assertEqual(plans, [])
+
+    def test_release_has_main_asset(self):
+        self.assertFalse(svc._release_has_main_asset(
+            {"assets": {"cudart-cuda-13.3": {"name": "c", "size": 1}}}))
+        self.assertTrue(svc._release_has_main_asset(
+            {"assets": {"cuda-13.3": {"name": "m", "size": 1}}}))
+        self.assertFalse(svc._release_has_main_asset(None))
+        self.assertFalse(svc._release_has_main_asset({}))
+
+
+class TestListInstalledSort(unittest.TestCase):
+    def test_sorted_by_build_number_not_tag_string(self):
+        """b9999 与 b10615 共存时按 build 号排序（字符串排序 '9'>'1' 会错乱）。"""
+        import json
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        for tag in ("b9999", "b10615"):
+            d = os.path.join(tmp, f"{tag}-cpu")
+            os.makedirs(d)
+            with open(os.path.join(d, svc.META_FILENAME), "w", encoding="utf-8") as f:
+                json.dump({"tag": tag, "variant": "cpu",
+                           "installed_at": "2026-09-01T00:00:00"}, f)
+            open(os.path.join(d, "llama-server.exe"), "w").close()
+        items = svc.list_installed(tmp)
+        self.assertEqual([i["tag"] for i in items], ["b10615", "b9999"])
 
 
 def _make_zip(path, files):

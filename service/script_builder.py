@@ -3,6 +3,7 @@ import os
 import re
 
 from config.config import Settings
+from utils.path_utils import normalize_path
 
 # 监听方式下拉选项（新建脚本对话框的 --host）。
 # "__tailscale__" 是哨兵值：对话框打开时解析为检测到的 Tailscale IP，
@@ -138,14 +139,22 @@ def find_mmproj(model_path):
         for f in sorted(os.listdir(directory)):
             low = f.lower()
             if "mmproj" in low and low.endswith(".gguf"):
-                return os.path.join(directory, f)
+                return normalize_path(os.path.join(directory, f))
     except OSError:
         pass
     return ""
 
 
 def build_bat_content(exe_dir, model_path, config, visual_model_path=""):
-    """根据配置生成 .bat 启动脚本内容。"""
+    """根据配置生成 .bat 启动脚本内容。
+
+    所有路径统一规范化（正斜线 /）：cmd/llama-server 在 Windows 下兼容，
+    JSON 存储与跨平台一致（见 utils/path_utils.py 约定）。
+    """
+    exe_dir = normalize_path(exe_dir)
+    model_path = normalize_path(model_path)
+    visual_model_path = normalize_path(visual_model_path)
+
     lines = [
         "@echo off",
         f'cd /d "{exe_dir}"',

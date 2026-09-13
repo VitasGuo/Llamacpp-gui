@@ -1,6 +1,7 @@
 """聊天模块数据访问层。"""
 import os
 import json
+import threading
 import uuid
 import urllib.request
 from datetime import datetime
@@ -16,6 +17,10 @@ AGENTS_DIR = os.path.abspath("data/agents")
 MEMORY_DIR = os.path.join(AGENTS_DIR, "memory")
 SETTINGS_FILE = os.path.join(CHAT_DIR, "settings.json")
 TASK_INDEX_FILE = os.path.join(CHAT_DIR, "task_index.json")
+
+# 对话文件读写锁（RLock 可重入）：scheduler 线程与 HTTP handler 线程并发
+# 读写同一 conversation 时串行化写，避免后写者覆盖先写者的更新（traps #20）
+CONV_LOCK = threading.RLock()
 
 
 def _load_json(path, default):
@@ -163,28 +168,29 @@ def list_conversations():
 
 
 def write_conv_file(conv):
-    os.makedirs(CONVERSATIONS_DIR, exist_ok=True)
-    current = list_conversations()
-    for c in current:
-        if c["id"] == conv["id"] and c.get("title") != conv.get("title"):
-            old = _conv_path(c["title"])
-            if os.path.exists(old):
-                os.remove(old)
-            break
+    with CONV_LOCK:  # 写串行化：scheduler/handler 并发写同一对话时避免互相覆盖
+        os.makedirs(CONVERSATIONS_DIR, exist_ok=True)
+        current = list_conversations()
+        for c in current:
+            if c["id"] == conv["id"] and c.get("title") != conv.get("title"):
+                old = _conv_path(c["title"])
+                if os.path.exists(old):
+                    os.remove(old)
+                break
 
-    base = conv.get("title", "未命名对话")
-    path = _conv_path(base)
-    if os.path.exists(path):
-        existing = _load_json(path, None)
-        if existing and existing.get("id") != conv["id"]:
-            for n in range(1, 100):
-                t = f"{base}({n})"
-                p = _conv_path(t)
-                if not os.path.exists(p):
-                    conv["title"] = t
-                    path = p
-                    break
-    _save_json(path, conv)
+        base = conv.get("title", "未命名对话")
+        path = _conv_path(base)
+        if os.path.exists(path):
+            existing = _load_json(path, None)
+            if existing and existing.get("id") != conv["id"]:
+                for n in range(1, 100):
+                    t = f"{base}({n})"
+                    p = _conv_path(t)
+                    if not os.path.exists(p):
+                        conv["title"] = t
+                        path = p
+                        break
+        _save_json(path, conv)
 
 
 def delete_conv_file(title):
@@ -330,4 +336,6 @@ def call_llm(llm_url, messages, sampling=None):
     )
     with urllib.request.urlopen(req, timeout=120) as resp:
         data = json.loads(resp.read())
-    return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    # choices 键存在但为空列表时 get 默认值不生效，需 (or [{}]) 兜底
+    choices = data.get("choices") or [{}]
+    return choices[0].get("message", {}).get("content", "")

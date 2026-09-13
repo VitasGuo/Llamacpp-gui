@@ -120,7 +120,7 @@ class ScriptService:
         return {"scripts": []}
 
     def _upsert_config_entry(self, entry):
-        """增量 upsert scripts.json：命中既有条目则更新 name/model_path/saved_at/content，
+        """增量 upsert scripts.json：命中既有条目则更新 name/model_path/saved_at/content/pinned，
         未命中则追加；原子写回（临时文件 + os.replace），崩溃不会写坏 JSON。"""
         data = self._load_config_data()
         new = {
@@ -128,6 +128,7 @@ class ScriptService:
             "content": entry.content,
             "saved_at": datetime.now().isoformat(),
             "model_path": entry.model_path,
+            "pinned": bool(entry.pinned),
         }
         for item in data["scripts"]:
             if isinstance(item, dict) and self._matches(item.get("name", ""), entry.name):

@@ -2,6 +2,7 @@
 import sys
 import os
 import re
+import subprocess
 import webbrowser
 from datetime import datetime
 
@@ -10,7 +11,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QLabel, QLineEdit, QPushButton, QTextEdit,
     QTreeWidget, QTreeWidgetItem, QMessageBox,
     QSplitter, QTabWidget, QFileDialog, QInputDialog, QDialog,
-    QSystemTrayIcon, QMenu, QComboBox,
+    QSystemTrayIcon, QMenu, QComboBox, QHeaderView, QToolButton,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QTextCursor, QAction, QBrush, QColor, QPixmap, QPainter, QFont, QIcon
@@ -29,7 +30,7 @@ from service.model_scanner import scan_gguf_files
 from chat import start_bridge
 from model.script import ScriptEntry
 from ui.model_tab import ModelTab
-from ui.monitor_tab import MonitorTab
+from ui.monitor_tab import MonitorTab, CompactMonitor
 from ui.update_tab import UpdateTab
 from ui.dialogs.new_script_dialog import NewScriptDialog
 from ui.dialogs.settings_dialog import SettingsDialog
@@ -72,6 +73,8 @@ class MainWindow(QMainWindow):
 
         self.monitor_service = MonitorService(self.process_service)
         self.monitor_tab = MonitorTab(self.monitor_service)
+        # 主控制页嵌入的压缩版监控（与日志并排）：同一数据源，加载模型时边看日志边看负载
+        self.monitor_compact = CompactMonitor(self.monitor_service)
 
         # 多服务器：后台线程每 2s 轮询 tasklist 刷新脚本列表状态列与控制面板
         # （tasklist 约 0.5~0.7s，放 GUI 线程会卡顿，故用后台 QThread）。
@@ -97,6 +100,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._status_poller.stop()
+        self._status_poller.wait(300)  # 轮询线程正跑 tasklist 时不能运行中被销毁
         # 通知所有 LogWorker 退出；readline 可能阻塞，短暂等待后不再等
         # （保留引用防止 QThread 在运行中被销毁导致崩溃，进程退出时线程终止）
         for w in self.log_workers:
@@ -131,6 +135,10 @@ class MainWindow(QMainWindow):
         menu.addAction(self.auto_start_action)
 
         menu.addSeparator()
+        restart_action = QAction("重启", self)
+        restart_action.triggered.connect(self._restart_app)
+        menu.addAction(restart_action)
+
         quit_action = QAction("退出", self)
         quit_action.triggered.connect(self._quit_app)
         menu.addAction(quit_action)
@@ -174,6 +182,19 @@ class MainWindow(QMainWindow):
         self._force_quit = True
         self.close()
 
+    def _restart_app(self):
+        """托盘菜单"重启"：以当前解释器+参数重新启动应用（打包后为 exe），随后退出本实例。
+
+        单实例锁由 main() 的短暂重试兜底：旧实例退出释放锁期间，新实例能拿到锁。
+        """
+        self._force_quit = True
+        cmd = [sys.executable] + list(sys.argv)
+        try:
+            subprocess.Popen(cmd, cwd=os.getcwd())
+        except OSError:
+            pass  # 启动失败时至少完成退出，不阻塞
+        self.close()
+
     def _init_ui(self):
         # 菜单：设置入口
         settings_menu = self.menuBar().addMenu("设置")
@@ -194,9 +215,15 @@ class MainWindow(QMainWindow):
         control_layout = QVBoxLayout(control_widget)
 
         control_layout.addWidget(self._create_path_panel())
-        control_layout.addWidget(self._create_script_panel())
+        # 脚本面板占更大空间（脚本多时列表能显示更多行）
+        control_layout.addWidget(self._create_script_panel(), stretch=2)
         control_layout.addWidget(self._create_control_panel())
-        control_layout.addWidget(self._create_log_panel(), stretch=1)
+
+        # 日志与压缩系统监控并排：加载模型时边看日志边看负载，免切标签
+        bottom_row = QHBoxLayout()
+        bottom_row.addWidget(self._create_log_panel(), stretch=3)
+        bottom_row.addWidget(self.monitor_compact, stretch=1)
+        control_layout.addLayout(bottom_row, stretch=1)
 
         tabs.addTab(control_widget, "主控制")
 
@@ -210,6 +237,8 @@ class MainWindow(QMainWindow):
         # 版本管理标签（llama.cpp 检测更新/下载安装/切换）
         self.update_tab = UpdateTab()
         self.update_tab.version_switched.connect(self._on_version_switched)
+        # 版本切换后用户选"立即重启" → 由主窗口执行应用重启
+        self.update_tab.restart_requested.connect(self._restart_app)
         tabs.addTab(self.update_tab, "版本管理")
 
         main_layout.addWidget(tabs)
@@ -277,11 +306,15 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         left_layout = QVBoxLayout()
-        # 双列：脚本名 + 状态（● 运行中 PID=xxx / 已停止）
+        # 三列：脚本名（自动拉伸）+ 状态（按内容）+ 置顶按钮（固定宽度）
         self.script_list = QTreeWidget()
-        self.script_list.setColumnCount(2)
-        self.script_list.setHeaderLabels(["脚本", "状态"])
-        self.script_list.setColumnWidth(1, 130)
+        self.script_list.setColumnCount(3)
+        self.script_list.setHeaderLabels(["脚本", "状态", ""])
+        header = self.script_list.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.script_list.setColumnWidth(2, 68)
         self.script_list.setRootIsDecorated(False)
         self.script_list.setUniformRowHeights(True)
         self.script_list.currentItemChanged.connect(self._on_script_selected)
@@ -289,6 +322,9 @@ class MainWindow(QMainWindow):
         self.script_list.itemDoubleClicked.connect(
             lambda item: self._run_script()
         )
+        # 右键菜单：置顶/取消置顶（补充路径，主入口为行内按钮）
+        self.script_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.script_list.customContextMenuRequested.connect(self._show_script_context_menu)
         left_layout.addWidget(self.script_list)
 
         btn_layout = QHBoxLayout()
@@ -423,6 +459,7 @@ class MainWindow(QMainWindow):
             self._append_log(f"检测到脚本 '{name}' 上次启动的服务仍在运行, PID={pid}")
             # 同步到监控页状态面板（否则恢复后显示"未运行"，与实际不符）
             self.monitor_tab.on_server_started(name)
+            self.monitor_compact.on_server_started(name)
         if not alive:
             # 回退：旧版本 data/last_pid.pid（无脚本归属信息，行为与升级前一致）
             pid = self.process_service.restore_last_pid()
@@ -443,8 +480,10 @@ class MainWindow(QMainWindow):
 
     def _refresh_script_list(self):
         self.script_list.clear()
-        self.script_list.setColumnCount(2)
+        self.script_list.setColumnCount(3)
         scripts = self.script_service.load_scripts()
+        # 置顶脚本排前面（稳定排序：置顶内保持原相对顺序，其余不变）
+        scripts.sort(key=lambda s: not s.pinned)
         self._script_entries = scripts
         runtime = self.process_service.load_runtime()
         for script in scripts:
@@ -457,6 +496,62 @@ class MainWindow(QMainWindow):
             item.setText(0, script.name)
             item.setText(1, self._runtime_status_text(script.name, runtime))
             self.script_list.addTopLevelItem(item)
+            self._set_pin_button(item, script)
+
+    def _set_pin_button(self, item, script):
+        """在脚本行内置顶状态按钮：已置顶=橙色"置顶"，未置顶=灰色"未置顶"（点击切换）。
+
+        用文字而非 emoji：QSS color 无法给彩色 emoji 字形着色，emoji 版
+        置顶/非置顶视觉无差别（用户反馈）。
+        """
+        btn = QToolButton()
+        btn.setFixedSize(64, 24)
+        btn.setAutoRaise(True)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        if script.pinned:
+            btn.setText("置顶")
+            btn.setToolTip("已置顶，点击取消置顶")
+            btn.setStyleSheet("QToolButton { color: #e67e22; font-weight: bold; }")
+        else:
+            btn.setText("未置顶")
+            btn.setToolTip("置顶：点击后排在列表前面")
+            btn.setStyleSheet("QToolButton { color: #909090; }")
+        btn.clicked.connect(lambda _, n=script.name: self._toggle_pin(n))
+        self.script_list.setItemWidget(item, 2, btn)
+
+    def _show_script_context_menu(self, pos):
+        """脚本列表右键菜单：置顶/取消置顶。"""
+        item = self.script_list.itemAt(pos)
+        if not item:
+            return
+        self.script_list.setCurrentItem(item)
+        name = item.text(0)
+        entry = next((e for e in self._script_entries if e.name == name), None)
+        if entry is None:
+            return
+        menu = QMenu(self)
+        action = QAction("取消置顶" if entry.pinned else "置顶", self)
+        action.triggered.connect(lambda: self._toggle_pin(name))
+        menu.addAction(action)
+        menu.exec(self.script_list.viewport().mapToGlobal(pos))
+
+    def _toggle_pin(self, name):
+        """切换脚本置顶状态并持久化（写入 scripts.json），随后重排列表并保持选中。
+
+        用磁盘上的脚本内容保存：编辑器未保存的修改不回退（save_script 会写 content）。
+        """
+        entry = next((e for e in self._script_entries if e.name == name), None)
+        if entry is None:
+            return
+        entry.pinned = not entry.pinned
+        entry.content = self.script_service.load_script_content(name) or entry.content
+        entry.model_path = self.settings.model_path
+        self.script_service.save_script(entry)
+        self._refresh_script_list()
+        items = self.script_list.findItems(name, Qt.MatchFlag.MatchExactly)
+        if items:
+            self.script_list.setCurrentItem(items[0])
+        self._append_log(f"脚本已{'置顶' if entry.pinned else '取消置顶'}: {name}")
 
     def _refresh_script_statuses(self):
         """立即刷新脚本列表状态列与控制面板。
@@ -530,6 +625,7 @@ class MainWindow(QMainWindow):
             content = self.script_service.load_script_content(name)
             self.script_editor.setPlainText(content)
             self.monitor_tab.set_focus_script(name)
+            self.monitor_compact.set_focus_script(name)
             self._sync_control_panel()
             # 外网地址/聊天地址按选中脚本重算（多服务器下各脚本 host/port 不同）
             self._update_external_url()
@@ -537,6 +633,7 @@ class MainWindow(QMainWindow):
             # 取消选中 → 控制面板回退全局状态（旧版本启动/last_pid 恢复的进程）
             self.current_script_name = ""
             self.monitor_tab.set_focus_script("")
+            self.monitor_compact.set_focus_script("")
             self._sync_control_panel()
             self._update_external_url()
 
@@ -585,23 +682,23 @@ class MainWindow(QMainWindow):
         self._append_log(f"模型目录已设置: {path}")
 
     def _reload_model_combo(self):
-        """扫描已保存的模型目录，填充下拉并同步当前选中项。"""
+        """扫描已保存的模型目录，填充下拉（显示文件名、存完整路径）并同步当前选中项。"""
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
         files = scan_gguf_files(self.settings.model_dir)
-        self.model_combo.addItems(files)
+        for f in files:
+            # 下拉显示友好文件名，完整路径存 userData（避免超长路径撑爆下拉）
+            self.model_combo.addItem(os.path.basename(f), f)
         self.model_combo.setEnabled(bool(files))
-        # 当前已选模型若存在于列表则定位到对应项
-        idx = self.model_combo.findText(
-            self.settings.model_path, Qt.MatchFlag.MatchExactly
-        )
+        # 当前已选模型若存在于列表则定位到对应项（按完整路径精确匹配）
+        idx = self.model_combo.findData(self.settings.model_path)
         if idx >= 0:
             self.model_combo.setCurrentIndex(idx)
         self.model_combo.blockSignals(False)
 
     def _on_model_combo_selected(self, index):
         """下拉选中模型 → 写入当前模型路径。"""
-        path = self.model_combo.itemText(index)
+        path = self.model_combo.itemData(index)
         if not path:
             return
         if validate_gguf(path):
@@ -653,15 +750,19 @@ class MainWindow(QMainWindow):
             )
             return
 
-        name, ok = QInputDialog.getText(self, "新建脚本", "请输入脚本名称:")
-        if not ok or not name:
-            return
-
+        # 自动命名：默认取所选模型文件名（去扩展名），对话框内可修改
+        default_name = os.path.splitext(os.path.basename(model_path))[0]
         exe_dir = os.path.dirname(llamacpp_path)
         dialog = NewScriptDialog(
-            self, visual_model_path=self.settings.visual_model_path
+            self,
+            visual_model_path=self.settings.visual_model_path,
+            default_name=default_name,
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            name = dialog.get_name()
+            if not name:
+                QMessageBox.warning(self, "提示", "脚本名称不能为空。")
+                return
             config = dialog.get_config()
             bat_content = build_bat_content(
                 exe_dir, model_path, config,
@@ -669,7 +770,10 @@ class MainWindow(QMainWindow):
             )
             self.script_editor.setPlainText(bat_content)
             self.current_script_name = name
-            entry = ScriptEntry(name=name, content=bat_content, model_path=model_path)
+            # 新建脚本默认置顶（用户可右键取消）
+            entry = ScriptEntry(
+                name=name, content=bat_content, model_path=model_path, pinned=True
+            )
             bat_path = self.script_service.save_script(entry)
             self._refresh_script_list()
             item = self.script_list.findItems(name, Qt.MatchFlag.MatchExactly)
@@ -683,19 +787,32 @@ class MainWindow(QMainWindow):
             if not content.strip():
                 QMessageBox.warning(self, "提示", "脚本内容为空，无法保存。")
                 return
+            # 保存既有脚本时保留其置顶状态
+            pinned = next(
+                (e.pinned for e in self._script_entries if e.name == self.current_script_name),
+                False,
+            )
             entry = ScriptEntry(
                 name=self.current_script_name,
                 content=content,
                 model_path=self.settings.model_path,
+                pinned=pinned,
             )
             bat_path = self.script_service.save_script(entry)
             if bat_path:
                 self._append_log(f"脚本已保存: {bat_path}")
         else:
-            name, ok = QInputDialog.getText(self, "保存脚本", "请输入脚本名称:")
+            # 保存新脚本：预填所选模型名作为默认名称（可改）；新建默认置顶
+            default_name = os.path.splitext(os.path.basename(self.settings.model_path))[0]
+            name, ok = QInputDialog.getText(
+                self, "保存脚本", "请输入脚本名称:", text=default_name,
+            )
             if ok and name:
                 content = self.script_editor.toPlainText()
-                entry = ScriptEntry(name=name, content=content, model_path=self.settings.model_path)
+                entry = ScriptEntry(
+                    name=name, content=content,
+                    model_path=self.settings.model_path, pinned=True,
+                )
                 bat_path = self.script_service.save_script(entry)
                 if bat_path:
                     self._refresh_script_list()
@@ -746,10 +863,16 @@ class MainWindow(QMainWindow):
         bat_path = self.script_service.get_script_path(self.current_script_name)
         disk_content = self.script_service.load_script_content(self.current_script_name)
         if content != disk_content:
+            # 保留置顶状态：upsert 会整条目覆盖，漏传 pinned 会把置顶静默取消
+            pinned = next(
+                (e.pinned for e in self._script_entries if e.name == self.current_script_name),
+                False,
+            )
             entry = ScriptEntry(
                 name=self.current_script_name,
                 content=content,
                 model_path=self.settings.model_path,
+                pinned=pinned,
             )
             bat_path = self.script_service.save_script(entry)
             self._append_log("脚本内容已修改，运行前自动保存")
@@ -777,10 +900,17 @@ class MainWindow(QMainWindow):
                         rf"--port[=\s]+{port}\b", f"--port {next_port}", content
                     )
                     port = next_port
+                    # 端口改写保存同样保留置顶状态（漏传会静默取消置顶）
+                    pinned = next(
+                        (e.pinned for e in self._script_entries
+                         if e.name == self.current_script_name),
+                        False,
+                    )
                     entry = ScriptEntry(
                         name=self.current_script_name,
                         content=content,
                         model_path=self.settings.model_path,
+                        pinned=pinned,
                     )
                     self.script_service.save_script(entry)
                     self.script_editor.setPlainText(content)
@@ -807,10 +937,16 @@ class MainWindow(QMainWindow):
             lambda url, name=self.current_script_name: self._on_server_ready(name, url)
         )
         worker.tps_signal.connect(self.monitor_tab.update_tps)
+        worker.tps_signal.connect(self.monitor_compact.update_tps)
         worker.finished.connect(lambda w=worker: self._on_run_finished(w))
         # 多服务器：退出时带上脚本名，只重置该服务的状态（不顶掉其他服务）
         worker.finished.connect(
             lambda w=worker: self.monitor_tab.on_server_stopped(
+                getattr(w, "script_name", "") or "default"
+            )
+        )
+        worker.finished.connect(
+            lambda w=worker: self.monitor_compact.on_server_stopped(
                 getattr(w, "script_name", "") or "default"
             )
         )
@@ -825,6 +961,7 @@ class MainWindow(QMainWindow):
         )
         self._refresh_script_statuses()
         self.monitor_tab.on_server_started(self.current_script_name or "default")
+        self.monitor_compact.on_server_started(self.current_script_name or "default")
 
     def _on_server_ready(self, name, url):
         """服务就绪（按脚本归属）：记录该脚本的 URL 并刷新外网地址显示。"""
@@ -1074,6 +1211,7 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    import time
     from PyQt6.QtWidgets import QApplication, QMessageBox
     from PyQt6.QtGui import QFont
     from PyQt6.QtCore import QLockFile
@@ -1086,12 +1224,20 @@ def main():
     os.makedirs("data", exist_ok=True)
     lock = QLockFile(os.path.join("data", "app.lock"))
     if not lock.tryLock():
-        QMessageBox.warning(
-            None, "已在运行",
-            "LlamaCPP GUI 已在运行。\n请使用已有窗口（或从系统托盘唤起），"
-            "或先退出旧实例后再启动。",
-        )
-        return
+        # 托盘"重启"时新实例可能先于旧实例退出启动：短暂重试等旧实例释放锁
+        locked = False
+        for _ in range(10):
+            time.sleep(0.15)
+            if lock.tryLock():
+                locked = True
+                break
+        if not locked:
+            QMessageBox.warning(
+                None, "已在运行",
+                "LlamaCPP GUI 已在运行。\n请使用已有窗口（或从系统托盘唤起），"
+                "或先退出旧实例后再启动。",
+            )
+            return
 
     window = MainWindow()
     window.show()

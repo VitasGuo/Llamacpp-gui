@@ -30,8 +30,11 @@ class ProcessService:
             # cmd /c 后紧跟以引号开头的参数会被特殊剥离引号，且 && 会被拆成命令，
             # 导致 '"...bat"' 整体被当作一条命令找不到。改用 /d /s /c + call + 整串命令，
             # chcp 保证输出按 UTF-8 解析；call 让 .bat 在同一个 cmd 内运行。
-            # 注意：cmd 不把单引号当引号用，必须双引号包裹 bat 路径，故 replace 统一成双引号。
-            cmdline = f'cmd /d /s /c "chcp 65001>nul && call \'{bat_path}\'"'.replace("'", '"')
+            # 注意：cmd 不把单引号当引号用，必须双引号包裹 bat 路径；且不能做
+            # 全局 .replace("'", '"')——脚本名含单引号（sanitize 保留）时会被误替换
+            # 破坏路径。bat 路径经 ScriptEntry.sanitize_filename 保证不含双引号，
+            # 可直接用双引号包裹（外层 cmd 引号与内层路径引号不冲突）。
+            cmdline = f'cmd /d /s /c "chcp 65001>nul && call "{bat_path}""'
             process = subprocess.Popen(
                 cmdline,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | NO_WINDOW,

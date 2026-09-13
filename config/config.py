@@ -3,6 +3,7 @@ import json
 
 from config import APP_CONFIG_FILE
 from utils.atomic_io import atomic_write_json
+from utils.path_utils import normalize_path
 
 class Settings:
     _instance = None
@@ -42,7 +43,7 @@ class Settings:
 
     @llamacpp_path.setter
     def llamacpp_path(self, value):
-        self.config["llamacpp_path"] = value
+        self.config["llamacpp_path"] = normalize_path(value)
 
     @property
     def model_path(self):
@@ -50,7 +51,7 @@ class Settings:
 
     @model_path.setter
     def model_path(self, value):
-        self.config["model_path"] = value
+        self.config["model_path"] = normalize_path(value)
 
     @property
     def model_dir(self):
@@ -58,7 +59,7 @@ class Settings:
 
     @model_dir.setter
     def model_dir(self, value):
-        self.config["model_dir"] = value
+        self.config["model_dir"] = normalize_path(value)
 
     @property
     def visual_model_path(self):
@@ -66,7 +67,7 @@ class Settings:
 
     @visual_model_path.setter
     def visual_model_path(self, value):
-        self.config["visual_model_path"] = value
+        self.config["visual_model_path"] = normalize_path(value)
 
     @property
     def download_path(self):
@@ -74,7 +75,7 @@ class Settings:
 
     @download_path.setter
     def download_path(self, value):
-        self.config["download_path"] = value
+        self.config["download_path"] = normalize_path(value)
 
     @property
     def auto_open_chat(self) -> bool:
@@ -217,7 +218,7 @@ class Settings:
 
     @llamacpp_install_root.setter
     def llamacpp_install_root(self, value):
-        self.config["llamacpp_install_root"] = value or "data/llamacpp"
+        self.config["llamacpp_install_root"] = normalize_path(value or "data/llamacpp")
 
     @property
     def llamacpp_auto_download(self):

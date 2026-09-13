@@ -5,6 +5,7 @@ import traceback
 from datetime import datetime, timedelta
 
 from .log import error
+from . import repository as repo
 from .repository import (
     call_llm,
     list_agents,
@@ -103,75 +104,95 @@ class SchedulerService:
                 self._record_task_error(conv_id, task_id, summary)
                 return
 
-            conv = None
-            for c in list_conversations():
-                if c["id"] == conv_id:
-                    conv = c
-                    break
-            if not conv:
-                return
+            # 锁内：读 conv/task/agent 并构造请求（网络调用放锁外，避免长持锁）
+            with repo.CONV_LOCK:
+                conv = None
+                for c in list_conversations():
+                    if c["id"] == conv_id:
+                        conv = c
+                        break
+                if not conv:
+                    return
 
-            task = None
-            for t in conv.get("tasks", []):
-                if t["id"] == task_id:
-                    task = t
-                    break
-            if not task or not task.get("enabled", True):
-                return
+                task = None
+                for t in conv.get("tasks", []):
+                    if t["id"] == task_id:
+                        task = t
+                        break
+                if not task or not task.get("enabled", True):
+                    return
 
-            agent = None
-            for a in list_agents():
-                if a["id"] == agent_id:
-                    agent = a
-                    break
-            if not agent:
-                return
+                agent = None
+                for a in list_agents():
+                    if a["id"] == agent_id:
+                        agent = a
+                        break
+                if not agent:
+                    return
 
-            messages = []
-            messages.append({"role": "system", "content": agent.get("system_prompt") or "You are a helpful assistant."})
+                messages = []
+                messages.append({"role": "system", "content": agent.get("system_prompt") or "You are a helpful assistant."})
 
-            msgs_for_llm = conv.get("messages", [])[-50:]
-            for m in msgs_for_llm:
-                if m.get("role") in ("user", "assistant"):
-                    messages.append({"role": m["role"], "content": m.get("content", "")})
+                msgs_for_llm = conv.get("messages", [])[-50:]
+                for m in msgs_for_llm:
+                    if m.get("role") in ("user", "assistant"):
+                        messages.append({"role": m["role"], "content": m.get("content", "")})
 
-            messages.append({"role": "user", "content": task.get("instruction", "")})
+                messages.append({"role": "user", "content": task.get("instruction", "")})
 
-            # 应用角色配置的采样参数（temperature/top_p/…），与聊天页行为一致；
-            # 未配置的字段不传，由 call_llm 内部使用服务端默认
-            sampling = {}
-            for key in (
-                "temperature", "top_p", "top_k", "min_p",
-                "repeat_penalty", "presence_penalty", "frequency_penalty",
-            ):
-                value = agent.get(key)
-                if value is not None:
-                    sampling[key] = value
+                # 应用角色配置的采样参数（temperature/top_p/…），与聊天页行为一致；
+                # 未配置的字段不传，由 call_llm 内部使用服务端默认
+                sampling = {}
+                for key in (
+                    "temperature", "top_p", "top_k", "min_p",
+                    "repeat_penalty", "presence_penalty", "frequency_penalty",
+                ):
+                    value = agent.get(key)
+                    if value is not None:
+                        sampling[key] = value
+
+            # 锁外：网络请求（最长 120s），不阻塞其他对话的读写
             response = call_llm(llm_url, messages, sampling=sampling)
 
-            conv["messages"].append({
-                "role": "assistant",
-                "content": response,
-                "agent_id": agent_id,
-                "agent_name": agent.get("name", ""),
-            })
-            conv["updated_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            write_conv_file(conv)
+            # 锁内：重新读最新 conv 再写回（避免基于调用前的旧对象覆盖并发更新）
+            with repo.CONV_LOCK:
+                fresh = None
+                for c in list_conversations():
+                    if c["id"] == conv_id:
+                        fresh = c
+                        break
+                if not fresh:
+                    return
 
-            task["last_run_time"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            task["last_result"] = response[:200]
-            # 成功：清空错误状态
-            task["last_error"] = ""
-            task["error_count"] = 0
+                fresh["messages"].append({
+                    "role": "assistant",
+                    "content": response,
+                    "agent_id": agent_id,
+                    "agent_name": agent.get("name", ""),
+                })
+                fresh["updated_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
-            now = datetime.now()
-            interval = task.get("interval_seconds", 3600)
-            # 基于上次计划时间（当前 next_run_time）推算，执行耗时不产生漂移
-            task["next_run_time"] = self._next_run_time(task.get("next_run_time"), interval, now)
+                updated_task = next(
+                    (t for t in fresh.get("tasks", []) if t["id"] == task_id), None
+                )
+                if updated_task is None:
+                    return  # 任务已被删除/停用，不再写回
 
-            conv["tasks"] = [t for t in conv.get("tasks", []) if t["id"] != task_id] + [task]
-            write_conv_file(conv)
-            rebuild_task_index()
+                updated_task["last_run_time"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                updated_task["last_result"] = response[:200]
+                # 成功：清空错误状态
+                updated_task["last_error"] = ""
+                updated_task["error_count"] = 0
+
+                now = datetime.now()
+                interval = updated_task.get("interval_seconds", 3600)
+                # 基于上次计划时间（当前 next_run_time）推算，执行耗时不产生漂移
+                updated_task["next_run_time"] = self._next_run_time(
+                    updated_task.get("next_run_time"), interval, now)
+
+                fresh["tasks"] = [t for t in fresh.get("tasks", []) if t["id"] != task_id] + [updated_task]
+                write_conv_file(fresh)
+                rebuild_task_index()
 
         except Exception as e:
             # 记日志（含 traceback）并回写错误状态 + 推进 next_run_time（失败退避，
@@ -192,35 +213,36 @@ class SchedulerService:
         if not conv_id or not task_id:
             return
         try:
-            conv = None
-            for c in list_conversations():
-                if c["id"] == conv_id:
-                    conv = c
-                    break
-            if not conv:
-                return
+            with repo.CONV_LOCK:  # 读-改-写原子，避免与 handler/主流程并发覆盖
+                conv = None
+                for c in list_conversations():
+                    if c["id"] == conv_id:
+                        conv = c
+                        break
+                if not conv:
+                    return
 
-            task = None
-            for t in conv.get("tasks", []):
-                if t["id"] == task_id:
-                    task = t
-                    break
-            if not task:
-                return
+                task = None
+                for t in conv.get("tasks", []):
+                    if t["id"] == task_id:
+                        task = t
+                        break
+                if not task:
+                    return
 
-            now = datetime.now()
-            interval = task.get("interval_seconds", 3600)
-            task["last_error"] = summary
-            # webui 原样展示 last_result，保持字符串类型
-            task["last_result"] = "[执行失败] " + summary
-            task["error_count"] = task.get("error_count", 0) + 1
-            task["last_run_time"] = now.strftime("%Y-%m-%dT%H:%M:%S")
-            # 与成功路径同一"基于计划时间"逻辑（计划时间缺失/畸形时退化为 now）
-            task["next_run_time"] = self._next_run_time(task.get("next_run_time"), interval, now)
+                now = datetime.now()
+                interval = task.get("interval_seconds", 3600)
+                task["last_error"] = summary
+                # webui 原样展示 last_result，保持字符串类型
+                task["last_result"] = "[执行失败] " + summary
+                task["error_count"] = task.get("error_count", 0) + 1
+                task["last_run_time"] = now.strftime("%Y-%m-%dT%H:%M:%S")
+                # 与成功路径同一"基于计划时间"逻辑（计划时间缺失/畸形时退化为 now）
+                task["next_run_time"] = self._next_run_time(task.get("next_run_time"), interval, now)
 
-            conv["tasks"] = [t for t in conv.get("tasks", []) if t["id"] != task_id] + [task]
-            write_conv_file(conv)
-            rebuild_task_index()
+                conv["tasks"] = [t for t in conv.get("tasks", []) if t["id"] != task_id] + [task]
+                write_conv_file(conv)
+                rebuild_task_index()
         except Exception as e:
             error(f"[scheduler] 任务 {task_id} 失败信息回写失败: {e}")
 

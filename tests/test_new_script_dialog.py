@@ -45,5 +45,23 @@ class TestGetConfig(unittest.TestCase):
         self.assertEqual(config, {})
 
 
+class TestGetName(unittest.TestCase):
+    """脚本名称行：默认名来自所选模型（自动命名），可修改（v1.9.1）。"""
+
+    def test_default_name_prefilled(self):
+        dialog = NewScriptDialog(default_name="MiniCPM5-2B")
+        self.assertEqual(dialog.get_name(), "MiniCPM5-2B")
+
+    def test_name_editable(self):
+        dialog = NewScriptDialog(default_name="MiniCPM5-2B")
+        dialog.name_edit.setText("我的模型")
+        self.assertEqual(dialog.get_name(), "我的模型")
+
+    def test_empty_name(self):
+        dialog = NewScriptDialog(default_name="MiniCPM5-2B")
+        dialog.name_edit.setText("   ")
+        self.assertEqual(dialog.get_name(), "")
+
+
 if __name__ == "__main__":
     unittest.main()

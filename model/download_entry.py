@@ -18,9 +18,11 @@ class DownloadEntry:
 
     @property
     def progress(self):
+        """进度百分比 0~100（clamp 兜底：元数据/HTTP 大小失真时不超过量程）。"""
         if self.file_size <= 0:
             return 0
-        return int(self.downloaded * 100 / self.file_size)
+        pct = int(self.downloaded * 100 / self.file_size)
+        return min(100, max(0, pct))
 
     @property
     def filename(self):
@@ -89,7 +91,11 @@ class DownloadQueue:
             try:
                 with open(DOWNLOAD_QUEUE_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    for d in data.get("queue", []):
-                        self.entries.append(DownloadEntry.from_dict(d))
+                    # 结构防御：合法 JSON 但顶层非 dict（如 [] / 字符串）时跳过，
+                    # 避免 .get 抛 AttributeError 导致 DownloadManager 构造即崩溃
+                    if isinstance(data, dict):
+                        for d in data.get("queue", []):
+                            if isinstance(d, dict):
+                                self.entries.append(DownloadEntry.from_dict(d))
             except (json.JSONDecodeError, IOError):
                 pass

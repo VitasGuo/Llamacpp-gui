@@ -136,28 +136,32 @@ class InstallWorker(QThread):
             if os.path.exists(t["dest"]):
                 resume = os.path.getsize(t["dest"])
                 if t.get("size") and resume >= t["size"]:
-                    done_bytes += resume  # 上次已下完，直接进校验
-                    continue
-            done_bytes += resume
-            self.status_signal.emit(f"下载中（{i}/{len(self.tasks)}）：{t['label']}")
-            last_time, last_bytes, emitted_speed = time.time(), resume, 0.0
+                    done_bytes += resume  # 上次已下完：不再下载，但下方仍会做 SHA256 校验
+            else:
+                # 继续下载前不需要 resume，保持 0
+                pass
+            if not (os.path.exists(t["dest"]) and t.get("size") and resume >= t["size"]):
+                done_bytes += resume
+                self.status_signal.emit(f"下载中（{i}/{len(self.tasks)}）：{t['label']}")
+                last_time, last_bytes, emitted_speed = time.time(), resume, 0.0
 
-            def on_chunk(current, _total, _base=done_bytes - resume,
-                         _t0=last_time, _b0=resume):
-                nonlocal last_time, last_bytes, emitted_speed
-                if self._cancelled:
-                    raise _Cancelled
-                now = time.time()
-                if now - last_time >= 1.0:
-                    emitted_speed = (current - last_bytes) / (now - last_time)
-                    last_time, last_bytes = now, current
-                self.progress_signal.emit(_base + current, total, emitted_speed)
+                def on_chunk(current, _total, _base=done_bytes - resume,
+                             _t0=last_time, _b0=resume):
+                    nonlocal last_time, last_bytes, emitted_speed
+                    if self._cancelled:
+                        raise _Cancelled
+                    now = time.time()
+                    if now - last_time >= 1.0:
+                        emitted_speed = (current - last_bytes) / (now - last_time)
+                        last_time, last_bytes = now, current
+                    self.progress_signal.emit(_base + current, total, emitted_speed)
 
-            download_file(t["url"], t["dest"], resume_pos=resume,
-                          chunk_callback=on_chunk)
-            done_bytes = (done_bytes - resume) + os.path.getsize(t["dest"])
-            self.progress_signal.emit(done_bytes, total, 0.0)
-            # SHA256 校验（GitHub API 提供 digest 时）
+                download_file(t["url"], t["dest"], resume_pos=resume,
+                              chunk_callback=on_chunk)
+                done_bytes = (done_bytes - resume) + os.path.getsize(t["dest"])
+                self.progress_signal.emit(done_bytes, total, 0.0)
+            # SHA256 校验（GitHub API 提供 digest 时）——本地已有完整 zip 也校验，
+            # 避免损坏残留包被直接用于解压安装
             digest = (t.get("digest") or "").split(":", 1)
             if len(digest) == 2 and digest[0] == "sha256":
                 self.status_signal.emit(f"校验 SHA256：{t['label']}")

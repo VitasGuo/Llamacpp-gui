@@ -4,12 +4,22 @@
 
 - **目标**：在本地 Windows 环境运行 LlamaCPP GUI（PyQt6 桌面客户端），用于管理本地 llama.cpp 推理服务器。
 
-- **当前版本**：v1.7.1（2026-09-04，后台静默下载修复）
+- **当前版本**：v1.11.0（2026-09-13，全量代码审查修复）
 
 ## 版本历史
 
 | 版本     | 日期         | 说明                                                                                                                                                       |
 | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| v1.11.0 | 2026-09-13 | 全量代码审查（三路并行）一次性修复 16 项：运行前自动保存/端口改写保存漏传 pinned 静默取消置顶；_toggle_pin 用磁盘内容避免回退未保存修改；closeEvent StatusPoller 缺 wait；plan_auto_download 完整 release 无待下载时不再降级下载旧版；list_installed 按 build 号排序（字符串跨位数错乱）；start_script 单引号路径被全局 replace 破坏；chat call_llm 空 choices IndexError；chat 并发读写对话加 CONV_LOCK（RLock，写串行化 + scheduler 两段锁，traps #20）；_on_release_selected 提前 return 未恢复 blockSignals；模型搜索无过期保护（旧 worker 迟到覆盖）；本地已有完整 zip 跳过 SHA256 校验；DownloadQueue._load 结构校验；download_service worker 竞态（旧 finished 弹掉新 worker 致 GC 崩溃）；测试新增 3 例（累计 101） |
+| v1.10.3 | 2026-09-13 | 版本切换完成弹窗改为双按钮："立即重启"（重启 GUI 加载新版本，走 restart_requested 信号由主窗口执行）/ "稍后重启"（默认，继续当前会话）；替代原来只能点 OK 的信息框 |
+| v1.10.2 | 2026-09-13 | 脚本列表体验优化：置顶从右键改为**每行内置 📌 按钮**（橙色=已置顶/灰色=未置顶，点击切换，右键保留为补充）；列宽合理化——脚本名自动拉伸占满剩余空间、状态按内容、置顶列固定 34px |
+| v1.10.1 | 2026-09-13 | 修复自动下载失效（traps #18）：GitHub release 资产逐步上传，最新版可能只有 cudart → `_release_from_api` 丢弃无主资产快照、`fetch_releases` 缓存命中校验完整性强制重抓、`plan_auto_download` 支持列表自动落到第一个可下载版本（实测 b10934 计划 [('b10934','cuda-13.3')]）；修复下载进度条百分比错乱（traps #19）：HTTP total 覆盖失真元数据、完成后校准 file_size、progress clamp 0-100；测试新增 8 例（累计 98） |
+| v1.10.0 | 2026-09-13 | 托盘菜单新增"重启"（sys.executable+argv 重启，main() 单实例锁短暂重试兜底）；脚本列表支持**置顶**：新增"置顶"列（📌）+ 右键菜单置顶/取消置顶，新建/新保存脚本默认置顶，排序置顶在前，pinned 字段持久化到 scripts.json；脚本面板垂直空间加大（stretch 2）；测试新增 5 例（累计 90） |
+| v1.9.2 | 2026-09-13 | 主控制页嵌入压缩版系统监控（CompactMonitor）：CPU/RAM/GPU + t/s + 运行时长，与日志输出并排（stretch 3:1），加载模型时边看日志边看负载免切标签；与 MonitorTab 同数据源，5 处状态/信号双发（启动/停止/聚焦/tps）；新增 _GpuRow 紧凑卡（温度并入显存文本）；测试新增 7 例（累计 85） |
+| v1.9.1 | 2026-09-13 | 新建脚本流程联动优化：脚本名称并入参数对话框并**自动命名**（默认取所选模型文件名去扩展名，可改，去掉手输弹窗）；模型下拉改显示文件名（完整路径存 userData）；保存新脚本默认名同样预填；测试适配 v1.9.0 路径规范 + 新增自动命名 3 用例（累计 78） |
+| v1.9.0 | 2026-09-13 | 路径分隔符统一规范：新增 `utils/path_utils.py`（normalize_path，统一正斜线 `/`）；config 路径 setter、script_builder、find_mmproj、replace_bat_dir 写入点收口；一次性迁移存量 17 个脚本 + scripts.json + app_config.json（traps #16）；顺带修复 MiniCPM5 脚本文件错位——名字含空格时 bat 文件名是 sanitize 后的下划线版，此前修了空格版孤儿、真文件未同步（traps #17） |
+| v1.8.1 | 2026-09-13 | 新增 MiniCPM5-2B-F16 启动脚本（端口 8080、ctx 200000）；修复 b10883 移除 `--mmap` 导致的脚本秒退（traps #15）：批量清理 7 个脚本的 `--mmap`，同步 .bat 与 scripts.json；修正 MiniCPM5 脚本的相对 cd 路径与错误的 model_path |
+| v1.8.0 | 2026-09-06 | 全部脚本统一端口 8080（单模型运行，不冲突）；ctx-size 最低 128000（大上下文可用）；脚本名移除端口后缀，bat 文件同步重命名 |
 | v1.7.1 | 2026-09-04 | 修复后台静默下载链路完全不触发（traps #14）：`_on_local_info` 补 `_local_info_done` 置位；`_refresh_installed` 回填 `_installed_dirs`（防已装版本重复规划）；`_start_next_auto` 提前置 `_install_silent`；CUDA 通道按大版本系列匹配最新资产（本地 cuda-13 → 装资产 cuda-13.3）；新增 `llamacpp_auto_download` 配置（默认开），启动即后台下载当前通道+推荐变体，完成不弹窗、进"已安装版本"一键切换 |
 | v1.7.0 | 2026-09-04 | 新增"版本管理"标签页：本地 build 号检测（`llama-server --version` 双格式解析）+ NVML 驱动检测与变体推荐（cuda-13.x 需驱动≥580、cuda-12.x 需≥528，按前缀系列逐级降级）；GitHub releases 列表（1h 缓存）对比标记"可更新"；断点续传下载安装（直连/自定义镜像前缀/手动导入 zip，SHA256 校验，zip-slip 防穿越）；CUDA 变体可选配套 cudart 运行库（约 380MB，系统已有 CUDA 时自动跳过）；版本化目录安装 + 一键切换（自动批量替换 .bat 中 `cd /d` 路径，运行中服务不受影响）；新增测试 35 例（累计 55） |
 | v1.6.0 | 2026-09-03 | 全量代码审查一次性修复 18 项：新建脚本 QComboBox 崩溃（traps #9）；GUI 线程 tasklist 回归（#11）；/metrics host 感知（#10）；下载续传换目录损坏（#12）；退出时 LogWorker 崩溃风险；聊天页 XSS 消毒 + 桥服务同源校验 + 静态文件防穿越加固；模型搜索移后台线程；运行前自动保存；多服务器 URL 串扰；端口占用自动顺延；定时任务采样参数与退避；配置类型防御；taskkill 结果校验；单实例锁；补冒烟测试 tests/（20 用例） |
@@ -26,6 +36,59 @@
 | v1.0.0 | 2026-09-02 | 首次克隆并配置运行环境，GUI 启动验证通过                                                                                                                                   |
 
 ## 当前任务
+
+- [x] v1.11.0 全量代码审查修复（2026-09-13）：三路并行审查（service+chat / ui / model+utils+config），修复 16 处明显 bug 并补 3 例测试（101 例全绿）；已知低优先级残留：`_stop_script`/`_cleanup_all_processes` 在 GUI 线程同步 taskkill（用户主动一次性操作，卡顿 <1s 可接受）；chat handler 读在锁外的极小覆盖窗口（traps #20）
+
+- [x] v1.10.2 置顶按钮 + 列宽优化（2026-09-13）：
+  - 脚本列表每行内置 📌 按钮（QToolButton，橙色=已置顶/灰色=未置顶，点击切换置顶），替代"文本列 + 右键"的隐蔽入口；右键菜单保留为补充
+  - 列宽：脚本名 Stretch 自动拉伸占满、状态 ResizeToContents、置顶列 Fixed 34px
+  - 验证：ui.app 导入正常、98 例全绿
+
+- [x] v1.10.1 自动下载 / 进度条修复（2026-09-13）：
+  - traps #18：GitHub release 资产逐步上传 → 最新版可能"只有 cudart"无主包
+    - `llamacpp_update_service._release_from_api`：无主包资产 release 丢弃
+    - `fetch_releases`：缓存命中时校验最新 release 完整性，不完整强制重抓（自愈）
+    - `plan_auto_download`：支持传整个 releases 列表，跳过不完整快照取第一个可下载版本（单 dict 兼容）；`update_tab._maybe_auto_download` 改传列表
+    - 清理存量不完整缓存；实测 GitHub 最新 b10934（完整），计划 `[('b10934','cuda-13.3')]`
+  - traps #19：ModelScope 元数据 file_size 失真（MiniCPM5 744MB vs 实际 5GB）
+    - `download_service._on_progress`：total>0 时用 HTTP 完整大小覆盖 file_size
+    - `_on_finished`：完成后以实际大小校准 file_size（收敛 100%）
+    - `download_entry.progress`：clamp 0-100
+  - 测试：plan_auto_download 列表用例 5 + progress clamp 4；98 例全绿
+
+- [x] v1.10.0 托盘重启 + 脚本置顶（2026-09-13）：
+  - 托盘菜单新增"重启"：`_restart_app` 用 `sys.executable + sys.argv` 重启（打包后为 exe），先 Popen 再 close；`main()` 单实例锁 tryLock 失败时 10 次×150ms 短暂重试，等旧实例释放锁
+  - 脚本置顶：`ScriptEntry` 新增 `pinned` 字段（to_dict/from_dict 持久化）；`ScriptService._upsert_config_entry` 保存 pinned；`ui/app.py` 脚本列表改三列（脚本/状态/置顶📌）、右键菜单置顶/取消置顶、新建/新保存默认置顶、`_refresh_script_list` 稳定排序置顶在前
+  - 脚本面板垂直空间加大：`control_layout` 中脚本面板 stretch=2
+  - 测试：新增 `tests/test_script_pin.py` 5 例（默认不置顶、roundtrip、缺字段回退、save/load 保留、存量 json 兼容）；90 例全绿
+
+- [x] v1.9.2 主控制页嵌入压缩监控（2026-09-13）：
+  - `ui/monitor_tab.py`：新增 `_GpuRow`（两行紧凑 GPU 卡）+ `CompactMonitor`（CPU/RAM/GPU + t/s + 运行时长 + 状态），复用 `_bar_style`/`_fmt_bytes`，与 MonitorTab 同连 `metrics_updated`
+  - `ui/app.py`：创建 `monitor_compact`；主控制页日志与压缩监控**并排**（stretch 3:1）；启动/停止/聚焦/tps 5 处调用与信号双发（`on_server_started`/`on_server_stopped`/`set_focus_script`/`tps_signal`）
+  - 完整功能仍在"性能监控"标签（采样频率/历史/图表），压缩版仅展示
+  - 测试：新增 `tests/test_compact_monitor.py` 7 例（CPU/RAM/tps 推送/日志回退/聚焦过滤/GPU 增删与占位符恢复/启停状态）；85 例全绿
+
+- [x] v1.9.1 新建脚本自动命名联动（2026-09-13）：
+  - `ui/dialogs/new_script_dialog.py`：新增"脚本名称"输入行（预填 default_name）+ `get_name()`
+  - `ui/app.py`：`_new_script` 去掉 QInputDialog 手输弹窗，默认名取所选模型文件名（去扩展名）传入对话框，可在参数对话框内改；空名校验
+  - `ui/app.py`：模型下拉改显示文件名（完整路径存 userData），`findData` 精确匹配当前模型；`_save_script` 空名分支预填模型名
+  - `service/llamacpp_update_service.py`：`switch_version` 写 settings.llamacpp_path 前显式 normalize（不依赖 setter）
+  - 测试：适配 v1.9.0 路径规范（find_mmproj / build_bat_content / replace_bat_dir / switch_version 断言改正斜线），新增自动命名 3 用例；78 例全绿
+
+- [x] v1.9.0 路径分隔符统一规范（2026-09-13）：
+  - 新增 `utils/path_utils.py`：`normalize_path()`（`\` → `/`，幂等），确立正斜线 `/` 为唯一规范形式（跨平台 / JSON 免转义 / Qt 原生 / cmd 与 llama-server 兼容）
+  - `config/config.py`：6 个路径 setter（llamacpp_path / model_path / model_dir / visual_model_path / download_path / llamacpp_install_root）统一过 normalize_path
+  - `service/script_builder.py`：`build_bat_content` 对 exe_dir / model_path / visual_model_path 入口统一；`find_mmproj` 返回前规范化
+  - `service/llamacpp_update_service.py`：`replace_bat_dir` 的 new_dir 统一正斜线（原 normpath 产反斜线）
+  - 一次性迁移存量：17 个 .bat + scripts.json + app_config.json 全部路径分隔符改为 `/`
+  - 顺带修复 traps #17：MiniCPM5 脚本名含空格 → 登记 bat 实际是 sanitize 后的 `Mini_CPM5-2B.bat`（此前只改了空格版孤儿），已同步内容并删除孤儿
+  - 验证：登记脚本 17 个全部通过（sanitize 文件名 bat/json 一致、无 --mmap、无残留反斜线、无孤儿文件）；app_config.json 路径统一；全模块导入冒烟通过
+
+- [x] v1.8.1 MiniCPM5 脚本 + 移除 `--mmap`（2026-09-13）：
+  - 新增 `Mini CPM5-2B` 启动脚本：模型 `C:/modelscope/MiniCPM5-2B-F16.gguf`（纯文本，无 mmproj），端口 8080、ctx 200000、gpu-layers 99
+  - traps #15：b10883 已移除 `--mmap`（改 `--load-mode`），批量清理 7 个脚本（Qwen3.8-27B / gemma-heretic / GLM-4.7-Flash / gemma-4-26B / IQ3 / IQ2 / MiniCPM5）的 `--mmap`，.bat 与 scripts.json 同步
+  - 修正 MiniCPM5 条目：相对 cd 路径改绝对路径；model_path 由 Qwen3.8-27B-UD-IQ2_S 改为 MiniCPM5-2B-F16
+  - 验证：17 个脚本全部通过（无 --mmap、cd 绝对路径、bat/json 一致、model_path 有效、port 8080、ctx≥128000）
 
 - [x] v1.7.1 后台静默下载（2026-09-04）：
   - `service/llamacpp_update_service.py`：`plan_auto_download()` 按当前通道（CUDA 大版本系列匹配）+ 推荐变体规划，去重、跳过已装、通道无更新时只装推荐
@@ -73,6 +136,7 @@
 
 - [x] 扩展为**全部 14 个完整 gguf 主模型**各一个脚本：上下文按文件尺寸分级（<2.5G→65536，<6G→32768，否则→16384），>12G 模型 `gpu-layers 48` + `--mmap` CPU offload，含 mmproj 的目录自动绑定视觉模型
   - 端口 8080\~8093 依次分配；视觉模型：gemma-12b-heretic、Ministral-14B/3B、gemma-4-12B/26B-A4B/E2B/E4B
+  - **v1.8.0 统一为端口 8080**（单模型运行），ctx-size 最低 128000
 
 - [x] 修复所有启动脚本无法运行的根因：`process_service.start_script()` 由列表传参改为整串命令 + `cmd /d /s /c` + `call` + 双引号包路径；实测 llama-server 正常启动（traps #4，v1.4.0）
 
