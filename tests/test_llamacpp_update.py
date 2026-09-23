@@ -1,6 +1,7 @@
 """service.llamacpp_update_service 纯函数 + 安装流程测试（不碰网络/真实子进程）。"""
 import json
 import os
+import shutil
 import tempfile
 import unittest
 import unittest.mock
@@ -407,6 +408,7 @@ class TestListInstalledSort(unittest.TestCase):
         import json
         import tempfile
         tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         for tag in ("b9999", "b10615"):
             d = os.path.join(tmp, f"{tag}-cpu")
             os.makedirs(d)
@@ -441,6 +443,7 @@ class TestCleanup(unittest.TestCase):
     def setUp(self):
         import tempfile
         self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def test_each_variant_keeps_2_except_current(self):
         # cuda-13.4 四个（含当前）、cuda-13.3 两个

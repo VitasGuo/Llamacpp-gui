@@ -286,6 +286,27 @@ class ProcessService:
             runtime.pop(name)
             self._write_runtime(runtime)
 
+    def remap_runtime(self, mapping):
+        """脚本名变更后同步 pids.json 的键（旧名条目 → 新名，pid/端口等信息保留）。
+
+        脚本绑定清理会淘汰错位的旧名，而运行中进程仍记录在旧名下；不迁移
+        的话"运行中"清单会继续显示旧名。新名已有记录时保留既有记录。
+        返回实际迁移条数。
+        """
+        if not mapping:
+            return 0
+        runtime = self.load_runtime()
+        moved = 0
+        for old, new in mapping.items():
+            if not old or not new or old == new or old not in runtime:
+                continue
+            entry = runtime.pop(old)
+            runtime.setdefault(new, entry)
+            moved += 1
+        if moved:
+            self._write_runtime(runtime)
+        return moved
+
     def clear_all_runtime(self):
         """清空所有脚本的运行时记录（"清理全部"入口后调用）。"""
         self._write_runtime({})

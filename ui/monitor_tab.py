@@ -2,14 +2,14 @@
 
 v1.15.0 起，原独立"性能监控"标签页（MonitorTab/TpsChart/HistoryChart）
 已随监控能力并入主控制页而移除；本模块仅保留 CompactMonitor。
+v1.18.0 起，CompactMonitor 不再承载"运行状态/运行时长"——这两项移入
+主控制页"运行控制"的"正在运行"清单（每模型一行），本组件只展示纯负载。
 """
-import time
-
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QProgressBar,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot
+from PyQt6.QtCore import Qt, pyqtSlot
 
 
 def _bar_style(pct):
@@ -31,6 +31,22 @@ def _fmt_bytes(n):
     if n >= 10 ** 6:
         return f"{n / 10 ** 6:.1f}MB"
     return f"{n / 10 ** 3:.1f}KB"
+
+
+def format_uptime(seconds):
+    """运行时长格式化：秒 → "HH:MM:SS"（非法/负值回退 "--"）。
+
+    纯函数，供主控制页"运行控制"的运行中模型清单逐行刷新时长。
+    """
+    try:
+        e = int(seconds)
+    except (TypeError, ValueError):
+        return "--"
+    if e < 0:
+        return "--"
+    h, r = divmod(e, 3600)
+    m, s = divmod(r, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 class _GpuRow(QWidget):
@@ -91,19 +107,16 @@ class CompactMonitor(QWidget):
     """主控制页嵌入的压缩版系统监控（CPU/RAM/GPU + t/s），与日志并排显示。
 
     加载模型/调参时无需切换标签即可同时查看日志与系统负载。
+    运行状态与运行时长见主控制页"运行控制"的"正在运行"清单（v1.18.0）。
     """
 
     def __init__(self, monitor_service, parent=None):
         super().__init__(parent)
         self._service = monitor_service
         self._focus_name = ""
-        self._running = {}   # 脚本名 -> 启动时间 ts
         self._gpu_rows = []  # [_GpuRow]
         self._setup_ui()
         self._service.metrics_updated.connect(self._on_metrics)
-        self._uptime_timer = QTimer(self)
-        self._uptime_timer.timeout.connect(self._update_uptime)
-        self._uptime_timer.setInterval(1000)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -149,16 +162,11 @@ class CompactMonitor(QWidget):
         self._tps_label = QLabel("推理速度: -- t/s")
         self._tps_label.setStyleSheet("font-weight: bold;")
         v.addWidget(self._tps_label)
-        self._uptime_label = QLabel("运行时长: --")
-        v.addWidget(self._uptime_label)
-        self._status_label = QLabel("状态: \u25cf 未运行")
-        self._status_label.setStyleSheet("color: #888;")
-        v.addWidget(self._status_label)
 
         layout.addWidget(group)
 
     def set_focus_script(self, name):
-        """聚焦脚本（模型选中项）：t/s 与状态优先显示该服务。"""
+        """聚焦脚本（模型选中项）：t/s 优先显示该服务。"""
         self._focus_name = name or ""
 
     @pyqtSlot(str, float)
@@ -172,56 +180,10 @@ class CompactMonitor(QWidget):
         self._update_tps_label(name, tps)
         self._service.record_tps(name, tps)
 
-    def on_server_started(self, name):
-        name = name or "default"
-        self._running[name] = time.time()
-        self._uptime_timer.start()
-        self._refresh_status()
-
-    def on_server_stopped(self, name):
-        name = name or "default"
-        self._running.pop(name, None)
-        if not self._running:
-            self._uptime_timer.stop()
-        self._refresh_status()
-
-    def on_all_servers_stopped(self):
-        """全部 llama 进程被清理后整体重置（恢复的服务没有 LogWorker
-        代理 on_server_stopped，由主窗口清理入口统一调用）。"""
-        self._running.clear()
-        self._uptime_timer.stop()
-        self._refresh_status()
-
     def _update_tps_label(self, name, tps):
         if self._focus_name and name != self._focus_name:
             return
         self._tps_label.setText(f"推理速度: {tps:.1f} t/s")
-
-    def _refresh_status(self):
-        if self._focus_name and self._focus_name in self._running:
-            self._status_label.setText("状态: \u25cf 运行中")
-            self._status_label.setStyleSheet("color: orange; font-weight: bold;")
-        elif self._running:
-            n = len(self._running)
-            self._status_label.setText(f"状态: \u25cf {n} 个服务运行中")
-            self._status_label.setStyleSheet("color: orange; font-weight: bold;")
-        else:
-            self._status_label.setText("状态: \u25cf 未运行")
-            self._status_label.setStyleSheet("color: #888;")
-            self._uptime_label.setText("运行时长: --")
-
-    def _update_uptime(self):
-        if not self._running:
-            self._uptime_label.setText("运行时长: --")
-            return
-        if self._focus_name and self._focus_name in self._running:
-            start = self._running[self._focus_name]
-        else:
-            start = max(self._running.values())
-        e = time.time() - start
-        h, r = divmod(int(e), 3600)
-        m, s = divmod(r, 60)
-        self._uptime_label.setText(f"运行时长: {h:02d}:{m:02d}:{s:02d}")
 
     @pyqtSlot(dict)
     def _on_metrics(self, m):

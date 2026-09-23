@@ -48,6 +48,41 @@ def _format_date(iso_str):
         return iso_str[:10]
 
 
+def _make_progress_cell(value):
+    """下载队列"进度"单元格：进度条 + 右侧百分比 QLabel（阿拉伯数字）。
+
+    QProgressBar 的条内建文本（默认格式 %p%）在本环境渲染为乱码，看着像
+    中文字符、数字完全认不出（traps #2，monitor_tab 同样处理）——故关闭
+    setTextVisible，数值一律由 QLabel 以普通 ASCII 数字显示。
+    """
+    container = QWidget()
+    layout = QHBoxLayout(container)
+    layout.setContentsMargins(2, 0, 2, 0)
+    layout.setSpacing(6)
+    bar = QProgressBar()
+    bar.setRange(0, 100)
+    bar.setValue(value)
+    bar.setTextVisible(False)
+    label = QLabel(f"{value}%")
+    label.setFixedWidth(38)
+    label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    layout.addWidget(bar, 1)
+    layout.addWidget(label)
+    return container
+
+
+def _set_progress_cell(cell, value):
+    """更新进度单元格（条 + 文本），与 _make_progress_cell 成对使用。"""
+    if cell is None:
+        return
+    bar = cell.findChild(QProgressBar)
+    if bar is not None:
+        bar.setValue(value)
+    label = cell.findChild(QLabel)
+    if label is not None:
+        label.setText(f"{value}%")
+
+
 class ModelTab(QWidget):
     def __init__(self):
         super().__init__()
@@ -532,11 +567,7 @@ class ModelTab(QWidget):
         name_item.setData(Qt.ItemDataRole.UserRole, (entry.source, entry.file_path))
         self.queue_table.setItem(row, 1, name_item)
 
-        prog = QProgressBar()
-        prog.setMinimum(0)
-        prog.setMaximum(100)
-        prog.setValue(entry.progress)
-        self.queue_table.setCellWidget(row, 2, prog)
+        self.queue_table.setCellWidget(row, 2, _make_progress_cell(entry.progress))
 
         self.queue_table.setItem(row, 3, QTableWidgetItem(""))
         self.queue_table.setItem(row, 4, QTableWidgetItem(entry.status))
@@ -544,9 +575,7 @@ class ModelTab(QWidget):
         self._set_queue_actions(row, entry)
 
     def _update_queue_row(self, row, entry):
-        prog = self.queue_table.cellWidget(row, 2)
-        if isinstance(prog, QProgressBar):
-            prog.setValue(entry.progress)
+        _set_progress_cell(self.queue_table.cellWidget(row, 2), entry.progress)
         self.queue_table.item(row, 4).setText(entry.status)
 
     def _set_queue_actions(self, row, entry):

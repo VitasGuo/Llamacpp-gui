@@ -37,7 +37,17 @@ QtGui 导入中补上 `QIcon`（见 [ui/app.py 的 \_create\_app\_icon](ui/app.p
 
 ***
 
-**当前状态**：#2 已修复（v1.2.1）。
+**当前状态**：#2 已修复（v1.2.1）。**2026-09-24 复发（v1.19.4 修复）**：
+`ui/model_tab.py` 下载队列"进度"列的 QProgressBar 一直没关内建文本——条上数字
+渲染成乱码，用户描述为"百分比的数字好像是用中文写的，看不懂具体数字"。
+按同一方案修复：新增模块级 `_make_progress_cell(value)` / `_set_progress_cell(cell, value)`
+（条 `setTextVisible(False)` + 右侧 QLabel 显示 `NN%`），`_add_queue_row` /
+`_update_queue_row` 改走这对函数；并加 offscreen 回归测试
+`tests/test_download_progress_cell.py`（断言条内文本关闭、QLabel 文本只含 ASCII 数字）。
+
+**教训补充**：**每新增一个 QProgressBar，都要同时决定"百分比文本由谁显示"**——
+漏一个就复发一次（本次是 `model_tab` 漏了，`monitor_tab` / `update_tab` 当初都已按
+约定处理）。判据：条上若有自带文本需求，一律 `setTextVisible(False)` + 旁侧 QLabel。
 
 ***
 
@@ -827,6 +837,80 @@ HF 镜像搜索，然后到"更新追踪"列表点某模型的"查看文件"进�
 参数（来源、返回目标）不同时，UI 状态必须按"当前视图"建模（进视图时记录
 上下文变量），不能按"全局选中项"建模——后者会让第二个入口悄悄用错参数。
 合并功能时，逐一检查被合并视图的所有**入口**和**消费方**（不只是入口本身）。
+
+***
+
+## #38 scripts.json 同模型多绑定 + model_path 与 .bat 的 -m 脱节——跑 MiniCPM5 却显示 gemma-4
+
+**现象**（v1.19.0 修复）：加载 `MiniCPM5-2B-F16.gguf` 运行，"运行控制"
+与运行中模型清单显示的却是 `gemma-4-E4B`。核查磁盘发现：
+- `data/scripts.json` 中同一 MiniCPM5 路径存在 **3 条**条目
+  （`gemma-4-E4B`、`Mini CPM5-2B`、`MiniCPM5-2B-F16_1edbd53f`）；
+- `data/scripts/gemma-4-E4B.bat` 第 4 行实际是
+  `-m "C:/modelscope/MiniCPM5-2B-F16.gguf"`（脚本名与内容不符）；
+- 另有 2 条条目 json 的 `model_path` 与 .bat 的 `-m` 完全对不上
+  （如 `Qwen3.8-27B` 的 model_path 写的是 gemma 路径）。
+
+**根因**：
+1. `service/script_service.py` 的 `get_script_for_model` 原实现是
+   "按归一化路径取**第一条**命中"，而 json 顺序里错位条目
+   （第 12 条 `gemma-4-E4B`）先于规范名条目（第 18 条）
+   → 返回错脚本名 → 运行、写 `pids.json`、运行中清单全部显示 gemma-4-E4B。
+2. 写入端 `_upsert_config_entry` 只按 `name` 判重、不比较 `model_path`，
+   同一模型下改名保存会**新增**条目而非合并（脏数据的直接来源：早期
+   "脚本名可手改 + 手动绑模型"时代遗留）。
+3. 早期版本在表单里改模型路径时，json 的 `model_path` 与 .bat 的 `-m`
+   被分别改写，形成**两处事实源**，随后必然漂移。
+
+**解决方案**（三端收口，`service/script_service.py`）：
+- **读取端**：新增纯函数 `name_model_score(name, model_path)`（脚本名各 token
+  在模型文件名中的命中比例）与 `binding_rank`（契合度 > 置顶 > 最新保存）；
+  `get_script_for_model` 对全部同路径候选按 `binding_rank` **择优**返回
+  （兜底仍走 `derive_name` 匹配）。
+- **写入端**：`_upsert_config_entry` 判重条件加"归一化 `model_path` 相同"，
+  改名时用新增的 `_remove_bat(old_name)` 清掉旧 .bat，防孤儿脚本。
+- **启动迁移**：新增 `migrate_bindings()` 一次性清理——以 .bat 的 `-m` 为
+  **事实源**校正 json 的 `model_path`；同 `model_path` 分组只留 `binding_rank`
+  最高者；淘汰条目的 .bat 移动（不删除）到 `data/scripts_replaced`
+  （`config/__init__.py` 的 `REPLACED_SCRIPTS_DIR`，可人工找回）；剔除 .bat
+  已不存在的幽灵条目；全流程幂等。`ui/app.py` 在 `_init_tray` 之后调用并写日志
+  留痕；`process_service.remap_runtime` 同步 `pids.json` 的键。
+- 实测本机 18 → 15 条（校正 2、清理 3），二次运行全 0。
+
+**教训**：同一个事实（"这个模型用哪条脚本"）必须只有一个权威来源，且
+**写入端与读取端要用同一套等价判定**——读取端按 `model_path` 找、写入端按
+`name` 去重，就是典型的"读一套写一套"错配。此外 .bat 是内容唯一来源，
+json 里的派生字段（`model_path`）必须能从 .bat 重建，否则一定会漂移。
+
+***
+
+## #39 单元测试的 mkdtemp 不清理：反复跑测试把 C 盘写满（489GB）
+
+**现象**（v1.19.2 顺手修复）：`python -m unittest discover -s tests` 突然失败——
+`OSError: [Errno 28] No space left on device`（`tests/test_script_builder.py`
+的 `_make_model` 写 8G 假模型时）。查盘：953GB 的 C 盘只剩 **8.1GB** 可用。
+
+**根因**：
+1. 测试大量使用 `tempfile.mkdtemp()` 造临时目录，**但从不删除**
+   （unittest 不会自动回收，`mkdtemp` 是"只借不还"）。
+2. `tests/test_script_builder.py` 的 `test_ctx_tier_by_size` 每次运行都**真写**
+   1.5G + 8G 两个假模型（`_make_model` 用 `seek(size-1)` + 写 1 字节填零，
+   NTFS 上不是稀疏文件，实占磁盘）——跑一次泄漏约 9.5GB。
+3. 本机累计 **442 个 `tmp*` 目录、约 489GB**，把盘吃干；其余测试的小目录
+   （几百字节的 .bat/json）是同类问题的小头。
+
+**解决方案**：
+- 每个 `tempfile.mkdtemp()` 之后立刻登记回收：
+  `self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)`
+  ——`setUp` 与测试方法内都能用，不需要 tearDown、不需要新建基类；
+  已覆盖 `tests/test_script_builder.py`(4 处)、`test_script_model_binding.py`(4)、
+  `test_script_pin.py`、`test_download_entry.py`、`test_llamacpp_update.py`(2)。
+- 一次性清历史垃圾：删 `%TEMP%` 下"`tmp*` 且含 `.gguf`"的目录 442 个
+  → 释放 **478.8GB**，盘从 8.1GB 恢复到 638GB 可用。
+
+**教训**：会写大文件的测试必须自己回收临时目录，否则本地反复跑测试会线性
+膨胀到写满盘（且失败表现为"测试代码报错"，极易误判为业务 bug）。
+判据：跑完 `unittest` 后 `%TEMP%` 下"`tmp*` 含 .gguf"的目录数应为 0（本次已核验）。
 
 ***
 

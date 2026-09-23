@@ -1,6 +1,7 @@
 """DownloadEntry.progress 百分比 clamp 测试（进度条失真兜底）。"""
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -32,6 +33,7 @@ class TestQueueLoadRobust(unittest.TestCase):
 
     def _load_with(self, data):
         tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         path = os.path.join(tmp, "queue.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f)

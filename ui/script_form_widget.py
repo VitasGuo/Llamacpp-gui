@@ -324,11 +324,6 @@ class ScriptFormWidget(QWidget):
             if val not in (None, "", "off"):
                 self.checkboxes[key].setChecked(True)
 
-    def clear_form(self):
-        """清空为"未配置"（新模型无绑定脚本时）。"""
-        for cb in self.checkboxes.values():
-            cb.setChecked(False)
-
     def get_config(self):
         """把表单读成 config dict（面向 build_bat_content）。"""
         result = {}

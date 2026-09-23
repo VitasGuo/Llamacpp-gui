@@ -1,5 +1,6 @@
 """service.script_builder 纯函数测试。"""
 import os
+import shutil
 import struct
 import tempfile
 import unittest
@@ -67,6 +68,8 @@ class TestFindMmproj(unittest.TestCase):
     def setUp(self):
         import tempfile
         self._tmp = tempfile.mkdtemp()
+        # 用完即删：本文件会造 1.5G/8G 的假模型，不清理会持续吃盘（traps #39）
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
 
     def test_none_when_absent(self):
         self.assertEqual(find_mmproj(os.path.join(self._tmp, "nope.gguf")), "")
@@ -86,6 +89,8 @@ class TestAutoGenerateAndParse(unittest.TestCase):
     def setUp(self):
         import tempfile
         self._tmp = tempfile.mkdtemp()
+        # 用完即删：本文件会造 1.5G/8G 的假模型，不清理会持续吃盘（traps #39）
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
 
     def _make_model(self, name="MiniCPM5-2B-F16.gguf", size=5 * 1024 * 1024):
         p = os.path.join(self._tmp, name)
@@ -143,6 +148,8 @@ class TestGgufContextLength(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
+        # 用完即删：本文件会造 1.5G/8G 的假模型，不清理会持续吃盘（traps #39）
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
 
     def _gguf(self, name, ctx):
         p = os.path.join(self._tmp, name)
@@ -168,6 +175,8 @@ class TestCtxOptions(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
+        # 用完即删：本文件会造 1.5G/8G 的假模型，不清理会持续吃盘（traps #39）
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
 
     def _gguf(self, name, ctx):
         p = os.path.join(self._tmp, name)

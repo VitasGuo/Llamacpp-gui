@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QTabWidget, QFileDialog, QSplitter,
     QSystemTrayIcon, QMenu, QComboBox,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QTextCursor, QAction, QColor, QPixmap, QPainter, QFont, QIcon
 
 from config.config import Settings
@@ -35,7 +35,7 @@ from service.model_scanner import scan_gguf_files
 from chat import start_bridge
 from model.script import ScriptEntry
 from ui.model_tab import ModelTab
-from ui.monitor_tab import CompactMonitor
+from ui.monitor_tab import CompactMonitor, format_uptime
 from ui.script_form_widget import ScriptFormWidget
 from ui.update_tab import UpdateTab
 from ui.dialogs.settings_dialog import SettingsDialog
@@ -50,6 +50,9 @@ LOG_PANEL_TRIM_EVERY = 50
 
 # Tailscale 自动探测的 GUI 侧缓存窗口（与 service.tailscale 的探测缓存同量级）
 TS_PROBE_TTL = 60.0
+
+# "运行控制"运行中清单里旧版 data/last_pid.pid 恢复实例的展示名
+LEGACY_NAME = "旧实例"
 
 
 def _resolve_llm_host(host, tailscale_override, ts_cache):
@@ -95,6 +98,21 @@ def _pick_llm_url(current_name, server_urls, runtime, tailscale_override, ts_cac
     return ""
 
 
+def stop_all_targets(run_rows, runtime, legacy_running):
+    """「全部结束」的停止目标（纯函数，便于回归测试）。
+
+    清单（run_rows 的键）∪ pids.json 运行时记录（runtime 的键），去重保序：
+    跨会话恢复的服务可能还没进清单，只按清单结束会漏掉它、残留占用端口。
+    旧实例（无脚本归属、不在 runtime 键里）由第二项返回值单独标识。
+    """
+    names = [n for n in run_rows if n and n != LEGACY_NAME]
+    for name in runtime or {}:
+        if name and name != LEGACY_NAME and name not in names:
+            names.append(name)
+    legacy = bool(legacy_running) or (LEGACY_NAME in run_rows)
+    return names, legacy
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -118,6 +136,13 @@ class MainWindow(QMainWindow):
         self._last_alive = set()
         # 旧版本 data/last_pid.pid 恢复的全局进程是否存活（启动时验证一次）
         self._legacy_running = False
+        # "运行控制"运行中清单：脚本名 -> 启动时间 ts；行控件缓存（脚本名 -> (时长标签, 结束按钮)）
+        self._run_times = {}
+        self._run_rows = {}
+        self._uptime_timer = QTimer(self)
+        self._uptime_timer.setInterval(1000)
+        self._uptime_timer.timeout.connect(self._tick_uptime)
+        self._uptime_timer.start()
         # Tailscale 自动探测缓存（GUI 只读，探测在后台 TailscaleProbeWorker）
         self._ts_ip = ""
         self._ts_ip_probed_at = 0.0
@@ -143,6 +168,7 @@ class MainWindow(QMainWindow):
 
         self._init_ui()
         self._init_tray()
+        self._migrate_script_bindings()
         self._load_saved_paths()
         self._restore_service_state()
 
@@ -367,7 +393,7 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(6)
 
-        # 模型文件：下拉显示文件名 + 浏览/一键生成
+        # 模型文件：从"路径配置"的模型目录自动扫描的下拉里选（不再提供浏览兜底）
         left_layout.addWidget(QLabel("模型文件 (.gguf):"))
         self.model_combo = QComboBox()
         self.model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
@@ -378,15 +404,6 @@ class MainWindow(QMainWindow):
         self.model_path_edit.setReadOnly(True)
         self.model_path_edit.setPlaceholderText("（模型的完整路径，只读）")
         left_layout.addWidget(self.model_path_edit)
-        op_row = QHBoxLayout()
-        browse_btn2 = QPushButton("浏览...")
-        browse_btn2.clicked.connect(self._select_model_file)
-        op_row.addWidget(browse_btn2)
-        self.gen_script_btn = QPushButton("一键生成")
-        self.gen_script_btn.setToolTip("按当前所选模型自动生成基础参数（已绑定脚本时重新生成）")
-        self.gen_script_btn.clicked.connect(self._generate_script)
-        op_row.addWidget(self.gen_script_btn)
-        left_layout.addLayout(op_row)
 
         left_layout.addSpacing(6)
         left_layout.addWidget(QLabel("外挂视觉模型 (.gguf):"))
@@ -398,13 +415,19 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(browse_btn3)
 
         left_layout.addSpacing(6)
-        # 动作按钮：保存 / 删除该模型脚本 / 查看生成原文
+        # 动作按钮：保存 / 重置参数（清掉已保存脚本、重新生成默认版）/ 查看生成原文
+        act_row = QHBoxLayout()
         save_btn = QPushButton("保存")
         save_btn.clicked.connect(self._save_script)
-        left_layout.addWidget(save_btn)
-        delete_btn = QPushButton("删除该模型脚本")
-        delete_btn.clicked.connect(self._delete_script)
-        left_layout.addWidget(delete_btn)
+        act_row.addWidget(save_btn)
+        reset_btn = QPushButton("重置参数")
+        reset_btn.setToolTip(
+            "清掉该模型已保存的脚本参数，按模型重新生成一版默认脚本"
+            "（对模型文件无影响）"
+        )
+        reset_btn.clicked.connect(self._reset_script)
+        act_row.addWidget(reset_btn)
+        left_layout.addLayout(act_row)
         self.view_raw_btn = QPushButton("查看生成的脚本")
         self.view_raw_btn.setCheckable(True)
         self.view_raw_btn.toggled.connect(self._toggle_raw_view)
@@ -488,7 +511,11 @@ class MainWindow(QMainWindow):
         self.run_btn = QPushButton("运行")
         self.run_btn.clicked.connect(self._run_script)
         btn_row.addWidget(self.run_btn)
-        self.stop_btn = QPushButton("结束")
+        self.stop_btn = QPushButton("全部结束")
+        self.stop_btn.setToolTip(
+            "结束清单中全部运行中的模型（逐个结束；未通过本软件启动的实例"
+            "请用下方\"清理全部llama进程\"）"
+        )
         self.stop_btn.clicked.connect(self._stop_script)
         btn_row.addWidget(self.stop_btn)
         root.addLayout(btn_row)
@@ -498,6 +525,15 @@ class MainWindow(QMainWindow):
             "color: green; font-size: 12px; font-weight: bold;"
         )
         root.addWidget(self.status_label)
+
+        # 正在运行的模型清单（支持多模型同时运行）：每行 模型名 | 运行时长 | 结束
+        # （不再加"正在运行:"标题——清单本身就是答案，占一行垂直空间）
+        self.run_list = QVBoxLayout()
+        self.run_list.setSpacing(2)
+        self.run_list_placeholder = QLabel("无模型运行")
+        self.run_list_placeholder.setStyleSheet("color: #888; font-size: 12px;")
+        self.run_list.addWidget(self.run_list_placeholder)
+        root.addLayout(self.run_list)
 
         self.chat_btn = QPushButton("聊天窗口")
         self.chat_btn.setEnabled(True)
@@ -546,6 +582,34 @@ class MainWindow(QMainWindow):
 
         return group
 
+    def _migrate_script_bindings(self):
+        """启动时清理脚本绑定脏数据：同模型多绑定、脚本名与模型错位。
+
+        必须在 _load_saved_paths 之前跑——后者会按模型查绑定脚本，脏数据
+        会让 current_script_name 取到别的模型的名字（跑 MiniCPM5 显示
+        gemma-4-E4B）。清理后同步 pids.json 的键，运行中清单立刻用上正确名。
+        """
+        report = self.script_service.migrate_bindings()
+        if report.get("corrected"):
+            self._append_log(
+                f"已按脚本内容校正 {report['corrected']} 条脚本的模型绑定路径")
+        if report.get("removed"):
+            self._append_log(
+                f"已清理 {report['removed']} 条重复/错位的脚本绑定"
+                f"（原 .bat 已备份到 {report.get('backup_dir', '')}，可人工找回）")
+        moved = self.process_service.remap_runtime(report.get("remap") or {})
+        if moved:
+            self._append_log(f"已同步 {moved} 条运行中记录的脚本名")
+        # 数据变更留痕到 data/logs/app.log（_append_log 只写界面面板，重启即丢）
+        if report.get("corrected") or report.get("removed") or report.get("dropped"):
+            detail = (f"脚本绑定清理: 校正 {report['corrected']} 条 model_path、"
+                      f"合并 {report['removed']} 条重复绑定"
+                      f"（备份 {report.get('backup_dir', '')}）、"
+                      f"剔除 {report['dropped']} 条无 .bat 的过期条目")
+            if moved:
+                detail += f"；同步 {moved} 条运行中记录的脚本名"
+            info(detail)
+
     def _load_saved_paths(self):
         if self.settings.llamacpp_path:
             self.llamacpp_path_edit.setText(self.settings.llamacpp_path)
@@ -564,8 +628,8 @@ class MainWindow(QMainWindow):
         alive = self.process_service.restore_all_pids()
         for name, pid in alive.items():
             self._append_log(f"检测到脚本 '{name}' 上次启动的服务仍在运行, PID={pid}")
-            # 同步到主控制页压缩状态面板（否则恢复后显示"未运行"，与实际不符）
-            self.monitor_compact.on_server_started(name)
+            # 同步到"运行控制"运行中清单（否则恢复后显示"无模型运行"，与实际不符）
+            self._on_model_started(name)
         if not alive:
             # 回退：旧版本 data/last_pid.pid（无脚本归属信息，行为与升级前一致）
             pid = self.process_service.restore_last_pid()
@@ -573,6 +637,7 @@ class MainWindow(QMainWindow):
                 # restore_last_pid 返回非 None 即已验证进程存活（此处一次性验证，
                 # 之后 GUI 线程只查缓存，不再同步跑 tasklist）
                 self._legacy_running = True
+                self._on_model_started(LEGACY_NAME)
                 self._append_log(f"检测到上次启动的服务仍在运行, PID={pid}")
         self._sync_control_panel()
         self._refresh_script_statuses()
@@ -589,9 +654,9 @@ class MainWindow(QMainWindow):
         """GUI 线程：缓存后台探测结果并刷新控制面板运行状态（纯内存，不卡顿）。
 
         同时检测"恢复的服务已退出"（有运行时记录、PID 不在存活集、且无
-        LogWorker 代理其生命周期）：清除运行时记录并同步压缩监控面板——
+        LogWorker 代理其生命周期）：清除运行时记录并同步运行中清单——
         LogWorker 的 finished 路径只覆盖本次会话内启动的服务，恢复的服务
-        退出后若不在此处理，压缩面板会一直显示"运行中"。
+        退出后若不在此处理，清单会一直挂着"运行中"。
         """
         self._last_runtime = runtime
         self._last_alive = alive_set
@@ -602,7 +667,7 @@ class MainWindow(QMainWindow):
                     and pid > 0 and pid not in alive_set):
                 self.process_service.clear_runtime(name)
                 self._last_runtime.pop(name, None)
-                self.monitor_compact.on_server_stopped(name)
+                self._on_model_stopped(name)
         self._sync_control_panel()
 
     def _sync_control_panel(self):
@@ -628,7 +693,8 @@ class MainWindow(QMainWindow):
             running = self._legacy_running
         self.is_running = running
         self.run_btn.setEnabled(not running)
-        self.stop_btn.setEnabled(running)
+        # "全部结束"对准清单里所有运行中的模型：任一在跑就可点
+        self.stop_btn.setEnabled(running or bool(self._run_rows))
         if running:
             self.status_label.setText("\u25cf 运行中")
             self.status_label.setStyleSheet(
@@ -639,6 +705,92 @@ class MainWindow(QMainWindow):
             self.status_label.setStyleSheet(
                 "color: green; font-size: 12px; font-weight: bold;"
             )
+
+    # ── "运行控制"运行中清单（多模型：每行 模型名 | 运行时长 | 结束）──────
+
+    def _on_model_started(self, name):
+        """某模型服务开始运行（启动/恢复时调用）：登记启动时间并加入清单。"""
+        name = name or "default"
+        self._run_times[name] = time.time()
+        if name not in self._run_rows:
+            self._add_run_row(name)
+
+    def _on_model_stopped(self, name):
+        """某模型服务停止（进程退出/手动结束时调用）：移出清单。"""
+        name = name or "default"
+        self._run_times.pop(name, None)
+        self._remove_run_row(name)
+
+    def _on_all_models_stopped(self):
+        """全部 llama 进程被清理后整体重置（清理入口统一调用）。"""
+        self._run_times.clear()
+        for name in list(self._run_rows):
+            self._remove_run_row(name)
+        self.run_list_placeholder.setVisible(True)
+
+    def _add_run_row(self, name):
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        name_label = QLabel(name)
+        name_label.setStyleSheet("font-weight: bold;")
+        name_label.setWordWrap(True)
+        h.addWidget(name_label)
+        h.addStretch(1)
+        uptime_label = QLabel("运行时长: --")
+        uptime_label.setStyleSheet("color: #555; font-size: 12px;")
+        h.addWidget(uptime_label)
+        stop_btn = QPushButton("结束")
+        stop_btn.setFixedWidth(48)
+        stop_btn.setToolTip(f"结束模型 '{name}' 的进程")
+        stop_btn.clicked.connect(
+            lambda _=False, n=name: self._stop_single_model(n)
+        )
+        h.addWidget(stop_btn)
+        self.run_list.addWidget(row)
+        self._run_rows[name] = (uptime_label, stop_btn)
+        self.run_list_placeholder.setVisible(False)
+
+    def _remove_run_row(self, name):
+        pair = self._run_rows.pop(name, None)
+        if pair is None:
+            return
+        row = pair[0].parentWidget()
+        self.run_list.removeWidget(row)
+        row.deleteLater()
+        if not self._run_rows:
+            self.run_list_placeholder.setVisible(True)
+
+    def _tick_uptime(self):
+        """每秒刷新清单各行的运行时长（无行时仅空转，不阻塞）。"""
+        now = time.time()
+        for name, (uptime_label, _btn) in self._run_rows.items():
+            start = self._run_times.get(name)
+            if start is None:
+                uptime_label.setText("运行时长: --")
+            else:
+                uptime_label.setText(f"运行时长: {format_uptime(now - start)}")
+
+    def _stop_single_model(self, name):
+        """结束运行中清单里的单个模型进程（行内"结束"按钮回调）。
+
+        常规按脚本名 stop_by_pid；旧实例无脚本归属，走全局 PID 回退。
+        """
+        if name == LEGACY_NAME:
+            stopped = self.process_service.stop_by_pid()
+            self._legacy_running = False
+        else:
+            stopped = self.process_service.stop_by_pid(name)
+            self._last_runtime.pop(name, None)
+            self._server_urls.pop(name, None)
+        if stopped:
+            self._on_model_stopped(name)
+            self._append_log(f"已结束模型 '{name}' 的进程")
+        else:
+            self._append_log(f"尝试结束 '{name}'，但可能未找到相关进程")
+        self._sync_control_panel()
+        self._refresh_script_statuses()
 
     def _script_name_for(self, model_path):
         """模型路径 → 脚本名：已有绑定（路径比较大小写不敏感）复用其名，
@@ -699,21 +851,6 @@ class MainWindow(QMainWindow):
                     self, "验证失败",
                     "请选择 llama-server.exe 文件。",
                 )
-
-    def _select_model_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择 GGUF 模型文件", "", "GGUF Files (*.gguf)"
-        )
-        if path:
-            if validate_gguf(path):
-                self.model_path_edit.setText(path)
-                self.settings.model_path = path
-                self.settings.save()
-                self._auto_bind_visual_model(path)
-                self._on_model_changed()
-                self._append_log(f"模型文件已设置: {path}")
-            else:
-                QMessageBox.warning(self, "验证失败", "请选择 .gguf 格式的模型文件。")
 
     def _select_model_dir(self):
         """选择本地模型目录 → 递归扫描填充下拉。"""
@@ -784,10 +921,13 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "验证失败", "请选择 .gguf 格式的模型文件。")
 
-    def _generate_script(self):
-        """一键生成：按当前所选模型用基础模板重新自动推算参数填入表单（可微调后保存）。
+    def _reset_script(self):
+        """重置参数：清掉该模型已保存的脚本，按模型重新生成一版默认脚本。
 
-        脚本即模型，无需脚本名。懒人流下选中模型已自动生成，此按钮供"想重置回基础参数"时用。
+        v1.19.2 合并原「一键生成」（回到默认参数）与「删除该模型脚本」
+        （解绑清理）——懒人流下选中模型即自动生成参数，两个按钮实际只服务
+        "回到默认状态"这一个诉求。重置后磁盘上仍是一条绑定（参数为默认值），
+        脚本名沿用原绑定名以免运行中清单/记录错位。
         """
         model_path = self.settings.model_path
         if not model_path:
@@ -796,14 +936,32 @@ class MainWindow(QMainWindow):
         if not self.settings.llamacpp_path:
             QMessageBox.warning(self, "提示", "请先选择 llama-server.exe。")
             return
+        reply = QMessageBox.question(
+            self, "确认重置参数",
+            "将清掉当前模型已保存的脚本参数，重新生成一版默认脚本。\n"
+            "（对模型文件无影响）\n确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
         # 先刷新模型信息与 ctx 挡位，再回填（同 _on_model_changed 的顺序约束）
         self.script_form.set_model_path(model_path)
         self.script_form.set_preset(auto_generate_config(model_path))
         self.script_form.set_alias_auto(model_path)
+        content = build_bat_content(
+            os.path.dirname(self.settings.llamacpp_path), model_path,
+            self.script_form.get_config(),
+            visual_model_path=self.settings.visual_model_path,
+        )
+        if not content.strip():
+            QMessageBox.warning(self, "提示", "请至少勾选一个参数。")
+            return
+        name = self.script_service.reset_script(model_path, content)
+        self.current_script_name = name
         if self.view_raw_btn.isChecked():
-            self.script_editor.setPlainText(self._form_to_content())
-        base = os.path.splitext(os.path.basename(model_path))[0]
-        self._append_log(f"已按模型重新生成基础参数，可微调后保存: {base}")
+            self.script_editor.setPlainText(content)
+        self._append_log(f"已重置参数并重新生成默认脚本: {name}")
+        self._sync_control_panel()
 
     def _save_script(self):
         """从表单生成 .bat 并绑定保存到当前模型（模型即脚本标识）。"""
@@ -832,24 +990,6 @@ class MainWindow(QMainWindow):
             self.script_editor.setPlainText(content)
         self._append_log(f"脚本已绑定保存到该模型: {bat_path}")
 
-    def _delete_script(self):
-        """删除当前模型绑定的脚本（不删除模型文件本身）。"""
-        if not self.settings.model_path:
-            QMessageBox.warning(self, "提示", "当前未选择模型。")
-            return
-        name = self._script_name_for(self.settings.model_path)
-        reply = QMessageBox.question(
-            self, "确认删除",
-            f"确定要删除当前模型绑定的脚本吗？\n（对模型文件无影响）",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            self.script_service.delete_script(name)
-            self.script_form.clear_form()
-            self.script_editor.clear()
-            self.current_script_name = ""
-            self._append_log("已删除绑定到当前模型的脚本")
-
     def _run_script(self):
         if self.is_running:
             QMessageBox.warning(self, "提示", "该脚本已有进程在运行，请先结束。")
@@ -862,7 +1002,7 @@ class MainWindow(QMainWindow):
         content = self._form_to_content()
         m_path = parse_model_path_from_bat(content) or self.settings.model_path
         if not content.strip():
-            QMessageBox.warning(self, "提示", "请先一键生成或填写脚本内容。")
+            QMessageBox.warning(self, "提示", "参数表单为空，请先勾选参数。")
             return
 
         # 运行前自动保存：编辑器内容与磁盘不一致（或 .bat 不存在）时先落盘，
@@ -938,7 +1078,7 @@ class MainWindow(QMainWindow):
         worker.finished.connect(lambda w=worker: self._on_run_finished(w))
         # 多服务器：退出时带上脚本名，只重置该服务的状态（不顶掉其他服务）
         worker.finished.connect(
-            lambda w=worker: self.monitor_compact.on_server_stopped(
+            lambda w=worker: self._on_model_stopped(
                 getattr(w, "script_name", "") or "default"
             )
         )
@@ -952,7 +1092,7 @@ class MainWindow(QMainWindow):
             "color: orange; font-size: 12px; font-weight: bold;"
         )
         self._refresh_script_statuses()
-        self.monitor_compact.on_server_started(self.current_script_name or "default")
+        self._on_model_started(self.current_script_name or "default")
 
     def _on_server_ready(self, name, url):
         """服务就绪（按脚本归属）：记录该脚本的 URL 并刷新外网地址显示。
@@ -1078,27 +1218,38 @@ class MainWindow(QMainWindow):
         self._append_log(f"已打开聊天页面: {url}")
 
     def _stop_script(self):
-        if not self.is_running:
-            return
+        """顶部"全部结束"：逐个结束清单里全部运行中的模型（多服务器）。
 
-        # 常规停止只按 PID（本软件跟踪的进程）；"清理全部"走 _cleanup_all_processes
-        # 多服务器：停止选中脚本自己的进程；无脚本归属时走全局 current_pid（兼容旧版本）
-        name = self.current_script_name
-        if name and self.process_service.load_runtime().get(name, {}).get("pid"):
-            stopped = self.process_service.stop_by_pid(name)
+        每行已有各自的"结束"按钮，此按钮承担"一键全停"；逐个结束使单个
+        失败不影响其余。旧实例（无脚本归属）走全局 PID 回退。只结束本软件
+        跟踪的进程——未跟踪的实例仍归下方"清理全部llama进程"（带确认）。
+
+        清单尚未覆盖的运行时记录（跨会话恢复的服务）也要结束：以 pids.json
+        为准并集，避免按钮"看不到"的实例残留占用 8080 端口。
+        """
+        names, legacy = stop_all_targets(
+            self._run_rows, self.process_service.load_runtime(),
+            self._legacy_running)
+
+        stopped = []
+        for name in names:
+            if self.process_service.stop_by_pid(name):
+                stopped.append(name)
             # 同步清缓存（不等下一轮轮询），按钮/状态列立即反映
             self._last_runtime.pop(name, None)
             self._server_urls.pop(name, None)
-            if stopped:
-                # 恢复的服务没有 LogWorker 代理 finished 信号，手动同步压缩面板
-                self.monitor_compact.on_server_stopped(name)
-        else:
-            stopped = self.process_service.stop_by_pid()
+            self._on_model_stopped(name)
+        if legacy:
+            if self.process_service.stop_by_pid():
+                stopped.append(LEGACY_NAME)
             self._legacy_running = False
+            self._on_model_stopped(LEGACY_NAME)
+
         if stopped:
-            self._append_log("进程已终止")
+            self._append_log(f"已结束全部模型（{len(stopped)} 个）: "
+                             + "、".join(stopped))
         else:
-            self._append_log("尝试终止进程，但可能未找到相关进程")
+            self._append_log("没有找到可结束的运行中进程")
 
         self._sync_control_panel()
         self._refresh_script_statuses()
@@ -1141,8 +1292,8 @@ class MainWindow(QMainWindow):
         self._last_alive = set()
         self._legacy_running = False
         self._server_urls.clear()
-        # 恢复的服务没有 LogWorker 代理 finished，这里整体重置压缩面板
-        self.monitor_compact.on_all_servers_stopped()
+        # 恢复的服务没有 LogWorker 代理 finished，这里整体重置运行中清单
+        self._on_all_models_stopped()
         self._sync_control_panel()
         self._refresh_script_statuses()
 

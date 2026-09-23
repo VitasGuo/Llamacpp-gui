@@ -4,12 +4,18 @@
 
 - **目标**：在本地 Windows 环境运行 LlamaCPP GUI（PyQt6 桌面客户端），用于管理本地 llama.cpp 推理服务器。
 
-- **当前版本**：v1.17.3（2026-09-24，切来源按输入空/有分流）
+- **当前版本**：v1.19.4（2026-09-24，下载队列进度列数字改由 QLabel 显示，修乱码）
 
 ## 版本历史
 
 | 版本     | 日期         | 说明                                                                                                                                                       |
 | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| v1.19.4 | 2026-09-24 | 修复下载队列"进度"列数字乱码（traps #2 **复发**，用户描述"百分比数字好像是用中文写的"）：`ui/model_tab.py` 的 QProgressBar 一直没关条内建文本，`%p%` 在本环境渲染成乱码字形；新增模块级 `_make_progress_cell`（条 `setTextVisible(False)` + 右侧 QLabel 显示阿拉伯数字 `NN%`，列宽 160px 容纳）与 `_set_progress_cell`，`_add_queue_row`/`_update_queue_row` 改走这对函数；新增 offscreen 回归测试 `tests/test_download_progress_cell.py` 5 例（条内文本关闭 / 文本仅 ASCII 数字 / 数值同步 / 容错 None）；162→167 全绿 |
+| v1.19.3 | 2026-09-24 | 启动脚本区去掉模型"浏览..."按钮（模型只从"路径配置"里模型目录的递归扫描下拉中选）：模型来源已由 `Settings.model_dir` 规定，浏览任意路径属重复入口，还让"选模型即生成脚本"的主流程多一条旁路；删除 `_select_model_file`（其设置 model_path/save/自动绑视觉/`_on_model_changed` 的链路已被 `_on_model_combo_selected` 完全覆盖）+ 相应按钮；保留"外挂视觉模型 选择..."（`find_mmproj` 只在模型同目录找 mmproj，异目录时是唯一兜底）与路径配置里的 llama-server.exe 选择；162 全绿 |
+| v1.19.2 | 2026-09-24 | 脚本区按钮合并：**「一键生成」+「删除该模型脚本」→「重置参数」**。根因：懒人流（选模型即自动生成参数）下两个按钮都只服务"回到默认状态"——一键生成只剩重置作用、删除脚本是它的前置清理，实际是同一诉求的两半（且"请先一键生成或填写脚本内容"等提示已成过时文案）。新按钮一次性完成：清掉该模型已保存的脚本参数 → 按 `auto_generate_config` 重新生成一版默认脚本并落盘（带确认框，不影响模型文件）；`ScriptService.reset_script(model_path, content)` 复用**现有绑定名**重建（无绑定才用 `derive_name`）——改名会让运行中清单/`pids.json` 记录错位；布局：`保存｜重置参数` 同行 + `查看生成的脚本`，模型路径行只留"浏览..."；清除死代码 `ScriptService.delete_script` / `_remove_config_entry`（合并后无调用方）；测试新增 3 例（162 全绿） |
+| v1.19.1 | 2026-09-24 | 「运行控制」顶部按钮语义对齐多模型：大"结束"改**"全部结束"**——不再只结束当前选中脚本，而是逐个结束清单里所有运行中的模型（每个模型本就有各自的行内"结束"按钮）；目标为 运行中清单 ∪ `pids.json` 运行时记录（纯函数 `stop_all_targets`，去重保序，覆盖跨会话恢复、尚未进清单的服务），旧实例仍走全局 PID 回退；任一模型在跑该按钮即可点（`_sync_control_panel`）；删除清单上方多余的"正在运行:"标题（清单本身即答案，"无模型运行"占位符保留）；未跟踪的外部实例仍归下方"清理全部llama进程"（带确认）；测试新增 6 例（159 全绿） |
+| v1.19.0 | 2026-09-24 | **脚本绑定唯一化（修复"跑 MiniCPM5 运行中却显示 gemma-4"）**：`scripts.json` 同模型多条目 + 部分条目 model_path 与 .bat 的 `-m` 脱节，`get_script_for_model` 取"第一条命中"导致错位（traps #38）。三端收口：**读取端** `get_script_for_model` 同路径候选按"脚本名与模型文件名的 token 契合度 > 置顶 > 最新保存"择优（新增纯函数 `name_model_score` / `binding_rank`）；**写入端** `_upsert_config_entry` 同 model_path 视为同一条（改名时清旧 .bat 防孤儿）；**启动迁移** 新增 `migrate_bindings()`——以 .bat 的 `-m` 为事实源校正 model_path、同模型只留最优条目（淘汰 .bat 备份到 `data/scripts_replaced` 不删除）、清掉 .bat 已不存在的幽灵条目、幂等；`process_service.remap_runtime` 同步 pids.json 键；实测本机 18→15 条（校正 2、清理 3、二次运行全 0）；测试新增 12 例（153 全绿） |
+| v1.18.0 | 2026-09-24 | 主控制页运行状态**去重**：删除系统负载 CompactMonitor 的"状态"显示与"运行时长"（两处与运行控制冗余）；运行控制新增**运行中模型清单**（支持多模型同时运行）——每行 模型名｜各自运行时长｜"结束"按钮（单点结束任一模型，走 `stop_by_pid(name)`），1s QTimer 逐行刷新时长（`format_uptime` 纯函数）；旧版本 last_pid 恢复实例显示"旧实例"行、走全局 PID 停止；141 全绿 |
 | v1.17.3 | 2026-09-24 | 切换搜索来源按输入分流：**空输入**时只更新占位提示、完全不打扰当前视图（追踪界面保持正常不重新加载）；**有输入**时保留输入内容、清空旧来源结果表并回追踪视图等重搜；142 全绿 |
 | v1.17.2 | 2026-09-24 | 修复切换搜索来源的两个体验问题：不再清空搜索框已有输入（用户可能想在另一来源搜同一关键词，仅更新占位提示）；切换来源后回到默认的更新追踪视图而非空的搜索结果页（重新搜索才显示新来源结果）；142 全绿 |
 | v1.17.1 | 2026-09-24 | 修复搜索后无法回到追踪视图：搜索框新增 **× 清空按钮**（搜索栏搜索框与搜索按钮之间），点击清空关键词并切回默认的更新追踪视图——搜索后返回追踪的唯一显式入口；142 全绿 |
@@ -51,6 +57,45 @@
 | v1.0.0 | 2026-09-02 | 首次克隆并配置运行环境，GUI 启动验证通过                                                                                                                                   |
 
 ## 当前任务
+
+- [x] v1.19.4 下载队列"进度"列数字乱码修复（2026-09-24）：
+  - 根因：traps #2 复发——`ui/model_tab.py` 队列进度条的条内建文本（`%p%`）在本环境渲染为乱码字形，看着像中文；用户报"百分比的数字好像是用中文写的"
+  - `ui/model_tab.py`：新增模块级 `_make_progress_cell(value)`（进度条 `setTextVisible(False)` + 右侧固定宽 38px 的 QLabel 显示 `NN%`）与 `_set_progress_cell(cell, value)`；`_add_queue_row` / `_update_queue_row` 改走这对函数（原先直接放裸 QProgressBar）
+  - `tests/test_download_progress_cell.py`（新）：5 例 offscreen 测试——条内文本必须关闭、QLabel 文本仅含 ASCII 数字与 `%`、条值与文本同步、`None` 容错（含"必须持有 cell 引用，否则容器被 GC 连带删掉子控件"的坑）
+  - traps #2 状态行补记复发与二次教训（"每新增一个 QProgressBar 都要同时决定百分比文本由谁显示"）
+  - 验证：167 例全绿；`py_compile` 通过；顺手用 AST 扫全项目类体确认无重复方法定义（traps #32 隐患）= NONE
+
+- [x] v1.19.3 去掉启动脚本区的模型"浏览..."按钮（2026-09-24）：
+  - `ui/app.py`：删除模型路径行下的 `浏览...` 按钮与 `_select_model_file`；模型只从"路径配置"模型目录（`Settings.model_dir`）递归扫描的下拉中选（`_reload_model_combo` + `_on_model_combo_selected` 已覆盖设置/保存/自动绑视觉/`_on_model_changed` 全链路）
+  - 决策：保留"外挂视觉模型 选择..."——`find_mmproj` 只在模型同目录查找 mmproj，视觉文件放在别处时它是唯一入口；路径配置里的 llama-server.exe 选择同理保留
+  - 验证：162 例全绿；`py_compile` 通过
+
+- [x] v1.19.2 「一键生成」+「删除该模型脚本」合并为「重置参数」（2026-09-24）：
+  - `service/script_service.py`：新增 `reset_script(model_path, content)`（复用现有绑定名覆盖重建，无绑定用 `derive_name`；一个模型仍只一条绑定）；删除死代码 `delete_script` / `_remove_config_entry`（已无调用方）
+  - `ui/app.py`：删除 `_generate_script` / `_delete_script`，新增 `_reset_script`（确认框 → 重置表单为默认参数 → `build_bat_content` 落盘 → 刷新原文视图/日志/按钮状态）；按钮布局改 `保存｜重置参数` 同行 + `查看生成的脚本`，模型路径行只留"浏览..."；运行前空表单提示改为"参数表单为空，请先勾选参数"（去掉过时的"请先一键生成…"）
+  - `tests/test_script_model_binding.py`：新增 `TestResetScript` 3 例（沿用绑定名替换内容 / 无绑定用规范名 / 重复重置不增条目）
+  - **顺手修复测试临时目录泄漏（traps #39）**：5 个测试文件的 `tempfile.mkdtemp()` 统一加 `self.addCleanup(shutil.rmtree, ...)`（`test_script_builder` 4 处 / `test_script_model_binding` 4 / `test_script_pin` / `test_download_entry` / `test_llamacpp_update` 2）——此前 `test_ctx_tier_by_size` 每次运行真写 1.5G+8G 假模型且不回收，本机累计 442 个 `tmp*` 目录约 489GB 把 C 盘写满（仅剩 8.1GB，跑测试报 `OSError: [Errno 28]`）；清理历史垃圾释放 478.8GB（盘恢复到 638GB 可用）
+  - 验证：162 例全绿；跑完测试 `%TEMP%` 残留测试目录 = 0；`py_compile` 通过
+
+- [x] v1.19.1 「运行控制」顶部按钮改"全部结束"（2026-09-24）：
+  - `ui/app.py`：新增纯函数 `stop_all_targets(run_rows, runtime, legacy_running)`（清单 ∪ pids.json 运行时记录，去重保序；旧实例单独标识）；`_stop_script` 改为逐个结束全部目标并对每个失败容错，日志列出实际结束的模型名；`_sync_control_panel` 中 `stop_btn` 改为"任一模型在跑即可点"；删除 `run_list_title`（"正在运行:"）；按钮文案/工具提示更新（未跟踪实例指向下方"清理全部llama进程"）
+  - `tests/test_run_control.py`：新增 6 例（清单/记录并集去重、旧实例识别、空目标、空串过滤）
+  - 验证：159 例全绿；`py_compile` 通过
+
+- [x] v1.19.0 脚本绑定唯一化（2026-09-24）：
+  - `service/script_service.py`：新增纯函数 `name_model_score`（脚本名 token 命中模型文件名比例）与 `binding_rank`（契合度>置顶>最新保存）；`get_script_for_model` 改为候选择优（兜底 `derive_name`）；`_upsert_config_entry` 按归一化 model_path 判重（同模型即同一条，改名时 `_remove_bat` 清旧 .bat）；新增 `migrate_bindings()`（以 .bat 的 `-m` 校正 model_path / 同模型只留最优 / 幽灵条目剔除 / 备份到 `data/scripts_replaced` / 幂等）
+  - `service/process_service.py`：新增 `remap_runtime(mapping)`，脚本名变更后同步 pids.json 键
+  - `config/__init__.py`：新增 `REPLACED_SCRIPTS_DIR = "data/scripts_replaced"`
+  - `ui/app.py`：`__init__` 插入 `_migrate_script_bindings()`（`_init_tray` 之后、`_load_saved_paths` 之前），清理结果写界面日志面板 + `info()` 落 `data/logs/app.log` 留痕
+  - `tests/test_script_model_binding.py`：新增 `TestNameModelScore`(4) / `TestMigrateBindings`(5) / `TestBindingUniqueness`(3)
+  - 验证：153 例全绿；真实数据副本干跑 18→15 条、备份 3 份 .bat、二次运行全 0（幂等）；关键文件 `py_compile` 通过
+  - **实机执行（2026-09-24 01:13 启动）**：`data/scripts.json` 18→15 条、校正 2、清理 3、`data/scripts_replaced/` 落 3 份 .bat、`pids.json` 清空；复核 15 条全部无重复 model_path / 无缺失 .bat，逐条 `get_script_for_model` 均命中自身；再次调用迁移全 0（幂等）
+
+- [x] v1.18.0 主控制页运行状态去重 + 运行中模型清单（2026-09-24）：
+  - `ui/monitor_tab.py`：CompactMonitor 删除"状态"显示与"运行时长"（`_status_label`/`_uptime_label`/`_running`/`on_server_*`），只保留 CPU/RAM/GPU/t-s 纯负载；新增 `format_uptime` 纯函数（秒 → HH:MM:SS，非法/负值回退 --）
+  - `ui/app.py`：运行控制新增**运行中模型清单**——每行 模型名｜运行时长｜"结束"按钮，1s `_uptime_timer` 逐行刷新；6 处钩子改走 `_on_model_started/_on_model_stopped/_on_all_models_stopped`；`_stop_single_model` 按脚本名 `stop_by_pid` 单点结束任一模型、旧实例（LEGACY_NAME="旧实例"）走全局 PID 回退
+  - `tests/test_compact_monitor.py`：移除 2 例旧状态测试、新增 `format_uptime` 测试（净 -1）
+  - 验证：141 例全绿；离屏冒烟通过（多模型增删/时长刷新/占位符切换）
 
 - [x] v1.16.1 ctx 挡位化 + GGUF 元数据上限（2026-09-23）：
   - `service/script_builder.py`：`read_gguf_context_length`（GGUF 头 KV 扫描，命中 `*.context_length` 即停）+ `ctx_options_for`（挡位 + 默认值单一事实源）；`auto_generate_config` 的 ctx 改走元数据（上限<128K 默认取最大值、≥128K 默认 128K、读不到回退文件大小分级）

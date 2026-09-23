@@ -1,5 +1,6 @@
 """脚本置顶（pinned）字段的持久化测试。"""
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -24,6 +25,7 @@ class TestPinPersist(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
 
     def _service(self):
         svc = ScriptService()
