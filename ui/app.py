@@ -35,7 +35,6 @@ from service.model_scanner import scan_gguf_files
 from chat import start_bridge
 from model.script import ScriptEntry
 from ui.model_tab import ModelTab
-from ui.model_watch_tab import ModelWatchTab
 from ui.monitor_tab import CompactMonitor
 from ui.script_form_widget import ScriptFormWidget
 from ui.update_tab import UpdateTab
@@ -302,15 +301,9 @@ class MainWindow(QMainWindow):
 
         tabs.addTab(control_widget, "主控制")
 
-        # 模型搜索与下载标签
+        # 模型搜索与下载标签（内含更新追踪默认视图）
         self.model_tab = ModelTab()
         tabs.addTab(self.model_tab, "模型搜索与下载")
-
-        # 模型更新追踪标签（独立卡片）
-        self.model_watch_tab = ModelWatchTab()
-        tabs.addTab(self.model_watch_tab, "模型更新追踪")
-
-        # 性能监控并入主控制页压缩版，不再单设标签页
 
         # 版本管理标签（llama.cpp 检测更新/下载安装/切换）
         self.update_tab = UpdateTab()
@@ -319,14 +312,14 @@ class MainWindow(QMainWindow):
         self.update_tab.restart_requested.connect(self._restart_app)
         tabs.addTab(self.update_tab, "版本管理")
 
-        # 切到"模型更新追踪"时刷新（并入新下载的本地模型 + 后台检查）
+        # 切到"模型搜索与下载"时刷新追踪视图（并入新下载的本地模型 + 后台检查）
         tabs.currentChanged.connect(self._on_main_tab_changed)
 
         main_layout.addWidget(tabs)
 
     def _on_main_tab_changed(self, index):
-        if self.tabs_holder.widget(index) is self.model_watch_tab:
-            self.model_watch_tab.recall()
+        if self.tabs_holder.widget(index) is self.model_tab:
+            self.model_tab.refresh_watch()
 
     def _on_version_switched(self, new_exe_path):
         """版本管理页切换 llama.cpp 版本后，同步主控制页路径显示。"""

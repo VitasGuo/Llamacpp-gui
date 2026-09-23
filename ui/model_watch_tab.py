@@ -1,10 +1,13 @@
-"""模型更新追踪标签页（独立卡片）。
+"""模型更新追踪视图（嵌入 ModelTab 的可复用 QWidget）。
 
-自动关注本地已装的 ModelScope 模型系列 + 搜索结果可手动追踪；后台比对远端
-LastUpdatedTime 基线，有新版整行标黄。作为主窗口独立标签，切换进入即检查。
+作为"模型搜索与下载"标签页的默认视图：未搜索时显示已关注的模型列表；
+搜索时由宿主 ModelTab 切换到搜索结果页。自动关注本地已装的 ModelScope
+模型系列 + 搜索结果可手动追踪；后台比对远端 LastUpdatedTime 基线，
+有新版整行标黄；每行提供"查看文件"进入该模型的 gguf 文件列表并下载。
 """
 from datetime import datetime
 
+from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
@@ -26,7 +29,12 @@ def _format_date_ts(ts):
         return str(ts)
 
 
-class ModelWatchTab(QWidget):
+class ModelWatchView(QWidget):
+    """关注模型列表视图（嵌入 ModelTab 视图栈）。"""
+
+    # 行内"查看文件"→ 宿主 ModelTab 复用现有文件浏览+下载流程
+    view_model_requested = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.settings = Settings.get_instance()
@@ -35,7 +43,7 @@ class ModelWatchTab(QWidget):
         self._merge_worker = None  # 后台本地模型扫描线程（os.walk 大模型库较慢）
         self._pending_check = False  # merge 完成后是否需要触发网络检查
         self._build_ui()
-        # 首次仅并入本地模型并渲染（后台扫描）；网络检查由 tab 激活时 recall() 触发
+        # 首次仅并入本地模型并渲染（后台扫描）；网络检查由 refresh_watch() 触发
         self._request_merge()
 
     # ── 本地模型并入（后台）─────────────────────────────────────
@@ -68,12 +76,12 @@ class ModelWatchTab(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
         hint = QLabel(
-            "自动追踪本地已有的 ModelScope 模型系列；远端有新版本会标黄提示。\n"
-            "搜索结果页可手动点\"追踪\"添加更多模型。")
+            "未搜索时显示已关注的模型；远端有新版本会标黄提示。\n"
+            "搜索结果页可手动点\"追踪\"添加更多模型；追踪列表每行可\"查看文件\"下载。")
         hint.setStyleSheet("color: gray; font-size: 11px;")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -88,8 +96,9 @@ class ModelWatchTab(QWidget):
         bar.addWidget(self.status_label)
         layout.addLayout(bar)
 
-        self.watch_table = QTableWidget(0, 5)
-        self.watch_table.setHorizontalHeaderLabels(["状态", "模型 ID", "最后更新", "上次检查", "操作"])
+        self.watch_table = QTableWidget(0, 6)
+        self.watch_table.setHorizontalHeaderLabels(
+            ["状态", "模型 ID", "最后更新", "上次检查", "查看文件", "操作"])
         header = self.watch_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.watch_table.setColumnWidth(0, 110)
@@ -99,7 +108,9 @@ class ModelWatchTab(QWidget):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         self.watch_table.setColumnWidth(3, 130)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self.watch_table.setColumnWidth(4, 60)
+        self.watch_table.setColumnWidth(4, 80)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.watch_table.setColumnWidth(5, 60)
         self.watch_table.verticalHeader().setVisible(False)
         self.watch_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.watch_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -109,27 +120,56 @@ class ModelWatchTab(QWidget):
         """并入其他来源加入的关注、新下载的本地模型后重渲染；随后自动检查。"""
         self._request_merge(then_check=True)
 
+    def refresh_watch(self):
+        """外部（主窗口切到宿主标签页）提示刷新：合并新本地模型 + 若空闲自动检查。"""
+        self._request_merge(then_check=bool(self._watchlist))
+
     def _refresh_watch_table(self):
         self.watch_table.setRowCount(0)
         for row, w in enumerate(self._watchlist):
             self.watch_table.insertRow(row)
-            source_mark = "本地" if w.get("added_by") == "local" else "关注"
-            mid_item = QTableWidgetItem(f"{w.get('model_id', '')}  （{source_mark}）")
-            self.watch_table.setItem(row, 1, mid_item)
+            self._render_watch_row(row, w)
 
-            status_item = QTableWidgetItem("待检查")
-            status_item.setForeground(QColor("#909090"))
-            lu = w.get("last_updated")
-            self.watch_table.setItem(row, 2, QTableWidgetItem(
-                _format_date_ts(lu) if lu else "-"))
-            lc = w.get("last_checked") or "-"
-            self.watch_table.setItem(row, 3, QTableWidgetItem(
-                lc[:16].replace("T", " ") if lc != "-" else "-"))
-            self.watch_table.setItem(row, 0, status_item)
+    def _render_watch_row(self, row, w):
+        """渲染关注列表的一行（供全量重渲染与 notify_added 单行插入复用）。"""
+        source_mark = "本地" if w.get("added_by") == "local" else "关注"
+        mid_item = QTableWidgetItem(f"{w.get('model_id', '')}  （{source_mark}）")
+        self.watch_table.setItem(row, 1, mid_item)
 
-            rm = QPushButton("移除")
-            rm.clicked.connect(lambda _, mid=w.get("model_id"): self._remove_watch(mid))
-            self.watch_table.setCellWidget(row, 4, rm)
+        status_item = QTableWidgetItem("待检查")
+        status_item.setForeground(QColor("#909090"))
+        lu = w.get("last_updated")
+        self.watch_table.setItem(row, 2, QTableWidgetItem(
+            _format_date_ts(lu) if lu else "-"))
+        lc = w.get("last_checked") or "-"
+        self.watch_table.setItem(row, 3, QTableWidgetItem(
+            lc[:16].replace("T", " ") if lc != "-" else "-"))
+        self.watch_table.setItem(row, 0, status_item)
+
+        mid = w.get("model_id", "")
+        view_btn = QPushButton("查看文件")
+        view_btn.clicked.connect(
+            lambda checked, x=mid: self.view_model_requested.emit(x))
+        self.watch_table.setCellWidget(row, 4, view_btn)
+
+        rm = QPushButton("移除")
+        rm.clicked.connect(lambda _, mid=mid: self._remove_watch(mid))
+        self.watch_table.setCellWidget(row, 5, rm)
+
+    def notify_added(self, model_id):
+        """搜索页"追踪"成功后轻量插入一行（不整表重渲染，保留已有高亮）。"""
+        if any(w["model_id"] == model_id for w in self._watchlist):
+            return
+        self._watchlist.append({
+            "model_id": model_id,
+            "source": "modelscope",
+            "added_by": "manual",
+            "last_updated": None,
+            "last_checked": "",
+        })
+        row = self.watch_table.rowCount()
+        self.watch_table.insertRow(row)
+        self._render_watch_row(row, self._watchlist[-1])
 
     def _start_watch_check(self):
         if self._watch_worker and self._watch_worker.isRunning():
@@ -183,11 +223,3 @@ class ModelWatchTab(QWidget):
     def _remove_watch(self, model_id):
         self._watchlist = watchlist_service.remove_model(model_id, self._watchlist)
         self._refresh_watch_table()
-
-    def recall(self):
-        """外部（主窗口 tab 切换）提示刷新：合并新本地模型 + 若空闲自动检查。
-
-        原语义：merge 前列表非空才自动检查（避免空列表场景重复弹状态提示）；
-        空闲判定由 _start_watch_check 的 isRunning 防重入兜底。
-        """
-        self._request_merge(then_check=bool(self._watchlist))

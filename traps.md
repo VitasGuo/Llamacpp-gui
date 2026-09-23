@@ -801,3 +801,32 @@ GIL 下读安全），绝不跑子进程/建 QThread（跨线程不安全）。�
 
 ***
 
+## #37 追踪模型"查看文件"下载来源必须独立于搜索来源——共用 self._current_source 会下错 URL
+
+**现象**（v1.17.0 合并重构时识别，实施前即规避）：用户把来源切换到
+HF 镜像搜索，然后到"更新追踪"列表点某模型的"查看文件"进入文件列表，
+勾选/单点下载——若下载链路仍读 `self._current_source`（HF 镜像），
+会用 hf-mirror 的 URL 拼接 ModelScope 的 model_id/文件路径，下载必然失败。
+
+**根因**：追踪列表的模型来源固定是 ModelScope（`add_manual_model` /
+`merge_local_models` 都写 `source: modelscope`），但文件列表页的下载方法
+`_download_selected` / `_start_single_download` 原先统一读 UI 的
+`self._current_source`（跟随搜索来源下拉）。视图合并后同一个文件列表页
+有两个进入路径（搜索结果 / 追踪视图），来源语义分裂：
+- 搜索结果进入 → 来源应跟随 combo；
+- 追踪视图进入 → 来源必须强制 ModelScope。
+共用同一个变量必然有一个路径错。
+
+**解决方案**：引入独立的 `self._filelist_source`——`_show_file_list` 增加
+`source` 参数（默认取 `_current_source`，追踪入口显式传 `SOURCE_MODELSCOPE`），
+文件列表渲染（`FileListWorker`）、`_download_selected`、`_start_single_download`
+全部改读 `_filelist_source`。同时"返回"按钮不能硬编码回搜索结果页，用
+`self._filelist_back_index` 记忆进入来源（0=追踪视图 / 1=搜索结果页）。
+
+**教训**：当一个共享视图（文件列表页）被多个入口复用、且各入口的上下文
+参数（来源、返回目标）不同时，UI 状态必须按"当前视图"建模（进视图时记录
+上下文变量），不能按"全局选中项"建模——后者会让第二个入口悄悄用错参数。
+合并功能时，逐一检查被合并视图的所有**入口**和**消费方**（不只是入口本身）。
+
+***
+

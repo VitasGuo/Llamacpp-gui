@@ -15,7 +15,7 @@ from service import model_sources
 from service import watchlist_service
 from service.download_service import DownloadManager
 from ui.workers.search_worker import SearchWorker, FileListWorker
-from ui.workers.watch_worker import WatchCheckWorker
+from ui.model_watch_tab import ModelWatchView
 
 
 def _format_size(size_bytes):
@@ -60,10 +60,20 @@ class ModelTab(QWidget):
         self._current_keyword = ""
         self._total_count = 0
         self._current_model_id = ""
+        # 当前文件列表的来源：搜索查看跟随 combo（默认），追踪查看强制 ModelScope
+        self._filelist_source = model_sources.SOURCE_MODELSCOPE
+        # 文件列表"返回"目标：0=追踪视图 1=搜索结果页
+        self._filelist_back_index = 0
         self._watchlist = []          # 关注列表（watchlist_service 读入，供搜索结果追踪按钮判断）
+        self.watch_view = ModelWatchView()  # 更新追踪视图（默认视图）
         self._init_ui()
         self._connect_download_signals()
         self._restore_queue()
+        # 追踪视图"查看文件"→ 复用文件列表浏览+下载（追踪列表只有 ModelScope 模型）
+        self.watch_view.view_model_requested.connect(
+            lambda mid: self._show_file_list(
+                mid, source=model_sources.SOURCE_MODELSCOPE, back_index=0)
+        )
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -77,8 +87,9 @@ class ModelTab(QWidget):
         top_layout = QVBoxLayout(top_widget)
         top_layout.setContentsMargins(0, 0, 0, 0)
         self.stack = QStackedWidget()
-        self.stack.addWidget(self._build_results_page())
-        self.stack.addWidget(self._build_filelist_page())
+        self.stack.addWidget(self.watch_view)              # 0: 更新追踪（默认视图）
+        self.stack.addWidget(self._build_results_page())   # 1: 搜索结果
+        self.stack.addWidget(self._build_filelist_page())  # 2: 文件列表
         self.stack.setCurrentIndex(0)
         top_layout.addWidget(self.stack)
         splitter.addWidget(top_widget)
@@ -135,11 +146,22 @@ class ModelTab(QWidget):
         self.search_input.setPlaceholderText("输入关键词搜索 ModelScope 模型...")
         self.search_btn = QPushButton("搜索")
         self.search_btn.clicked.connect(self._do_search)
+        # 清空搜索框并回到默认的更新追踪视图（搜索后返回追踪的唯一入口）
+        self.clear_search_btn = QPushButton("×")
+        self.clear_search_btn.setFixedWidth(28)
+        self.clear_search_btn.setToolTip("清空搜索，返回追踪视图")
+        self.clear_search_btn.clicked.connect(self._clear_search)
         bar.addWidget(self.search_input)
+        bar.addWidget(self.clear_search_btn)
         bar.addWidget(self.search_btn)
         w = QWidget()
         w.setLayout(bar)
         return w
+
+    def _clear_search(self):
+        """清空搜索并回到默认的更新追踪视图。"""
+        self.search_input.clear()
+        self.stack.setCurrentIndex(0)
 
     def _build_results_page(self):
         page = QWidget()
@@ -189,7 +211,7 @@ class ModelTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         top_bar = QHBoxLayout()
-        self.back_btn = QPushButton("\u2190 返回搜索结果")
+        self.back_btn = QPushButton("\u2190 返回")
         self.back_btn.clicked.connect(self._back_to_results)
         top_bar.addWidget(self.back_btn)
         self.filelist_model_label = QLabel("")
@@ -236,11 +258,17 @@ class ModelTab(QWidget):
         return page
 
     def _watch_model(self, model_id, btn):
-        """搜索结果手动追踪一个模型（加入关注列表，供独立追踪页查看）。"""
+        """搜索结果手动追踪一个模型（加入关注列表，供追踪视图查看/下载）。"""
         watchlist_service.add_manual_model(model_id)
         self._watchlist = watchlist_service.load_watchlist()
         btn.setText("已追踪")
         btn.setEnabled(False)
+        # 轻量同步追踪视图（单行插入，不整表重渲染、不触发网络检查）
+        self.watch_view.notify_added(model_id)
+
+    def refresh_watch(self):
+        """主窗口切回本标签页时刷新追踪视图（并入新本地模型 + 空闲检查）。"""
+        self.watch_view.refresh_watch()
 
     def _do_search(self):
         keyword = self.search_input.text().strip()
@@ -322,22 +350,26 @@ class ModelTab(QWidget):
             watch_btn.clicked.connect(lambda checked, x=mid, b=watch_btn: self._watch_model(x, b))
             self.result_table.setCellWidget(row, 5, watch_btn)
 
-        self.stack.setCurrentIndex(0)
+        self.stack.setCurrentIndex(1)
 
     def _on_source_changed(self):
         source = self.source_combo.currentData()
         if source == self._current_source:
             return
         self._current_source = source
-        self._current_keyword = ""
-        self._current_page = 1
-        self._has_next = False
-        self._total_count = 0
-        self.search_input.clear()
         if source == model_sources.SOURCE_HF_MIRROR:
             self.search_input.setPlaceholderText("输入关键词搜索 Hugging Face 模型...")
         else:
             self.search_input.setPlaceholderText("输入关键词搜索 ModelScope 模型...")
+        # 空输入：切换来源不打扰当前视图（追踪界面保持正常，不重新加载）
+        if not self.search_input.text().strip():
+            return
+        # 有输入：保留输入内容；旧来源的搜索结果作废，清空并回到默认
+        # 的更新追踪视图，重新点搜索才显示新来源结果
+        self._current_keyword = ""
+        self._current_page = 1
+        self._has_next = False
+        self._total_count = 0
         self.result_table.setRowCount(0)
         self.page_label.setText("第 0 页")
         self.prev_btn.setEnabled(False)
@@ -354,17 +386,26 @@ class ModelTab(QWidget):
             self._current_page += 1
             self._load_search_page()
 
-    def _show_file_list(self, model_id):
+    def _show_file_list(self, model_id, source=None, back_index=1):
+        """进入某模型的 gguf 文件列表页（供下载）。
+
+        source：文件列表与下载所用的来源——搜索结果跟随当前 combo（默认）；
+        追踪视图查看强制 ModelScope（追踪列表只有 ModelScope 模型，避免
+        combo 停在 HF 镜像时下载 URL 错误）。
+        back_index："返回"目标，0=追踪视图 1=搜索结果页。
+        """
         self._current_model_id = model_id
-        source_label = model_sources.get_label(self._current_source)
+        self._filelist_source = source or self._current_source
+        self._filelist_back_index = back_index
+        source_label = model_sources.get_label(self._filelist_source)
         self.filelist_model_label.setText(f"当前模型 [{source_label}]: {model_id}")
         self.filelist_model_label.setStyleSheet("font-weight: bold;")
 
         # 文件列表同样是网络请求 → 后台线程加载，先显示占位行
         self.file_table.setRowCount(1)
         self.file_table.setItem(0, 1, QTableWidgetItem("文件列表加载中..."))
-        self.stack.setCurrentIndex(1)
-        self._filelist_worker = FileListWorker(self._current_source, model_id)
+        self.stack.setCurrentIndex(2)
+        self._filelist_worker = FileListWorker(self._filelist_source, model_id)
         self._filelist_worker.result_signal.connect(self._on_filelist_result)
         self._filelist_worker.start()
 
@@ -382,7 +423,7 @@ class ModelTab(QWidget):
         if not gguf_files:
             self.file_table.insertRow(0)
             self.file_table.setItem(0, 1, QTableWidgetItem("该模型下没有 .gguf 文件"))
-            self.stack.setCurrentIndex(1)
+            self.stack.setCurrentIndex(2)
             return
 
         for row, f in enumerate(gguf_files):
@@ -407,10 +448,11 @@ class ModelTab(QWidget):
             )
             self.file_table.setCellWidget(row, 3, dl_btn)
 
-        self.stack.setCurrentIndex(1)
+        self.stack.setCurrentIndex(2)
 
     def _back_to_results(self):
-        self.stack.setCurrentIndex(0)
+        # 按进入文件列表时的来源返回：搜索查看→搜索结果页，追踪查看→追踪视图
+        self.stack.setCurrentIndex(self._filelist_back_index)
 
     def _select_dl_path(self):
         path = QFileDialog.getExistingDirectory(self, "选择模型下载目录")
@@ -441,11 +483,11 @@ class ModelTab(QWidget):
                 if not isinstance(size, int):
                     size = 0
                 ok = self.download_manager.start_download(
-                    self._current_source, self._current_model_id, file_path, size, dl_path
+                    self._filelist_source, self._current_model_id, file_path, size, dl_path
                 )
                 if ok:
                     entry = self.download_manager.download_queue.find(
-                        self._current_source, self._current_model_id, file_path
+                        self._filelist_source, self._current_model_id, file_path
                     )
                     if entry:
                         self._add_queue_row(entry)
@@ -462,12 +504,12 @@ class ModelTab(QWidget):
             QMessageBox.warning(self, "提示", "下载目录不存在")
             return
         ok = self.download_manager.start_download(
-            self._current_source, model_id, file_path, file_size, dl_path
+            self._filelist_source, model_id, file_path, file_size, dl_path
         )
         if not ok:
             return
         entry = self.download_manager.download_queue.find(
-            self._current_source, model_id, file_path
+            self._filelist_source, model_id, file_path
         )
         if entry:
             self._add_queue_row(entry)
