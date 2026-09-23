@@ -1,7 +1,7 @@
 """版本比较与静态文件防穿越测试。"""
 import unittest
 
-from ui.workers.update_workers import compare_semver
+from utils.semver import compare_semver
 
 
 class TestCompareSemver(unittest.TestCase):

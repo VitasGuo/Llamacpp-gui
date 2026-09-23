@@ -7,6 +7,7 @@
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from service import model_sources
+from utils.logger import error
 
 
 class SearchWorker(QThread):
@@ -46,5 +47,5 @@ class FileListWorker(QThread):
             files = model_sources.list_model_files(self._source, self._model_id)
         except Exception as e:
             files = None
-            print(f"FileListWorker error: {e}")
+            error(f"FileListWorker 请求失败 {self._model_id}: {e}")
         self.result_signal.emit(self._model_id, files)

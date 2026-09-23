@@ -12,9 +12,12 @@ from PyQt6.QtWidgets import (
 
 from config.config import Settings
 from service import llamacpp_update_service as svc
+from service.process_service import ProcessService
+from service.script_service import ScriptService
 from ui.workers.update_manager_workers import (
     LocalInfoWorker, ReleasesWorker, InstallWorker,
 )
+from ui.workers.cleanup_worker import CleanupPlanWorker, CleanupExecWorker
 
 
 def _format_size(size_bytes):
@@ -187,6 +190,12 @@ class UpdateTab(QWidget):
         self.refresh_installed_btn = QPushButton("刷新列表")
         self.refresh_installed_btn.clicked.connect(self._refresh_installed)
         row.addWidget(self.refresh_installed_btn)
+        self.cleanup_btn = QPushButton("清理旧版本")
+        self.cleanup_btn.clicked.connect(self._cleanup_old_versions)
+        self.cleanup_btn.setToolTip(
+            "按规则清理：保留当前使用版本 + 每个变体系列（cuda-13.3/13.4/...）"
+            "最新 2 个，其余旧版本及已解压的下载缓存 zip 一并删除")
+        row.addWidget(self.cleanup_btn)
         row.addStretch(1)
         layout.addLayout(row)
         return group
@@ -584,6 +593,11 @@ class UpdateTab(QWidget):
                 return
             self.progress_status_label.setText(f"未完成: {message}")
             self.progress_status_label.setStyleSheet("color: red;")
+            # 数百 MB 下载失败不能只在小字显示：弹窗明确告知，附重试指引
+            QMessageBox.warning(
+                self, "安装未完成",
+                f"{message}\n\n下载缓存已保留，可点击\"重试\"从断点继续，"
+                "或在下载设置中更换镜像前缀后重试。")
 
     # ── 已安装版本 ─────────────────────────────────────────────
 
@@ -640,6 +654,114 @@ class UpdateTab(QWidget):
         root = self.settings.llamacpp_install_root
         os.makedirs(root, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(root)))
+
+    def _collect_running_dirs(self):
+        """收集运行中服务（pids.json）的 exe 所在目录。
+
+        清理规划须排除这些目录：从旧版本目录启动的 llama-server 仍在跑时，
+        rmtree 会把目录删成半残（未锁文件先删、锁文件才报错）。
+        """
+        dirs = []
+        try:
+            runtime = ProcessService().load_runtime()
+        except Exception:
+            return dirs
+        scripts = ScriptService()
+        for name in runtime:
+            try:
+                content = scripts.load_script_content(name) or ""
+            except Exception:
+                continue
+            m = re.search(r'cd /d "([^"]+)"', content)
+            if m:
+                dirs.append(m.group(1))
+        return dirs
+
+    def _cleanup_old_versions(self):
+        """按规则清理旧版本：后台规划 → 确认 → 后台删除。
+
+        保留规则：当前使用版本 + 运行中服务的目录恒保留，每个变体系列
+        各保留最新 2 个，其余删除。规划（递归统计大小）与删除（rmtree）
+        均在后台线程执行，不冻结 GUI。
+        """
+        btn = self.sender()
+        if isinstance(btn, QPushButton):
+            btn.setEnabled(False)
+            btn.setText("统计中...")
+        root = self.settings.llamacpp_install_root
+        worker = CleanupPlanWorker(root, self.settings.llamacpp_path,
+                                   self._collect_running_dirs())
+        self._workers.append(worker)
+
+        def on_planned(del_versions, del_zips, size_ver, size_zip):
+            if isinstance(btn, QPushButton):
+                btn.setEnabled(True)
+                btn.setText("清理旧版本")
+            if not del_versions and not del_zips:
+                QMessageBox.information(self, "清理旧版本", "没有需要清理的旧版本或缓存。")
+                return
+            if not self._confirm_cleanup(del_versions, del_zips, size_ver, size_zip):
+                return
+            self._exec_cleanup(del_versions, del_zips, btn)
+
+        worker.planned.connect(on_planned)
+        worker.finished.connect(lambda w=worker: self._drop_worker(w))
+        worker.start()
+
+    def _confirm_cleanup(self, del_versions, del_zips, size_ver, size_zip):
+        """弹确认框（默认取消防误触）。返回用户是否确认删除。"""
+        lines = []
+        if del_versions:
+            names = "、".join(f"{d['tag']}（{svc.variant_label(d['variant'])}）" for d in del_versions)
+            freed = _format_size(size_ver)
+            lines.append(f"• 旧版本目录（{len(del_versions)} 个，释放 {freed}）：\n    {names}")
+            lines.append("")
+        if del_zips:
+            files = "、".join(os.path.basename(z) for z in del_zips[:6])
+            if len(del_zips) > 6:
+                files += f" 等 {len(del_zips)} 个"
+            freed = _format_size(size_zip)
+            lines.append(f"• 已解压的下载缓存 zip（{len(del_zips)} 个，释放 {freed}）：\n    {files}")
+            lines.append("")
+        lines.append(f"共可释放约 {_format_size(size_ver + size_zip)}。\n"
+                     "保留：当前使用版本 + 运行中服务目录 + 每个变体系列最新 2 个。确定删除？")
+        msg = QMessageBox(self)
+        msg.setWindowTitle("清理旧版本")
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setText("\n".join(lines))
+        ok = msg.addButton("删除", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(msg.buttons()[1])  # 默认取消，防误触
+        msg.exec()
+        return msg.clickedButton() is ok
+
+    def _exec_cleanup(self, del_versions, del_zips, btn):
+        """后台执行删除，完成后刷新并汇总。"""
+        if isinstance(btn, QPushButton):
+            btn.setEnabled(False)
+            btn.setText("清理中...")
+        worker = CleanupExecWorker(del_versions, del_zips)
+        self._workers.append(worker)
+
+        def on_done(freed, errors):
+            if isinstance(btn, QPushButton):
+                btn.setEnabled(True)
+                btn.setText("清理旧版本")
+            self._refresh_installed()
+            summary = f"已清理，释放 {_format_size(freed)}。"
+            if errors:
+                summary += "\n以下未能删除（可能正被运行中服务占用）：\n" + "\n".join(errors[:5])
+            QMessageBox.information(self, "清理完成", summary)
+
+        worker.done.connect(on_done)
+        worker.finished.connect(lambda w=worker: self._drop_worker(w))
+        worker.start()
+
+    def _drop_worker(self, worker):
+        """worker 结束后移出引用列表并销毁（防会话级累积）。"""
+        if worker in self._workers:
+            self._workers.remove(worker)
+        worker.deleteLater()
 
     # ── 下载设置 ───────────────────────────────────────────────
 

@@ -8,9 +8,10 @@
 
 | 功能 | 说明 |
 |------|------|
-| 🚀 **llama-server 管理** | 图形化配置路径，参数模板生成启动脚本，一键运行/停止 |
+| 🚀 **llama-server 管理** | 图形化配置路径，参数模板生成启动脚本，一键运行/停止；**一键生成脚本**（选模型自动算参数）+ **表单式脚本编辑**（填空/下拉/勾选，可展开看 .bat 原文） |
 | 🔍 **模型搜索与下载** | 集成 ModelScope 与 hf-mirror.com，搜索模型、浏览 GGUF 文件、断点续传下载 |
-| 📊 **性能监控** | CPU/内存/NVIDIA GPU 实时监控 + 推理速度 TPS 折线图 |
+| 🔔 **模型更新追踪** | 自动关注本地已装的 ModelScope 模型系列 + 手动追踪，后台对比远端 `LastUpdatedTime`，有新版标黄提示 |
+| 📊 **性能监控** | 主控制页内嵌 CPU/内存/NVIDIA GPU 实时监控 + 推理速度 t/s（历史采样落盘 `data/history/`，保留 7 天） |
 | 💬 **聊天界面** | 服务器就绪后一键在浏览器中打开 Web 聊天 UI |
 | 🤖 **AI 聊天后端** | 支持多角色对话、长期记忆、定时任务调度的 HTTP 桥服务 |
 | 🔄 **版本检查** | 检查 llama.cpp 和本应用的最新 GitHub 版本 |
@@ -24,11 +25,11 @@
 
 | 类别 | 参数 |
 |------|------|
-| 通用 | `--gpu-layers` GPU 层数、`--port` 端口、`--ctx-size` 上下文大小、`--alias` 别名、`--host` 监听方式（仅本机/所有接口/Tailscale 专用） |
+| 通用 | `--gpu-layers` GPU 层数、`--port` 端口、`--ctx-size` 上下文大小（挡位下拉：按模型 GGUF 元数据上限生成 8K~1M 挡位，上限<128K 默认取模型最大值、≥128K 默认 128K，可手填任意值）、`--alias` 别名、`--host` 监听方式（仅本机/所有接口/Tailscale 专用） |
 | 模型 | `--mmproj` 视觉模型、`--reasoning off` 关闭思考、`--main-gpu` 主 GPU、`-ts` 多卡负载 |
 | MTP | `--spec-type` 预测类型、`--spec-draft-n-max` 草稿长度 |
 | 量化 | `--cache-type-k`、`--cache-type-v` KV 缓存量化 |
-| MOE | `--n-cpu-moe` CPU 线程、`--mmap` 内存映射、`--no-mmap-fallback` 禁用回退 |
+| MOE | `--n-cpu-moe` CPU 线程、`--no-mmap-fallback` 禁用回退 |
 
 ## 快速开始
 
@@ -52,12 +53,12 @@ pyinstaller -D -w --name='Lammacpp启动器' --add-data "ui/chat_webui;data/webu
 
 ## 首次使用
 
-1. **配置路径** — 在主控制页选择 `llama-server.exe` 和 `.gguf` 模型文件
-2. **创建脚本** — 点击"新建"，勾选参数，自动生成 `.bat` 启动脚本
-3. **启动服务** — 选中脚本点击"运行"，在日志窗口查看输出
+1. **配置路径** — 在主控制页选择 `llama-server.exe` 和模型目录（自动扫描 `.gguf`）
+2. **选模型即生成脚本** — 选中模型自动生成基础参数（脚本绑定模型，无独立脚本名；模型别名=模型文件名自动生成），在常用参数表单微调，点"保存"绑定；ctx 上下文自动按模型上限选好默认挡位（可下拉换挡或手填）；高级参数（并发/MTP/MOE）在表单底部"高级参数"区可展开调整
+3. **启动服务** — 点"运行"（运行当前模型绑定的脚本），在日志窗口查看输出
 4. **聊天** — 服务就绪后点击"聊天窗口"在浏览器中打开 Web UI
 5. **搜索模型** — 切换到"模型搜索与下载"标签页，选择 ModelScope 或 Hugging Face 镜像搜索模型
-6. **监控** — 切换到"性能监控"标签页查看 CPU/GPU/TPS
+6. **监控** — 主控制页右下角已内置压缩版 CPU/GPU/TPS 监控（与日志并排）
 
 ## 数据文件
 
@@ -70,6 +71,7 @@ pyinstaller -D -w --name='Lammacpp启动器' --add-data "ui/chat_webui;data/webu
 | `data/downloads/queue.json` | 下载队列状态 |
 | `data/chat/` | 聊天数据（对话、角色、记忆、定时任务） |
 | `data/last_pid.pid` | 旧版本运行中服务器进程 ID（多服务器架构下仅回退用途） |
+| `data/history/` | t/s 推理速度历史采样（按天 JSONL，保留 7 天） |
 | `data/app.lock` | 单实例锁（防止多个 GUI 并发运行） |
 | `data/webui/` | 聊天前端静态文件 |
 | `data/llamacpp/` | llama.cpp 版本管理默认根目录：`{tag}-{variant}/` 每版本一目录（可配置到其他盘），`zips/` 为下载缓存（断点续传） |
@@ -87,18 +89,19 @@ main.py
 │   ├── tailscale.py        Tailscale IP 检测（外网接入）
 │   ├── llamacpp_update_service.py  llama.cpp 版本管理（检测/下载/安装/切换）
 │   ├── modelscope.py       ModelScope API 客户端
+│   ├── watchlist_service.py 模型更新追踪关注列表（含 ignored 持久化）
 │   ├── download_service.py 下载管理器
 │   └── monitor_service.py  系统资源采样
 ├── chat/                   独立聊天后端子系统
 ├── ui/                     界面层
 │   ├── app.py              主窗口
 │   ├── model_tab.py        模型搜索与下载标签页
-│   ├── monitor_tab.py      性能监控标签页
+│   ├── monitor_tab.py      压缩版系统监控 CompactMonitor（内嵌主控制页）
 │   ├── update_tab.py       llama.cpp 版本管理标签页
 │   ├── dialogs/            对话框
-│   └── workers/            后台工作线程（日志/状态轮询/搜索/版本检查/版本安装）
+│   └── workers/            后台工作线程（日志/状态轮询/搜索/版本安装/更新追踪/Tailscale 探测/清理规划/进程清理）
 ├── tests/                  冒烟测试（unittest，offscreen 可跑）
-└── utils/                  通用工具（logger, validator, atomic_io, path_utils）
+└── utils/                  通用工具（logger, validator, atomic_io, path_utils, semver）
 ```
 
 ## 路径规范（关键设计决策）
@@ -109,9 +112,9 @@ main.py
 - 统一在**写入点**收口：配置 setter、脚本生成（script_builder）、版本切换
   （replace_bat_dir）均过 `utils/path_utils.normalize_path()`；
   `os.path.join` 等产物（Windows 下产 `\`）在进入存储前必须规范化。
-- 脚本名与 .bat 文件名可能不同：`ScriptEntry.sanitize_filename()` 会把空格/
-  特殊字符转为下划线，凡"按脚本名定位文件"必须经 sanitize 后的真实文件名
-  （详见 traps #17）。
+- 脚本绑定模型：`ScriptEntry.derive_name(model_path)` 由模型路径推导脚本名（文件名 + 路径短 hash，
+  跨目录同名不冲突）；`script_service.get_script_for_model` 按归一化模型路径查找。凡"按脚本定位文件"须经
+  `ScriptEntry.derive_name` / `sanitize_filename` 后的真实文件名（详见 traps #17）。
 
 ## 测试
 
@@ -123,7 +126,7 @@ main.py
 
 - Windows 10/11
 - Python 3.10+
-- 依赖：PyQt6, psutil, nvidia-ml-py, PyQt6-Charts
+- 依赖：PyQt6, psutil, nvidia-ml-py, Pillow
 
 ## 许可证
 

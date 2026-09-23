@@ -112,7 +112,9 @@ class MonitorService(QObject):
     def stop(self):
         self._timer.stop()
         self._metrics_stop.set()
-        self._metrics_thread.join(timeout=2)
+        # metrics 线程为 daemon，进程退出即回收；无需等满 2s，缩短为 0.2s 兜底
+        # （防止退出/重启时 GUI 阻塞，拖慢整体关闭）
+        self._metrics_thread.join(timeout=0.2)
 
     def is_gpu_available(self):
         return self._gpu_available
@@ -294,85 +296,6 @@ class MonitorService(QObject):
                         os.remove(os.path.join(HISTORY_DIR, fn))
         except OSError as e:
             error(f"t/s 历史清理失败: {e}")
-
-    def load_history(self, seconds):
-        """读取最近 seconds 秒的 t/s 历史，返回 [{ts, server, tps}]（时间升序）。
-
-        按天文件组织：从 cutoff 所在天到今天逐文件读取（1h 视图只读 1 个文件，
-        7d 视图最多 8 个），跳过损坏行。
-
-        降采样（性能 #3）：7d 视图点数巨大（约 12 万行/服务），UI 线程全量
-        解析+绘点会卡顿，长范围按时间桶聚合——
-        ≤1h 不降采样；1h<范围≤24h 用 60s 桶；>24h 用 300s 桶。
-        桶内 tps 取样本平均值，ts 取桶起点（bucket * bucket_seconds）。
-        """
-        if seconds <= 3600:
-            bucket_seconds = 0  # 1 小时视图不降采样（~720 点/服务，可接受）
-        elif seconds <= 86400:
-            bucket_seconds = 60
-        else:
-            bucket_seconds = 300
-        now = datetime.now()
-        today = now.strftime("%Y%m%d")
-        start_day = (now - timedelta(seconds=seconds)).strftime("%Y%m%d")
-        cutoff_ts = time.time() - seconds
-        out = []
-        day = start_day
-        while day <= today:
-            path = os.path.join(HISTORY_DIR, f"{HISTORY_FILE_PREFIX}{day}.jsonl")
-            if os.path.exists(path):
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                d = json.loads(line)
-                            except ValueError:
-                                continue
-                            ts = d.get("ts")
-                            tps = d.get("tps")
-                            if (
-                                isinstance(ts, (int, float))
-                                and isinstance(tps, (int, float))
-                                and ts >= cutoff_ts
-                            ):
-                                out.append({
-                                    "ts": ts,
-                                    "server": d.get("server", ""),
-                                    "tps": tps,
-                                })
-                except OSError:
-                    pass
-            day = (
-                datetime.strptime(day, "%Y%m%d") + timedelta(days=1)
-            ).strftime("%Y%m%d")
-        if bucket_seconds:
-            out = self._downsample_history(out, bucket_seconds)
-        out.sort(key=lambda d: d["ts"])
-        return out
-
-    @staticmethod
-    def _downsample_history(points, bucket_seconds):
-        """按 (server, 时间桶) 降采样：每桶保留一个点（ts=桶起点，tps=桶内均值）。
-
-        桶规则：bucket = int(ts) // bucket_seconds；点数从"每 5s 一个采样"
-        降为"每桶一个"，7d 视图约减少 30~150 倍。
-        """
-        buckets = {}  # (server, bucket) -> [tps 累计, 样本数]
-        for p in points:
-            key = (p["server"], int(p["ts"]) // bucket_seconds)
-            acc = buckets.get(key)
-            if acc is None:
-                buckets[key] = [p["tps"], 1]
-            else:
-                acc[0] += p["tps"]
-                acc[1] += 1
-        return [
-            {"ts": bucket * bucket_seconds, "server": server, "tps": total / count}
-            for (server, bucket), (total, count) in buckets.items()
-        ]
 
     def _get_all_gpu_stats(self):
         if not self._gpu_available:

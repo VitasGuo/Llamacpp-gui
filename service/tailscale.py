@@ -11,6 +11,8 @@ import time
 
 import psutil
 
+from config.config import Settings
+
 # 禁止弹出命令行窗口（项目硬性约定）
 NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
 
@@ -49,14 +51,22 @@ def _run_tailscale(exe: str):
 
 
 def get_tailscale_ipv4() -> str:
-    """返回本机 Tailscale IPv4；未安装/未连接/异常时返回空串。
+    """返回本机 Tailscale IPv4；未安装/未连接/异常且无手动指定时返回空串。
 
-    结果缓存 60s（探测含 subprocess，不应在 GUI 高频路径上反复执行）。
+    优先使用用户手动指定的 Settings.tailscale_ip（可覆盖自动检测、当自动检测失败时兜底）；
+    否则自动检测。自动检测结果缓存 60s。
     探测顺序：
     1. PATH 中的 `tailscale` 命令
     2. 已知安装路径 C:\\Program Files\\Tailscale\\tailscale.exe
     3. 枚举网卡，匹配 100.64.0.0/10 段的 IPv4（psutil 兜底）
     """
+    override = getattr(Settings.get_instance(), "tailscale_ip", "") or ""
+    if override and is_tailscale_ip(override):
+        return override
+    return _detect_cached()
+
+
+def _detect_cached():
     global _cached_ip, _cached_at
     now = time.monotonic()
     if now - _cached_at < _CACHE_TTL:

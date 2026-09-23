@@ -501,3 +501,217 @@ GitHub 直连超时又回退旧缓存，导致长期"有新版本却不下载"�
 
 ***
 
+## #21 表单回填 set_preset 只填值不勾开关，加载已存脚本"似读了但没用上"
+**现象**：v1.15.0 脚本绑定模型后，选中已有绑定脚本的模型时表单看起来有值，
+但某参数开关仍是灰的，保存/运行后参数丢失（等于没加载成功）。
+
+**根因**：`ui/script_form_widget.py` 的 `set_preset` 原先只对 config 里出现
+的 key 填值，但**不动 QCheckBox 勾选态**；而 `get_config` 只收集"被勾选"的
+参数。于是"值填进去了、开关没勾"→ 保存时该参数被跳过，表单事实源与磁盘
+脚本不一致（旧版靠"表单为事实源"兜底掩盖了，绑定模型后加载成为常态才暴露）。
+
+**解决方案**（v1.15.0）：
+- 改 `set_preset`：凡 config 中出现的 key 且值非空（非 None/"" /"off"），
+  同时置起对应 `checkboxes[key].setChecked(True)`。这样 parse 回填 与
+  auto_generate_config 自动生成 都能如实反映"该参数已启用"。
+
+**教训**：表格/表单组件的"回填"必须同步值和使能状态，二者缺一不可。凡是
+收集时过滤的维度（这里是勾选态），回填时就一定要还原它。
+
+***
+
+## #22 托盘"重启"误报"已再运行"：单实例锁重试窗口太短
+**现象**：托盘/版本管理页点"重启"，新实例弹"LlamaCPP GUI 已在运行"，重启失败。
+
+**根因**：`_restart_app` 用 `subprocess.Popen` 立即拉起新实例后才 `close()` 旧实例。
+新实例 `main()` 抢 `app.lock` 时旧实例尚未退出（停 StatusPoller wait300 +
+LogWorker wait300 + bridge shutdown + monitor stop，累计耗时波动），而锁重试窗口仅
+10×0.15s=1.5s，不够旧实例释放锁，误判单实例占用。
+
+**解决方案**（v1.15.0，最终）：
+- `_restart_app` 给子进程设环境变量 `LLAMACPP_RESTARTING=1` 再 Popen；
+- `main()` **对重启实例直接跳过单实例锁**（`if os.environ.get("LLAMACPP_RESTARTING") != "1":`）——
+  重启是用户显式意图，不应被锁拦；普通首次启动仍受单实例保护，重复启动走短暂重试后提示。
+  （初版方案"重启用 40×0.25s 长重试等旧实例释放锁"在残留/僵尸实例占锁时仍会误拦，
+  故改为彻底跳过。）
+
+**教训**："重启=启动新的+退出旧的"流程中，新实例先于旧实例启动，天然存在竞争窗口；
+把锁重试拉长只是缓解，最可靠的是**重启路径不走单实例锁**（区分重启与普通启动）。
+
+**二次优化**（同 v1.15.0）——重启"能成但慢"：旧实例 `closeEvent` 里 `bridge.shutdown()`
+阻塞 ~0.5s（HTTPServer serve_forever poll 周期）+ `monitor.stop()` join(2s)，
+把退出拖慢，新实例因此多等。修改：
+- 桥 shutdown 改到 `threading.Thread(daemon)` 触发，不阻塞 GUI（daemon serve_forever
+  进程退出时由 OS 回收并释放端口，新实例在旧进程退完后重新绑定，无重叠）；
+- `monitor_service.MonitorService.stop()` 的 metrics join 由 2s 降为 0.2s
+  （metrics 线程是 daemon，进程退出即回收）。
+- 注意：StatusPoller/LogWorker 的 QThread `wait` 是防"运行中被销毁崩溃"的，
+  不能为提速削太狠。
+
+***
+
+## #23 HTTP 服务 shutdown() 会阻塞等 poll 周期（~0.5s）
+**现象**：退出/重启 GUI 时点"关闭"要卡约半秒才消失。
+**根因**：`http.server.HTTPServer.shutdown()` 会阻塞直到 `serve_forever` 的 poll 周期
+结束（默认约 0.5s）；桥服务（`chat/server.py` 用 `serve_forever` daemon 线程）在
+`MainWindow.closeEvent` 里被同步调用，卡住 GUI。
+**解决方案**：把 `_bridge_server.shutdown()` 放到后台 daemon 线程里触发，不阻塞；
+进程退出时 daemon serve_forever 被回收、OS 关闭 socket 释放端口，新实例在旧进程
+退出后再绑定，无 SO_REUSEADDR 重叠问题。
+**教训**：凡是"阻塞等待某个 poll/轮询周期"的优雅关闭，都不该占住 UI 线程；
+daemon 线程 + 进程退出时由 OS 回收资源的场景，可安全地转为后台触发。
+
+***
+
+## #24 切换模型后表单残留上一模型的参数，污染新模型脚本
+
+**现象**：从已绑定脚本的模型 A（勾了 MTP/KV 量化等参数）切到无绑定脚本的模型 B
+后，B 的表单里仍勾着 A 的参数；直接保存则 B 的脚本带上 A 的配置（小模型被塞
+大 ctx、量化错配等），运行行为异常但无任何报错。
+**根因**：`ui/script_form_widget.py` 的 `set_preset(config)` 只回填 config 里出现的
+字段，未覆盖的字段保持上一个模型的现场；`auto_generate_config` 只产出基础参数，
+高级参数不上报 → 残留并随保存固化进 .bat。
+**解决方案**：`set_preset` 先调 `_reset_to_defaults()`（按 script_builder.CATEGORIES
+出厂默认整体重置勾选与值）再回填 config。
+**教训**："增量回填"型 setter 必须先整体复位，否则上一次调用的现场就是本次的
+隐性输入；表单是事实源的架构里，这类污染直接写进持久化脚本。
+
+***
+
+## #25 chat handler 层组合式读-改-写不加锁，并发更新互相覆盖（traps #20 延伸）
+
+**现象**：定时任务写对话的同时用户在 Web UI 改标题/增删任务，偶发"刚保存的任务
+消失"或"标题被改回旧值"。
+**根因**：`chat/handlers.py` 4 处端点（POST tasks、PUT tasks/{tid}、PUT
+conversations/{cid}、DELETE tasks/{tid}）各自"读 JSON → 改 → 写回"。traps #20 只
+把 repository 单次写串行化了，handler 层跨函数的组合 RMW 仍可交错，后写覆盖先写。
+**解决方案**：整个读-改-写段包 `chat/repository.CONV_LOCK`（RLock），响应构造放
+锁外；锁内以重读的最新数据为准。
+**教训**：锁的粒度必须覆盖完整业务事务（读+算+写），只锁"写"锁不住"读到的
+已是旧值"的竞态。
+
+***
+
+## #26 chat.js 并发回复错位 + 轮询覆盖发送中的消息
+
+**现象**：@ 两个角色的消息发出后偶发只回一条、或回复内容写进另一个角色的气泡；
+流式生成中切对话再切回，正在生成的回复被消息列表整体刷掉。
+**根因**：非流式分支 push 后用 `state.messages[state.messages.length - 1]` 定位，
+两个并发请求都 push 后各自取到的"-1"是同一条；`pollConversation` 无条件用轮询
+结果整体替换 `state.messages`，覆盖发送中的本地状态。
+**解决方案**：push 前记 `const msgIdx = state.messages.length`，按下标定位更新；
+`pollConversation` 开头加 `if (state.isSending) return` 守卫。
+**教训**：任何"先 append 再定位更新"的前端代码，并发下禁止用 length-1 定位，
+必须在 append 前记下标；后台轮询回写列表前必须避开本地进行中的修改窗口。
+
+***
+
+## #27 "清理旧版本"会规划删除运行中服务所在的版本目录
+
+**现象**：某版本 llama-server 正在运行时点"清理旧版本"，确认后该版本的 exe
+目录被删；进程虽未死但文件已消失，下次重启服务直接失败。
+**根因**：`llamacpp_update_service.plan_version_cleanup` 只排除"当前配置使用中的
+exe"，不知道 pids.json 里其他脚本还运行着别的版本目录。
+**解决方案**：UI 侧收集运行中目录（pids.json runtime + 脚本 `cd /d "..."` 正则提取）
+传入 `plan_version_cleanup(running_dirs=...)`，运行中目录恒保留。
+**教训**：磁盘清理类规划必须以"进程真相"（pids.json + .bat 里的工作目录）为输入，
+"当前配置路径"只是其中一个消费者。
+
+***
+
+## #28 循环内 lambda 捕获循环变量 / 行号快照，点击时已漂移
+
+**现象**：搜索结果里点某一行的"追踪"按钮，刷新的是最后一行的按钮状态；下载
+队列先删一行再点另一行的"移除"，删除的是错误的行（或 KeyError）。
+**根因**：Python 闭包晚绑定——`lambda: self._watch_model(mid, watch_btn)` 里
+`mid/watch_btn` 是循环变量的引用，点击时循环早已跑完；队列移除按钮捕获创建时的
+行号 `row`，期间有行删除后行号整体上移。
+**解决方案**：默认参数绑定捕获当前值（`lambda _, e=entry: ...`、
+`lambda checked, x=mid, b=watch_btn: ...`）；行号不快照，点击时按 UserRole 存的
+`(source, file_path)` 现查 `indexOf` 再 removeRow。
+**教训**：Qt 表格/列表里给动态行装回调，一律"默认参数绑定值 + 键现查行号"，
+绝不信创建时刻的行号或循环变量。
+
+***
+
+## #29 定时任务引用的对话/任务/角色被删后，调度线程每秒空转扫描
+
+**现象**：删除对话或其中的任务后，日志每秒刷"对话不存在"/"任务不存在"；
+删除角色后任务永不执行也不报错，且 next_run_time 不推进导致每轮重试。
+**根因**：`chat/scheduler.py` 的 not-found 分支只打日志并 return，不重建索引
+（task_index 里仍是已删条目）→ 每轮调度都 miss、每轮全量扫描；agent 缺失分支
+同样空转。
+**解决方案**：conv/task not-found → `rebuild_task_index()` 后 return（索引自愈）；
+agent not-found → `_record_task_error()` 记录错误并推进 next_run_time（防空转）。
+**教训**：调度器对"引用的实体已消失"必须有自愈路径（重建索引/推进时间/禁用），
+只 log 不动状态 = 死循环刷屏。
+
+***
+
+## #30 parse_bat_params 解析不了带引号的含空格值，短 flag 还会误匹配
+
+**现象**：`--host` 等值含空格时（.bat 里以双引号包裹）表单回填为空/截断；
+反向解析出的参数与 .bat 实际值不一致，保存后静默改写脚本。
+**根因**：值匹配正则 `\S+` 不吞引号内的空格；短 flag（如 `-m`）无词边界，
+会命中 `-mmproj` 等更长 flag 的前缀。
+**解决方案**：`service/script_builder.parse_bat_params` 值正则改为
+`("[^"]*"|\S+)` 并给 flag 加 `(?<![\w-])` 前置词边界。
+**教训**：反向解析生成物（.bat → 表单）必须与生成器（表单 → .bat）的引号规则
+对称，否则 roundtrip 会静默丢数据。
+
+***
+
+## #31 GUI 线程阻塞五连：tailscale 探测 / 全量清理 / 本地模型扫描 / 图片迁移 / 清理规划
+
+**现象**：切换模型或服务就绪偶发界面冻结数秒（tailscale 缓存过期）；点"清理全部
+llama 进程"到日志出现之间界面无响应（多实例时更久）；切到"模型更新追踪"标签
+卡顿（模型库大时秒级）；启动 GUI 后头几秒操作发滞；旧版本多时"清理旧版本"
+统计阶段卡 GUI。
+**根因**（traps #5/#11 的变体，这次藏在更冷门的路径里）：
+`_update_external_url` → `get_tailscale_ipv4()` 缓存 60s 过期后在 GUI 线程同步跑
+tailscale 子进程（timeout 3s × 2 候选）；`_cleanup_all_processes` 在 GUI 线程循环
+tasklist+taskkill；`merge_local_models` 全盘 os.walk 在 GUI 线程（且
+model_watch_tab 曾残留旧同步 `refresh()` 覆盖了后台版）；`migrate_conversation_images`
+启动时同步扫全部对话；版本清理的规划/大小统计在 GUI 线程。
+**解决方案**：全部挪后台 QThread——`TailscaleProbeWorker`（GUI 侧 60s 缓存只读、
+探测异步回传）、`KillAllLlamaWorker`、`WatchMergeWorker`、`CleanupPlanWorker`/
+`CleanupExecWorker`（两阶段拆分便于插确认框）、图片迁移改 daemon Thread；
+另删掉了 model_watch_tab 里覆盖新实现的旧 `refresh()` 重复定义（见 #32）。
+**教训**："GUI 线程禁阻塞"要审所有调用链：缓存过期后的重算、确认框前后的
+统计/执行、tab 切换触发的全量扫描、启动时的数据迁移——都是阻塞回潮的高发点。
+
+***
+
+## #32 类体里重复定义同名方法，后者静默覆盖前者
+
+**现象**：把 `model_watch_tab.refresh()` 改造成后台 merge 后，切 tab 依旧卡顿，
+后台化"没生效"；代码里两处 `def refresh` 相距 40 行，肉眼 review 极易漏。
+**根因**：改造时新增了新版 `refresh()`（调 `_request_merge`），旧的同步
+`refresh()`（直接 `merge_local_models`）残留在 `_build_ui` 之后——Python 类体
+顺序执行，后定义覆盖前定义，旧实现静默生效。
+**解决方案**：删除重复定义；同名方法改造后全文 grep `def <方法名>` 确认唯一。
+**教训**：在大方法块中间插入新版实现时，必须确认旧版被完全移除；
+`grep -n "def name"` 是收尾必做动作。
+
+***
+
+## #33 QComboBox.setEditable 后手填值不改变 currentIndex/currentData
+
+**现象**：ctx-size 改为"挡位下拉 + 可手填"后，用户手填 50000 保存，.bat 里
+写出的却是之前选中的挡位值（如 32768）——所见非所得。
+
+**根因**：可编辑 QComboBox 的 `setEditText()`/用户键入只改编辑框文本，
+**不更新 currentIndex**：currentData 仍停留在上一个候选项上。表单读取逻辑
+`get_config` 对所有 QComboBox 统一用 `currentData()`，手填值被静默丢弃。
+
+**解决方案**：`ui/script_form_widget.py` 的 `get_config` 对 `isEditable()`
+的下拉改读 `currentText()`（挡位显示文本 "128K (131072)" 用正则取括号内
+数字，手填纯数字原样返回）；回填 `set_preset` 对不在挡位里的值走
+`setEditText()` 而非只 findData。另配 `NoInsert` 防手填值混进候选项。
+
+**教训**：可编辑下拉的"值"有两套（item data vs 编辑框文本），读哪套要看
+交互形态：允许手填就必须以 currentText 为准；挡位文案与存储值不一致时
+（"128K" vs "131072"）要在读写两侧做同一套转换。
+
+***
+

@@ -78,8 +78,11 @@ def start_bridge(llm_url_provider=None):
     os.makedirs(CHAT_DIR, exist_ok=True)
     migrate_agents()
     migrate_convs()
-    migrate_conversation_images()
     rebuild_task_index()
+
+    # 图片压缩迁移（逐张 PIL 解码，历史图片多时慢）挪后台线程，
+    # 不阻塞 GUI 启动；函数内部逐对话包 CONV_LOCK 与 handler 串行化
+    threading.Thread(target=migrate_conversation_images, daemon=True).start()
 
     port = None
     server = None

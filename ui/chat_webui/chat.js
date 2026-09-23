@@ -9,7 +9,8 @@ const state = {
   agents: [],
   streaming: true,
   isSending: false,
-  abortController: null,
+  abortController: null,       // 最近一次请求的控制器（兼容引用）
+  abortControllers: new Set(), // 全部在途请求的控制器：@多角色并发时停止要全断（含非流式）
   reasoningDisplay: 'collapsed',
   pendingImages: [],
   connOk: false,
@@ -446,11 +447,21 @@ async function renameConversation(id) {
 }
 
 async function saveConversation(id, messages) {
-  await api('PUT', `conversations/${id}`, { messages, agents: state.conversationAgents, background: state.conversationBackground });
+  // 落盘失败不能静默：消息可能实际未保存而用户不知情（刷新即丢）。
+  // 至少在控制台留痕并避免 unhandled rejection 中断调用链
+  try {
+    await api('PUT', `conversations/${id}`, { messages, agents: state.conversationAgents, background: state.conversationBackground });
+  } catch (err) {
+    console.error('保存对话失败:', err);
+  }
 }
 
 async function saveConversationAgents(id) {
-  await api('PUT', `conversations/${id}`, { agents: state.conversationAgents });
+  try {
+    await api('PUT', `conversations/${id}`, { agents: state.conversationAgents });
+  } catch (err) {
+    console.error('保存对话成员失败:', err);
+  }
 }
 
 /* ===== LLM API - @mention + Parallel ===== */
@@ -535,20 +546,27 @@ async function sendMessage() {
       renderMessages(true);
       scrollToBottom();
     } else {
+      // 与流式分支一致：push 前记录索引。@多角色并发时用 messages[length-1]
+      // 定位会因完成顺序不定而把结果写进别人的消息
+      const msgIdx = state.messages.length;
       state.messages.push(assistantMsg);
       renderMessages(true);
 
       try {
         const result = await nonStreamChat(baseUrl, messages, agent);
-        const last = state.messages[state.messages.length - 1];
-        last.content = result.content || '';
-        last.reasoning_content = result.reasoning_content || '';
-        last.elapsed = (Date.now() - last.started_at) / 1000;
+        const msg = state.messages[msgIdx];
+        if (!msg) throw new Error('message replaced');
+        msg.content = result.content || '';
+        msg.reasoning_content = result.reasoning_content || '';
+        msg.elapsed = (Date.now() - msg.started_at) / 1000;
         renderMessages(true);
         scrollToBottom();
       } catch (err) {
-        state.messages[state.messages.length - 1].elapsed = (Date.now() - state.messages[state.messages.length - 1].started_at) / 1000;
-        state.messages[state.messages.length - 1].content = `[错误] ${err.message}`;
+        const msg = state.messages[msgIdx];
+        if (msg) {
+          msg.elapsed = (Date.now() - msg.started_at) / 1000;
+          msg.content = err.name === 'AbortError' ? (msg.content + '\n[已停止]') : `[错误] ${err.message}`;
+        }
         renderMessages(true);
         scrollToBottom();
       }
@@ -630,66 +648,89 @@ function buildRequestBody(messages, agent, streaming) {
   return body;
 }
 
+// 把在途请求的 controller 纳入停止管理：abort 或请求结束（成功/失败/异常）后自动移出
+function trackAbort(controller) {
+  state.abortControllers.add(controller);
+  controller.signal.addEventListener('abort', () => state.abortControllers.delete(controller));
+  return controller;
+}
+
 async function streamChat(baseUrl, messages, agent, onDelta) {
-  state.abortController = new AbortController();
+  const controller = trackAbort(new AbortController());
+  state.abortController = controller;
   const body = buildRequestBody(messages, agent, true);
 
-  const res = await fetch(baseUrl + '/v1/chat/completions', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body), signal: state.abortController.signal,
-  });
+  try {
+    const res = await fetch(baseUrl + '/v1/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body), signal: controller.signal,
+    });
 
-  if (!res.ok) {
-    let msg = `HTTP ${res.status}`;
-    try { const j = await res.json(); msg = j.error?.message || msg; } catch {}
-    throw new Error(msg);
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t || t === 'data: [DONE]' || !t.startsWith('data: ')) continue;
-      try {
-        const json = JSON.parse(t.slice(6));
-        const choice = json.choices && json.choices[0];
-        if (!choice) continue;
-        const delta = choice.delta || {};
-        onDelta({ content: delta.content || '', reasoning_content: delta.reasoning_content || '' });
-        if (choice.finish_reason === 'length') onDelta({ content: '\n[达到长度限制]' });
-      } catch {}
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try { const j = await res.json(); msg = j.error?.message || msg; } catch {}
+      throw new Error(msg);
     }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t || t === 'data: [DONE]' || !t.startsWith('data: ')) continue;
+        try {
+          const json = JSON.parse(t.slice(6));
+          const choice = json.choices && json.choices[0];
+          if (!choice) continue;
+          const delta = choice.delta || {};
+          onDelta({ content: delta.content || '', reasoning_content: delta.reasoning_content || '' });
+          if (choice.finish_reason === 'length') onDelta({ content: '\n[达到长度限制]' });
+        } catch {}
+      }
+    }
+  } finally {
+    state.abortControllers.delete(controller);
+    if (state.abortController === controller) state.abortController = null;
   }
-  state.abortController = null;
 }
 
 async function nonStreamChat(baseUrl, messages, agent) {
   const body = buildRequestBody(messages, agent, false);
-  const res = await fetch(baseUrl + '/v1/chat/completions', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    let msg = `HTTP ${res.status}`;
-    try { const j = await res.json(); msg = j.error?.message || msg; } catch {}
-    throw new Error(msg);
+  const controller = trackAbort(new AbortController());
+  state.abortController = controller;
+  try {
+    const res = await fetch(baseUrl + '/v1/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try { const j = await res.json(); msg = j.error?.message || msg; } catch {}
+      throw new Error(msg);
+    }
+    const json = await res.json();
+    const choice = json.choices && json.choices[0];
+    if (!choice) throw new Error('no response');
+    const msg = choice.message || {};
+    return { content: msg.content || '', reasoning_content: msg.reasoning_content || '' };
+  } finally {
+    state.abortControllers.delete(controller);
+    if (state.abortController === controller) state.abortController = null;
   }
-  const json = await res.json();
-  const choice = json.choices && json.choices[0];
-  if (!choice) throw new Error('no response');
-  const msg = choice.message || {};
-  return { content: msg.content || '', reasoning_content: msg.reasoning_content || '' };
 }
 
 function stopGeneration() {
-  if (state.abortController) { state.abortController.abort(); state.abortController = null; }
+  // 多角色并发（含非流式）时逐个 abort；单个请求场景行为不变
+  for (const c of state.abortControllers) c.abort();
+  state.abortControllers.clear();
+  state.abortController = null;
 }
 
 /* ===== Edit Message ===== */
@@ -1185,7 +1226,9 @@ function getAvatarHtml(agent, size, opts) {
     const r = round ? '50%' : radius;
     return `<img class="avatar" src="${escapeHtml(avatar)}" style="width:${dims[sz]}px;height:${dims[sz]}px;border-radius:${r};object-fit:cover" alt="">`;
   }
-  return `<div class="avatar-emoji" style="width:${dims[sz]}px;height:${dims[sz]}px;font-size:${fs[sz]}px;border-radius:${radius}">${avatar}</div>`;
+  // emoji 分支也过 escapeHtml：当前来源虽受控（emoji 选择器），数据文件
+  // 一旦被外部写入即成注入点，渲染层统一消毒不信任存量
+  return `<div class="avatar-emoji" style="width:${dims[sz]}px;height:${dims[sz]}px;font-size:${fs[sz]}px;border-radius:${radius}">${escapeHtml(avatar)}</div>`;
 }
 
 function getDefaultAvatarHtml(name, size) {
@@ -1333,6 +1376,9 @@ function scrollToBottom() {
 async function pollConversation() {
   if (!state.currentConvId) return;
   if (!state.tasks.some(t => t.enabled)) return;
+  // 生成中不轮询：全量替换 state.messages 会让流式回调的 msgIdx 指向
+  // 错位元素（内容丢失/TypeError），发送完成后的下一轮再同步任务结果
+  if (state.isSending) return;
   try {
     // 先拉轻量 meta（不含消息体），有更新再拉完整对话，避免每 5s 拉取数 MB base64 图片
     const meta = await api('GET', `conversations/${state.currentConvId}/meta`);

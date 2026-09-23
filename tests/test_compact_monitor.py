@@ -23,9 +23,13 @@ class _StubService(QObject):
     def __init__(self, gpu=False):
         super().__init__()
         self.gpu = gpu
+        self.recorded_tps = []  # update_tps 历史落盘通道的采样记录
 
     def is_gpu_available(self):
         return self.gpu
+
+    def record_tps(self, name, tps):
+        self.recorded_tps.append((name, tps))
 
 
 def _metrics(cpu=0.0, ram=0.0, gpus=None, servers=None):
@@ -56,6 +60,8 @@ class TestCompactMonitor(unittest.TestCase):
         self.m.set_focus_script("m")
         self.m.update_tps("m", 5.5)
         self.assertIn("5.5", self.m._tps_label.text())
+        # 日志回退通道的采样点同步进历史落盘缓冲
+        self.assertEqual(self.service.recorded_tps, [("m", 5.5)])
 
     def test_focus_filter(self):
         """聚焦脚本优先：非聚焦服务的 t/s 不覆盖标签。"""
@@ -91,6 +97,13 @@ class TestCompactMonitor(unittest.TestCase):
         self.m.on_server_started("m")
         self.assertIn("运行中", self.m._status_label.text())
         self.m.on_server_stopped("m")
+        self.assertIn("未运行", self.m._status_label.text())
+
+    def test_on_all_servers_stopped(self):
+        """清理全部进程后的整体重置（恢复的服务无 LogWorker 代理停止信号）。"""
+        self.m.on_server_started("a")
+        self.m.on_server_started("b")
+        self.m.on_all_servers_stopped()
         self.assertIn("未运行", self.m._status_label.text())
 
 

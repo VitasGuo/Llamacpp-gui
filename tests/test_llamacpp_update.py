@@ -1,4 +1,5 @@
 """service.llamacpp_update_service 纯函数 + 安装流程测试（不碰网络/真实子进程）。"""
+import json
 import os
 import tempfile
 import unittest
@@ -421,6 +422,66 @@ def _make_zip(path, files):
     with zipfile.ZipFile(path, "w") as zf:
         for name, data in files.items():
             zf.writestr(name, data)
+
+
+def _install_version(root, tag, variant):
+    """构造模拟版本目录（meta + exe）供清理规则测试。"""
+    d = os.path.join(root, f"{tag}-{variant}")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, svc.META_FILENAME), "w", encoding="utf-8") as f:
+        json.dump({"tag": tag, "variant": variant,
+                   "installed_at": "2026-09-01T00:00:00"}, f)
+    open(os.path.join(d, "llama-server.exe"), "w").close()
+    return d
+
+
+class TestCleanup(unittest.TestCase):
+    """旧版本清理规则（保留当前 + 每变体系列最新 2 个）。"""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+
+    def test_each_variant_keeps_2_except_current(self):
+        # cuda-13.4 四个（含当前）、cuda-13.3 两个
+        cur = _install_version(self.tmp, "b11093", "cuda-13.4")
+        _install_version(self.tmp, "b11065", "cuda-13.4")
+        _install_version(self.tmp, "b11011", "cuda-13.4")
+        _install_version(self.tmp, "b11005", "cuda-13.4")
+        _install_version(self.tmp, "b10936", "cuda-13.3")
+        _install_version(self.tmp, "b10934", "cuda-13.3")
+        cur_exe = os.path.join(cur, "llama-server.exe")
+        del_items = svc.plan_version_cleanup(self.tmp, cur_exe, keep_series=2)
+        tags = {i["tag"] for i in del_items}
+        # 当前 b11093 恒保留；13.4 保留最新 2（b11065/b11011）→ 删 b11005；13.3 未超 → 全保留
+        self.assertEqual(tags, {"b11005"})
+
+    def test_keep_all_when_within_threshold(self):
+        _install_version(self.tmp, "b11093", "cuda-13.4")
+        _install_version(self.tmp, "b11065", "cuda-13.4")
+        _install_version(self.tmp, "b10936", "cuda-13.3")
+        del_items = svc.plan_version_cleanup(self.tmp, None, keep_series=2)
+        self.assertEqual(del_items, [])
+
+    def test_zip_cleanup_only_for_installed(self):
+        # 已装版本对应的 zip 可清；未装版本、cudart zip 保留
+        _install_version(self.tmp, "b10936", "cuda-13.3")
+        zips = os.path.join(self.tmp, "zips")
+        os.makedirs(zips, exist_ok=True)
+        installed_zip = os.path.join(zips, "llama-b10936-bin-win-cuda-13.3-x64.zip")
+        _make_zip(installed_zip, {"x": b"1"})
+        not_installed = os.path.join(zips, "llama-b99999-bin-win-cuda-13.3-x64.zip")
+        _make_zip(not_installed, {"x": b"2"})
+        cudart_zip = os.path.join(zips, "cudart-llama-bin-win-cuda-13.3-x64.zip")
+        _make_zip(cudart_zip, {"x": b"3"})
+        del_zips = [os.path.basename(z) for z in svc.plan_zip_cleanup(self.tmp)]
+        self.assertEqual(del_zips, ["llama-b10936-bin-win-cuda-13.3-x64.zip"])
+
+    def test_delete_version_dir_removes_and_returns_size(self):
+        d = _install_version(self.tmp, "b10936", "cuda-13.3")
+        size = svc.delete_version_dir(d)
+        self.assertGreater(size, 0)
+        self.assertFalse(os.path.exists(d))
 
 
 class TestInstallFromZip(unittest.TestCase):

@@ -12,8 +12,10 @@ from PyQt6.QtWidgets import QSystemTrayIcon
 
 from config.config import Settings
 from service import model_sources
+from service import watchlist_service
 from service.download_service import DownloadManager
 from ui.workers.search_worker import SearchWorker, FileListWorker
+from ui.workers.watch_worker import WatchCheckWorker
 
 
 def _format_size(size_bytes):
@@ -58,6 +60,7 @@ class ModelTab(QWidget):
         self._current_keyword = ""
         self._total_count = 0
         self._current_model_id = ""
+        self._watchlist = []          # 关注列表（watchlist_service 读入，供搜索结果追踪按钮判断）
         self._init_ui()
         self._connect_download_signals()
         self._restore_queue()
@@ -143,8 +146,8 @@ class ModelTab(QWidget):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self.result_table = QTableWidget(0, 5)
-        self.result_table.setHorizontalHeaderLabels(["模型ID", "参数/标签", "下载量", "更新日期", "操作"])
+        self.result_table = QTableWidget(0, 6)
+        self.result_table.setHorizontalHeaderLabels(["模型ID", "参数/标签", "下载量", "更新日期", "操作", "追踪"])
         self.result_table.horizontalHeader().setStretchLastSection(False)
         self.result_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.result_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
@@ -155,6 +158,8 @@ class ModelTab(QWidget):
         self.result_table.setColumnWidth(3, 100)
         self.result_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         self.result_table.setColumnWidth(4, 80)
+        self.result_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.result_table.setColumnWidth(5, 70)
         self.result_table.verticalHeader().setVisible(False)
         self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -230,11 +235,20 @@ class ModelTab(QWidget):
         layout.addWidget(w2)
         return page
 
+    def _watch_model(self, model_id, btn):
+        """搜索结果手动追踪一个模型（加入关注列表，供独立追踪页查看）。"""
+        watchlist_service.add_manual_model(model_id)
+        self._watchlist = watchlist_service.load_watchlist()
+        btn.setText("已追踪")
+        btn.setEnabled(False)
+
     def _do_search(self):
         keyword = self.search_input.text().strip()
         if not keyword:
             QMessageBox.warning(self, "提示", "请输入搜索关键词")
             return
+        # 刷新关注列表，使结果行"追踪"按钮反映独立追踪页的最新状态
+        self._watchlist = watchlist_service.load_watchlist()
         self._current_keyword = keyword
         self._current_page = 1
         self._load_search_page()
@@ -299,6 +313,14 @@ class ModelTab(QWidget):
             view_btn = QPushButton("查看文件")
             view_btn.clicked.connect(lambda checked, x=mid: self._show_file_list(x))
             self.result_table.setCellWidget(row, 4, view_btn)
+
+            tracked = any(w["model_id"] == mid for w in self._watchlist)
+            watch_btn = QPushButton("已追踪" if tracked else "追踪")
+            watch_btn.setEnabled(not tracked)
+            # watch_btn 必须用默认参数绑定：lambda 只捕获循环变量引用，
+            # 不绑定的话点任意行生效的都是最后一行的按钮
+            watch_btn.clicked.connect(lambda checked, x=mid, b=watch_btn: self._watch_model(x, b))
+            self.result_table.setCellWidget(row, 5, watch_btn)
 
         self.stack.setCurrentIndex(0)
 
@@ -512,7 +534,7 @@ class ModelTab(QWidget):
                 retry_btn.clicked.connect(lambda: self._retry_download(entry))
                 layout.addWidget(retry_btn)
             remove_btn = QPushButton("移除")
-            remove_btn.clicked.connect(lambda: self._remove_queue_row(row, entry))
+            remove_btn.clicked.connect(lambda _, e=entry: self._remove_download(e))
             layout.addWidget(remove_btn)
 
         self.queue_table.setCellWidget(row, 5, container)
@@ -602,8 +624,17 @@ class ModelTab(QWidget):
         if ok:
             self._add_queue_row(entry)
 
-    def _remove_queue_row(self, row, entry):
-        self.queue_table.removeRow(row)
+    def _remove_download(self, entry):
+        """移除下载条目：点击时按 UserRole 现查行号。
+
+        不能用按钮构建时的行号快照——删除任一行后其余按钮的行号全部漂移，
+        removeRow 会删错行/越界静默失败，UI 与队列数据错乱。
+        """
+        for row in range(self.queue_table.rowCount()):
+            item = self.queue_table.item(row, 1)
+            if item and item.data(Qt.ItemDataRole.UserRole) == (entry.source, entry.file_path):
+                self.queue_table.removeRow(row)
+                break
         self.download_manager.remove_download(entry)
 
     def _restore_queue(self):

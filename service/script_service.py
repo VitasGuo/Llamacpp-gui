@@ -5,6 +5,7 @@ from datetime import datetime
 
 from model.script import ScriptEntry
 from config import SCRIPTS_DIR, SCRIPTS_CONFIG
+from utils.path_utils import normalize_path
 from utils.atomic_io import atomic_write_json
 
 
@@ -28,6 +29,23 @@ class ScriptService:
             self._remove_config_entry(name)
             return True
         return False
+
+    def get_script_for_model(self, model_path):
+        """按模型路径查找已绑定的脚本（模型即脚本标识）。
+
+        归一化路径后比较（/ 与 \\ 视为同一、大小写不敏感——Windows 文件
+        系统不区分大小写，同一文件不同大小写选择应命中同一绑定）；
+        命中返回 ScriptEntry，未绑定返回 None。
+        """
+        if not model_path:
+            return None
+        norm = normalize_path(model_path).lower()
+        for entry in self.load_scripts():
+            if entry.model_path and normalize_path(entry.model_path).lower() == norm:
+                return entry
+            if entry.name == ScriptEntry.derive_name(model_path):
+                return entry  # 兜底：旧版无 model_path 字段的条目（.bat 里 -m 路径派生）
+        return None
 
     def load_scripts(self):
         """scripts.json 条目（.bat 仍存在的）+ 目录里的孤儿 .bat（不在 json 中）。

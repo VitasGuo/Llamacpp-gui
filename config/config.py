@@ -30,6 +30,15 @@ class Settings:
                 # 后续所有 .get 访问抛 TypeError（GUI 静默崩溃）
                 if isinstance(data, dict):
                     self.config.update(data)
+                    # 读侧归一：旧版本/手改配置可能存反斜杠路径，
+                    # 统一为正斜线规范形式（与 setter 写侧一致）
+                    for key in (
+                        "llamacpp_path", "model_path", "model_dir",
+                        "visual_model_path", "download_path", "llamacpp_install_root",
+                    ):
+                        if key in self.config:
+                            self.config[key] = normalize_path(
+                                self.config.get(key) or "")
             except (json.JSONDecodeError, IOError):
                 pass
 
@@ -127,6 +136,15 @@ class Settings:
     @host.setter
     def host(self, value):
         self.config["host"] = value
+
+    @property
+    def tailscale_ip(self):
+        """用户手动指定的 Tailscale 默认 IP（覆盖自动检测）；留空=自动检测。"""
+        return self.config.get("tailscale_ip", "")
+
+    @tailscale_ip.setter
+    def tailscale_ip(self, value):
+        self.config["tailscale_ip"] = (value or "").strip()
 
     @property
     def np(self):

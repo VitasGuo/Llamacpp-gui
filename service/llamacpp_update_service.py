@@ -3,8 +3,7 @@
 职责边界（AGENTS.md）：
 - 纯业务逻辑，不导入 PyQt6.QtWidgets；网络/子进程调用均设计为可后台线程执行
 - 版本化安装：{install_root}/{tag}-{variant}/ 每版本独立目录，切换 = 改配置 + 批量替换 .bat 路径
-- 缓存复用 data/update_cache.json（新 key "llamacpp_releases"，TTL 1 小时；
-  不触碰 update_workers.py 已有的 llamacpp/app 条目）
+- 缓存复用 data/update_cache.json（key "llamacpp_releases"，TTL 1 小时）
 """
 import hashlib
 import json
@@ -190,9 +189,9 @@ def _read_cache_file():
 
 def _write_cache_file(cache):
     try:
-        os.makedirs(os.path.dirname(UPDATE_CACHE_FILE) or ".", exist_ok=True)
-        with open(UPDATE_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
+        # 原子写：读改写共用同一文件（多入口并发时至少保证文件内容完整，
+        # 非原子 open("w") 会让并发读方读到截断的一半 JSON）
+        atomic_write_json(UPDATE_CACHE_FILE, cache)
     except OSError:
         pass  # 缓存写失败不影响主流程
 
@@ -670,6 +669,110 @@ def list_installed(dest_root):
     # 按 build 号排序（tag 字符串排序在跨位数时错乱：b9999 > b10615）
     result.sort(key=lambda r: tag_to_build(r.get("tag", "")), reverse=True)
     return result
+
+
+def dir_size(path):
+    """递归统计目录字节数；目录不存在或异常时返回 0（UI 预览释放空间用）。"""
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def plan_version_cleanup(dest_root, current_exe_path=None, keep_series=2, running_dirs=None):
+    """计算应清理的旧版本目录。
+
+    保留规则（用户在 UI 选择）：当前使用中版本恒保留，其余按**精确变体**
+    分组（cuda-13.3 / cuda-13.4 / cuda-12.4 / cpu ... 为不同系列，见
+    _cuda_series 语义按大版本，但此处按完整 variant 区分小版本，让每个
+    构建矩阵各保留 keep_series 个供回退）各保留最新 keep_series 个，超出者
+    列入待删。返回待删条目列表（list_installed 结构，含 dir/tag/variant/date）。
+
+    running_dirs：运行中服务的 exe 所在目录列表（pids.json 运行时状态，
+    由调用方传入）。从旧版本目录启动的 llama-server 仍在跑时，其目录必须
+    保留——rmtree 删一半遇锁文件才抛错，会把版本目录删成半残。
+    """
+    if not dest_root or not os.path.isdir(dest_root):
+        return []
+    items = list_installed(dest_root)  # 已按 build 降序
+    current_dir = ""
+    if current_exe_path:
+        current_dir = os.path.normcase(os.path.dirname(os.path.abspath(current_exe_path)))
+    busy = {os.path.normcase(os.path.abspath(d)) for d in (running_dirs or []) if d}
+    kept_count = {}  # variant -> 已保留数
+    to_delete = []
+    for it in items:
+        item_dir = os.path.normcase(it["dir"])
+        if current_dir and item_dir == current_dir:
+            continue  # 当前使用中，恒保留
+        if item_dir in busy:
+            continue  # 运行中服务的目录，恒保留（防 rmtree 删半残）
+        variant = it.get("variant") or ""
+        n = kept_count.get(variant, 0)
+        if n < keep_series:
+            kept_count[variant] = n + 1  # 该变体保留阈值内，跳过
+        else:
+            to_delete.append(it)
+    return to_delete
+
+
+def delete_version_dir(installed_dir):
+    """删除一个版本目录，返回释放字节数；失败抛 OSError（运行中占用等由调用方提示）。"""
+    if not installed_dir or not os.path.isdir(installed_dir):
+        return 0
+    size = dir_size(installed_dir)
+    shutil.rmtree(installed_dir)
+    return size
+
+
+def plan_zip_cleanup(dest_root):
+    """计算已解压安装成功、缓存已无用的下载 zip（zips/ 下）。
+
+    规则：主包 zip（llama-*，能提取 tag+variant）若其对应版本目录
+    {tag}-{variant} 已存在，说明已安装成功，缓存可清。cudart 等无法归属
+    到具体 tag 的 zip 保守保留。返回待删 zip 文件路径列表。
+    """
+    zips_dir = os.path.join(dest_root, "zips")
+    if not os.path.isdir(zips_dir):
+        return []
+    # 已装版本集合 {tag}-{variant}
+    installed_versions = {
+        os.path.basename(item["dir"]) for item in list_installed(dest_root)
+    }
+    to_delete = []
+    try:
+        names = os.listdir(zips_dir)
+    except OSError:
+        return []
+    for name in names:
+        if not name.lower().endswith(".zip"):
+            continue
+        m = re.match(r"^llama-(b\d+)-", name)
+        if not m:
+            continue  # cudart/无法归属 → 保留
+        kind, variant = parse_asset_name(name)
+        if kind != "llama" or not variant:
+            continue
+        key = f"{m.group(1)}-{variant}"
+        if key in installed_versions:
+            to_delete.append(os.path.join(zips_dir, name))
+    return to_delete
+
+
+def delete_zip(zip_path):
+    """删除一个已无用的下载缓存 zip，返回释放字节数；失败抛 OSError。"""
+    if not zip_path or not os.path.isfile(zip_path):
+        return 0
+    size = os.path.getsize(zip_path)
+    os.remove(zip_path)
+    return size
 
 
 # ── 版本切换（联动 settings + .bat 脚本）────────────────────────

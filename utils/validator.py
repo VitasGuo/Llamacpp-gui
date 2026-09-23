@@ -1,5 +1,4 @@
 import os
-import re
 
 
 def validate_path(path):
@@ -22,8 +21,3 @@ def validate_llamacpp_file(path):
     if not os.path.isfile(path):
         return False
     return os.path.basename(path).lower() == "llama-server.exe"
-
-
-def sanitize_filename(name):
-    """移除文件名中的非法字符。"""
-    return re.sub(r'[<>:"/\\|?*]', '_', name)

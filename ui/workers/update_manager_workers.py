@@ -144,17 +144,21 @@ class InstallWorker(QThread):
                 done_bytes += resume
                 self.status_signal.emit(f"下载中（{i}/{len(self.tasks)}）：{t['label']}")
                 last_time, last_bytes, emitted_speed = time.time(), resume, 0.0
+                last_emit = 0.0  # 进度信号节流：高速下载时每 chunk emit 会打爆 GUI 线程
 
                 def on_chunk(current, _total, _base=done_bytes - resume,
                              _t0=last_time, _b0=resume):
-                    nonlocal last_time, last_bytes, emitted_speed
+                    nonlocal last_time, last_bytes, emitted_speed, last_emit
                     if self._cancelled:
                         raise _Cancelled
                     now = time.time()
                     if now - last_time >= 1.0:
                         emitted_speed = (current - last_bytes) / (now - last_time)
                         last_time, last_bytes = now, current
-                    self.progress_signal.emit(_base + current, total, emitted_speed)
+                    # 速度按 1s 窗口算，进度同窗节流（≥0.25s 或下载完成时才 emit）
+                    if now - last_emit >= 0.25 or current >= (t.get("size") or 0):
+                        last_emit = now
+                        self.progress_signal.emit(_base + current, total, emitted_speed)
 
                 download_file(t["url"], t["dest"], resume_pos=resume,
                               chunk_callback=on_chunk)

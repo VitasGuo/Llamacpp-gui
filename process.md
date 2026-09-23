@@ -4,12 +4,20 @@
 
 - **目标**：在本地 Windows 环境运行 LlamaCPP GUI（PyQt6 桌面客户端），用于管理本地 llama.cpp 推理服务器。
 
-- **当前版本**：v1.11.0（2026-09-13，全量代码审查修复）
+- **当前版本**：v1.16.2（2026-09-23，ctx 挡位补充 200K 细分挡）
 
 ## 版本历史
 
 | 版本     | 日期         | 说明                                                                                                                                                       |
 | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| v1.16.2 | 2026-09-23 | ctx 基础挡位补充 **200K (204800)** 细分挡（不作为默认值，仅手选；1M 挡 v1.16.1 已有）；默认值规则不变（上限<128K 取最大、≥128K 默认 128K）；132 全绿 |
+| v1.16.1 | 2026-09-23 | **ctx-size 挡位化（解决 128K 约束矛盾）**：新增 `read_gguf_context_length` 解析 GGUF 元数据 `*.context_length`（只扫文件头 KV 区、命中即停，遇超大 tokenizer 数组防御性放弃）；`ctx_options_for` 统一生成挡位与默认值——模型上限 <128K 默认取模型最大值、≥128K 默认 128K（更高挡手选/手填），读不到元数据回退文件大小分级；表单 ctx 控件改**可编辑下拉**（挡位点选 8K~1M + 任意值手填，NoInsert + IntValidator），挡位随选中模型动态刷新；解决 v1.16.0 遗留的"ctx≥128000 硬性约束 vs auto_generate 按文件大小分级"矛盾（traps #33：可编辑下拉必须读 currentText 而非 currentData）；实测本机模型全部正确解析（MiniCPM5→128K、Qwen3.8-27B→256K 上限默认 128K）；测试新增 9 例（132 全绿） |
+| v1.16.0 | 2026-09-23 | **全量审查修复 16 项 + misc**（R1-R16）：表单切模型残留参数污染（set_preset 整体重置）；chat handlers 4 处读改写包 CONV_LOCK；chat.js 非流式多角色回复错位（记 msgIdx）+ 轮询 isSending 守卫；清理旧版本排除运行中进程 exe 目录；下载队列移除按 UserRole 现查行号；追踪按钮 lambda 默认参数防循环变量捕获；scheduler not-found 自愈 rebuild_task_index；parse_bat_params 引号值 + 短 flag 词边界；恢复服务停止后 CompactMonitor 状态同步；**五处 GUI 线程阻塞挪后台**（Tailscale 探测 60s TTL 缓存 / 清理全部 llama 进程 / 模型目录 merge / 旧版本清理规划 / 图片迁移）；misc：托盘重启 Popen 补 CREATE_NO_WINDOW、get_script_for_model 大小写不敏感、Settings.load 读侧路径归一、dest_path 归一、表单原文视图统一刷新、下拉校验失败回滚、print→logger；**死代码清理约 450 行**（MonitorTab/TpsChart/HistoryChart、NewScriptDialog、CheckUpdateWorker/CheckAppUpdateWorker、history_worker、update_workers→compare_semver 迁 utils/semver.py、validator.sanitize_filename），移除 PyQt6-Charts 依赖；CompactMonitor.update_tps 补 t/s 历史落盘；traps 新增 #24-#32；测试新增 6 例（123 全绿） |
+| v1.15.0 | 2026-09-23 | **脚本彻底绑定模型**（移除独立脚本名/清单）：选中/下载模型即自动生成基础参数进表单，微调保存即绑定到该模型；`ScriptEntry.derive_name(model_path)` 自动命名（文件名+路径短hash，跨目录同名不冲突），`script_service.get_script_for_model` 归一化路径查找；删除脚本列表/置顶/新建按钮与控制面板"检查更新"按钮；表单常用参数=通用/模型/量化 直接显示 + **模型别名自动=模型文件名（只读）**，高级参数（并发批处理/MTP/MOE）收进主控制页底部可折叠"高级参数"区（默认收起）；移除独立"性能监控"标签页（监控并入主控制页压缩版）；修复托盘重启误报"已在运行"（重启实例跳过单实例锁）+ 重启慢（桥 shutdown 改后台线程、monitor join 2s→0.2s）；左栏新增 Tailscale 默认 IP 手动指定（Settings.tailscale_ip 覆盖自动检测、失效/留空回退）；聊天 LLM 地址 0.0.0.0 时自动解析为 Tailscale IP；移除脚本表单里残留的 `--mmap` 开关（traps #15 复发修复）；测试新增 11 例（累计 127） |
+| v1.14.0 | 2026-09-22 | 脚本编辑器改为**表单式**（填空/下拉/勾选，不再直接编辑 .bat 代码，可展开看生成原文）；新增**一键生成脚本**：选模型 → `auto_generate_config` 按文件大小自动算 ctx/量化/gpu 层/host、命名 alias、自动挂 mmproj，微调即存；`parse_bat_params`/`parse_model_path_from_bat` 反向解析 .bat 回填表单；运行/保存/端口改写统一走表单事实源；测试新增 4 例（累计 116） |
+| v1.13.1 | 2026-09-22 | 模型更新追踪改为**主窗口独立标签页**（ui/model_watch_tab.py），不再嵌在模型下载页；修复"移除没效果"：新增 `WATCHLIST_IGNORED_FILE` 持久化 ignored 集合，本地模型移除后不再被 merge 自动加回，手动追踪解除忽略；切到该 tab 自动 refresh（并入新下载模型 + 后台检查）；测试新增 2 例（累计 112） |
+| v1.13.0 | 2026-09-22 | 新增模型更新追踪（模型搜索与下载页"模型更新追踪"视图）：本地已装 ModelScope 模型系列自动加入关注 + 搜索结果可手动追踪；逐模型查 ModelScope `LastUpdatedTime` 与基线对比判更新，有更新行整行标黄；打开视图自动后台检查 + 手动"检查更新"；持久化 data/model_watchlist.json；新增 service/watchlist_service.py、ui/workers/watch_worker.py；测试新增 5 例（累计 110） |
+| v1.12.0 | 2026-09-22 | 新增"清理旧版本"功能（版本管理页）：保留当前使用版本 + 每变体系列（cuda-13.3/13.4/...）最新 2 个，其余旧版本目录与已解压的下载缓存 zip 一并清理；service 层 `plan_version_cleanup`/`delete_version_dir`/`plan_zip_cleanup`/`delete_zip`，UI 确认框列出待删项与释放空间、预览删除、单个失败不中断；实测本机 8 版本→保留 4、zip 清 8，释放约 1.9GB；测试新增 4 例（累计 105） |
 | v1.11.0 | 2026-09-13 | 全量代码审查（三路并行）一次性修复 16 项：运行前自动保存/端口改写保存漏传 pinned 静默取消置顶；_toggle_pin 用磁盘内容避免回退未保存修改；closeEvent StatusPoller 缺 wait；plan_auto_download 完整 release 无待下载时不再降级下载旧版；list_installed 按 build 号排序（字符串跨位数错乱）；start_script 单引号路径被全局 replace 破坏；chat call_llm 空 choices IndexError；chat 并发读写对话加 CONV_LOCK（RLock，写串行化 + scheduler 两段锁，traps #20）；_on_release_selected 提前 return 未恢复 blockSignals；模型搜索无过期保护（旧 worker 迟到覆盖）；本地已有完整 zip 跳过 SHA256 校验；DownloadQueue._load 结构校验；download_service worker 竞态（旧 finished 弹掉新 worker 致 GC 崩溃）；测试新增 3 例（累计 101） |
 | v1.10.3 | 2026-09-13 | 版本切换完成弹窗改为双按钮："立即重启"（重启 GUI 加载新版本，走 restart_requested 信号由主窗口执行）/ "稍后重启"（默认，继续当前会话）；替代原来只能点 OK 的信息框 |
 | v1.10.2 | 2026-09-13 | 脚本列表体验优化：置顶从右键改为**每行内置 📌 按钮**（橙色=已置顶/灰色=未置顶，点击切换，右键保留为补充）；列宽合理化——脚本名自动拉伸占满剩余空间、状态按内容、置顶列固定 34px |
@@ -36,6 +44,47 @@
 | v1.0.0 | 2026-09-02 | 首次克隆并配置运行环境，GUI 启动验证通过                                                                                                                                   |
 
 ## 当前任务
+
+- [x] v1.16.1 ctx 挡位化 + GGUF 元数据上限（2026-09-23）：
+  - `service/script_builder.py`：`read_gguf_context_length`（GGUF 头 KV 扫描，命中 `*.context_length` 即停）+ `ctx_options_for`（挡位 + 默认值单一事实源）；`auto_generate_config` 的 ctx 改走元数据（上限<128K 默认取最大值、≥128K 默认 128K、读不到回退文件大小分级）
+  - `ui/script_form_widget.py`：ctx_size 控件改可编辑下拉（挡位 "8K (8192)" 点选 + 任意值手填，NoInsert + QIntValidator）；`_update_ctx_tiers` 随模型刷新挡位；`get_config`/`set_preset`/`_reset_to_defaults` 适配可编辑下拉（traps #33）
+  - `ui/app.py`：`_on_model_changed`/`_generate_script` 里 `set_model_path` 提前到 `set_preset` 之前（挡位默认值先就绪）
+  - 验证：132 例全绿；本机真实模型实测（MiniCPM5-2B→上限 128K 默认 128K；Qwen3.8-27B 全系→上限 256K 默认 128K）；导入冒烟通过
+
+- [x] v1.16.0 全量审查修复 + 后台化 + 死代码清理（2026-09-23）：16 项审查修复（R1-R16）+ misc + 文档同步，123 例全绿；详见版本历史表 v1.16.0 条目与 traps.md #24-#32
+  - R1 `script_form_widget.set_preset`：切入新模型先整体重置表单，杜绝残留参数污染（traps #24）
+  - R2 `chat/handlers.py`：rename/delete/clear/set-title 4 处读改写包 CONV_LOCK（traps #25）
+  - R3/R8 `chat.js`：@多角色非流式回复按 msgIdx 定位（traps #26）+ pollConversation isSending 守卫防覆盖发送中消息
+  - R4 `plan_version_cleanup`：排除运行中进程 exe 所在目录（traps #27）
+  - R5 下载队列移除按钮 UserRole 现查行号；R6 追踪按钮 lambda 默认参数（traps #28）
+  - R7 scheduler not-found 分支 rebuild_task_index 自愈（traps #29）
+  - R10 `parse_bat_params` 引号值 + 短 flag 词边界（traps #30）；R11 update_cache 原子写
+  - R9 恢复服务停止后 `_apply_script_statuses` 清 runtime + `on_server_stopped`；`_stop_script` 补同步
+  - R12 Tailscale 探测 60s TTL 缓存 + TailscaleProbeWorker 后台刷新（traps #31）
+  - R13 清理全部 llama 进程 KillAllLlamaWorker 后台 + `_on_cleanup_all_done` 回传重置
+  - R14 旧版本清理规划 CleanupPlanWorker 两阶段；R15 merge_local_models 后台（含删 model_watch_tab 重复 refresh，traps #32）；R16 图片迁移后台
+  - misc：托盘重启 Popen 补 NO_WINDOW、`_script_name_for` 大小写不敏感复用绑定、Settings.load 读侧归一、dest_path 归一、表单原文视图三来源统一刷新、模型下拉校验失败回滚
+  - 死代码：删 MonitorTab/TpsChart/HistoryChart（monitor_tab 仅存 CompactMonitor）、NewScriptDialog、CheckUpdate/CheckAppUpdateWorker、history_worker、update_workers（compare_semver 迁 `utils/semver.py`）、validator.sanitize_filename、monitor_service.load_history/_downsample；requirements 移除 PyQt6-Charts
+
+- [x] v1.14.0 脚本一键生成 + 表单式编辑器（2026-09-22）：
+  - `service/script_builder.py`：`auto_generate_config`（选模型自动算 alias/ctx 分级/KV 量化/gpu 层/host/挂 mmproj）+ `parse_bat_params`/`parse_model_path_from_bat`（反向解析 .bat 回填表单）；修解析时 `\b` 在 `^` 续行后不匹配的问题
+  - `ui/script_form_widget.py`（新）：表单式脚本编辑器，按 CATEGORIES 渲染填空/下拉/勾选 + 脚本名 + 模型只读；set_preset/get_config/set_name/clear_form
+  - `ui/app.py`：脚本区右侧换表单 + "查看生成的脚本"折叠原文；按钮行加"一键生成"；`_on_script_selected` 反解回填、`_save_script`/`_generate_script`/`_new_script` 改表单、`_run_script`/端口改写/外网地址全部以表单为事实源；选模型/加载时同步表单模型显示
+  - 测试：新增 `TestAutoGenerateAndParse` 4 例（auto 基础字段/ctx 分级/build→parse roundtrip/开关存在）；116 全绿
+
+- [x] v1.13.1 追踪独立标签页 + 移除生效（2026-09-22）：
+  - `ui/model_watch_tab.py`（新）：主窗口独立"模型更新追踪"标签页，从 model_tab 抽出；首次不预跑网络，`recall()` 由主窗口切 tab 触发（合并新本地模型 + 空闲则检查）
+  - `ui/app.py`：注册 `model_watch_tab` 标签；`currentChanged` 切到该页调 `recall()`
+  - `ui/model_tab.py`：移出追踪视图，保留搜索结果"追踪"按钮（`_watch_model` 改全局读写，`_do_search` 刷新关注列表使按钮状态一致）
+  - `service/watchlist_service.py`：修复"移除没效果"——新增 `WATCHLIST_IGNORED_FILE` 持久化 ignored 集合，`remove_model` 记 ignore，`merge_local_models` 跳过 ignored，`add_manual_model` 解除 ignore
+  - 测试：新增 `TestIgnoreRemove` 2 例；112 全绿
+
+- [x] v1.12.0 清理旧版本功能（2026-09-22）：
+  - `service/llamacpp_update_service.py`：`plan_version_cleanup`（保留当前 + 每变体系列最新 2 个，返回待删）、`delete_version_dir`（删目录返释放字节）、`plan_zip_cleanup`（清已装版本对应的下载缓存 zip，cudart/未装保守保留）、`delete_zip`
+  - `ui/update_tab.py`："已安装版本"组新增"清理旧版本"按钮；确认框列出待删版本+zip 及释放空间，默认取消防误触；预览删除、单个失败不中断其余、失败项提示"可能被运行中服务占用"
+  - 规则说明：当前使用版本恒保留，每个变体系列（cuda-13.3/13.4/cpu...）各保留最新 2 个供回退，超出清理
+  - 实测：本机 8 版本 → 保留 4（b11093 当前 + b11065 + b10936/b10934），删 4 + zip 8，释放约 1.9GB
+  - 测试：新增 `TestCleanup` 4 例（规则保留/阈值内全留/zip 归属/删除返大小）；105 全绿
 
 - [x] v1.11.0 全量代码审查修复（2026-09-13）：三路并行审查（service+chat / ui / model+utils+config），修复 16 处明显 bug 并补 3 例测试（101 例全绿）；已知低优先级残留：`_stop_script`/`_cleanup_all_processes` 在 GUI 线程同步 taskkill（用户主动一次性操作，卡顿 <1s 可接受）；chat handler 读在锁外的极小覆盖窗口（traps #20）
 
@@ -166,7 +215,7 @@
 
 ## 已知问题
 
-- 暂无。已修复注意项见 `traps.md` #1~#12。
+- 暂无。已修复注意项见 `traps.md` #1~#33。
 - 审查中未纳入本次修复的低优先级项：`last_pid.pid` 语义陈旧（多服务器下仅剩回退用途，可规划废弃）；首次运行向导、日志面板关键字过滤（后续待办）。
 
 ## 后续待办

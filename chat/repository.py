@@ -226,29 +226,43 @@ def migrate_convs():
 
 
 def migrate_conversation_images():
-    """压缩旧对话中的内嵌图片，压缩成功的图片打上 _optimized 标记。"""
+    """压缩旧对话中的内嵌图片，压缩成功的图片打上 _optimized 标记。
+
+    在后台线程执行（图片多时逐张 PIL 解码较慢，不能阻塞 GUI 启动）；
+    逐对话包 CONV_LOCK，与 HTTP handler / scheduler 串行化，避免基于
+    旧快照覆盖并发更新（锁内含压缩耗时，但迁移仅在启动后跑一次）。
+    """
     for conv in list_conversations():
-        changed = False
-        for message in conv.get("messages", []):
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if not isinstance(part, dict) or part.get("_optimized"):
+        cid = conv.get("id")
+        with CONV_LOCK:
+            fresh = None
+            for c in list_conversations():
+                if c["id"] == cid:
+                    fresh = c
+                    break
+            if not fresh:
+                continue  # 迁移期间对话被删除
+            changed = False
+            for message in fresh.get("messages", []):
+                content = message.get("content")
+                if not isinstance(content, list):
                     continue
-                image_url = part.get("image_url")
-                if not isinstance(image_url, dict):
-                    continue
-                url = image_url.get("url")
-                if not isinstance(url, str) or not url.startswith("data:image/"):
-                    continue
-                compressed = compress_image_data_url(url)
-                if compressed is not None:
-                    image_url["url"] = compressed
-                    part["_optimized"] = True
-                    changed = True
-        if changed:
-            write_conv_file(conv)
+                for part in content:
+                    if not isinstance(part, dict) or part.get("_optimized"):
+                        continue
+                    image_url = part.get("image_url")
+                    if not isinstance(image_url, dict):
+                        continue
+                    url = image_url.get("url")
+                    if not isinstance(url, str) or not url.startswith("data:image/"):
+                        continue
+                    compressed = compress_image_data_url(url)
+                    if compressed is not None:
+                        image_url["url"] = compressed
+                        part["_optimized"] = True
+                        changed = True
+            if changed:
+                write_conv_file(fresh)
 
 
 # ─── Memory CRUD ─────────────────────────────────────────
@@ -273,10 +287,15 @@ def clean_memory(agent_id, threshold_days):
     now = int(datetime.now().timestamp())
     kept = []
     for item in memory:
+        if not isinstance(item, dict):
+            continue  # 单条畸形数据直接丢弃，不中断整轮清理
         if item.get("importance") == "high":
             kept.append(item)
             continue
-        created = datetime.fromisoformat(item.get("created_at", "2000-01-01T00:00:00")).timestamp()
+        try:
+            created = datetime.fromisoformat(item.get("created_at", "2000-01-01T00:00:00")).timestamp()
+        except (TypeError, ValueError):
+            created = 0  # 畸形时间视为过期，交给阈值判定
         if (now - created) < threshold_days * 86400:
             kept.append(item)
     if len(kept) != len(memory):

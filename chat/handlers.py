@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from .log import error as _log_error
 from .repository import (
+    CONV_LOCK,
     _load_json,
     _now,
     _save_json,
@@ -50,12 +51,24 @@ def _default_llm_url():
         return ""
 
 
+# 请求体上限：聊天消息可含 base64 图片，留足余量；超出/畸形直接 400
+MAX_BODY_BYTES = 100 * 1024 * 1024
+
+
 def _read_body(handler):
-    length = int(handler.headers.get("Content-Length", 0))
-    if length == 0:
+    try:
+        length = int(handler.headers.get("Content-Length", 0))
+    except (TypeError, ValueError):
+        raise ValueError("invalid Content-Length")
+    if length <= 0:
         return {}
+    if length > MAX_BODY_BYTES:
+        raise ValueError("body too large")
     raw = handler.rfile.read(length)
-    return json.loads(raw.decode("utf-8"))
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("body must be a JSON object")
+    return data
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
@@ -295,29 +308,33 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         elif re.match(r"^/conversations/[^/]+/tasks$", path):
             cid = path.split("/")[2]
-            conv = None
-            for c in list_conversations():
-                if c["id"] == cid:
-                    conv = c
-                    break
-            if not conv:
-                self._json(404, {"error": "conversation not found"})
-                return
-            task = {
-                "id": str(uuid.uuid4()),
-                "agent_id": body.get("agent_id", ""),
-                "name": body.get("name", "新任务"),
-                "instruction": body.get("instruction", ""),
-                "enabled": body.get("enabled", True),
-                "interval_seconds": body.get("interval_seconds", 3600),
-                "next_run_time": _now(),
-                "last_run_time": None,
-                "last_result": None,
-            }
-            conv.setdefault("tasks", []).append(task)
-            conv["updated_at"] = _now()
-            write_conv_file(conv)
-            rebuild_task_index()
+            task = None
+            # 整个读-改-写包锁：与 scheduler 并发时不基于旧快照覆盖任务列表
+            # （traps #20 残留的 handler 侧补全；RLock 可重入，write 内部再取锁安全）
+            with CONV_LOCK:
+                conv = None
+                for c in list_conversations():
+                    if c["id"] == cid:
+                        conv = c
+                        break
+                if not conv:
+                    self._json(404, {"error": "conversation not found"})
+                    return
+                task = {
+                    "id": str(uuid.uuid4()),
+                    "agent_id": body.get("agent_id", ""),
+                    "name": body.get("name", "新任务"),
+                    "instruction": body.get("instruction", ""),
+                    "enabled": body.get("enabled", True),
+                    "interval_seconds": body.get("interval_seconds", 3600),
+                    "next_run_time": _now(),
+                    "last_run_time": None,
+                    "last_result": None,
+                }
+                conv.setdefault("tasks", []).append(task)
+                conv["updated_at"] = _now()
+                write_conv_file(conv)
+                rebuild_task_index()
             self._json(201, task)
 
         else:
@@ -338,46 +355,61 @@ class BridgeHandler(BaseHTTPRequestHandler):
             parts = path.split("/")
             cid = parts[2]
             tid = parts[4]
-            conv = None
-            for c in list_conversations():
-                if c["id"] == cid:
-                    conv = c
-                    break
-            if not conv:
-                self._json(404, {"error": "conversation not found"})
-                return
-            tasks = conv.get("tasks", [])
-            for i, t in enumerate(tasks):
-                if t["id"] == tid:
-                    for key in ["name", "instruction", "enabled", "interval_seconds"]:
-                        if key in body:
-                            tasks[i][key] = body[key]
-                    conv["tasks"] = tasks
-                    conv["updated_at"] = _now()
-                    write_conv_file(conv)
-                    rebuild_task_index()
-                    self._json(200, tasks[i])
-                    return
-            self._json(404, {"error": "task not found"})
+            updated = None
+            not_found = None
+            with CONV_LOCK:  # 整个 RMW 包锁（traps #20 handler 侧补全）
+                conv = None
+                for c in list_conversations():
+                    if c["id"] == cid:
+                        conv = c
+                        break
+                if not conv:
+                    not_found = "conversation"
+                else:
+                    tasks = conv.get("tasks", [])
+                    for i, t in enumerate(tasks):
+                        if t["id"] == tid:
+                            for key in ["name", "instruction", "enabled", "interval_seconds"]:
+                                if key in body:
+                                    tasks[i][key] = body[key]
+                            conv["tasks"] = tasks
+                            conv["updated_at"] = _now()
+                            write_conv_file(conv)
+                            rebuild_task_index()
+                            updated = tasks[i]
+                            break
+                    if updated is None and not_found is None:
+                        not_found = "task"
+            if not_found:
+                self._json(404, {"error": f"{not_found} not found"})
+            else:
+                self._json(200, updated)
 
         elif path.startswith("/conversations/") and len(path) > len("/conversations/") and "/tasks" not in path:
             cid = path[len("/conversations/"):]
-            convs = list_conversations()
-            for i, c in enumerate(convs):
-                if c["id"] == cid:
-                    if "title" in body:
-                        convs[i]["title"] = body["title"]
-                    if "agents" in body:
-                        convs[i]["agents"] = body["agents"]
-                    if "messages" in body:
-                        convs[i]["messages"] = body["messages"]
-                    if "background" in body:
-                        convs[i]["background"] = body["background"]
-                    convs[i]["updated_at"] = _now()
-                    write_conv_file(convs[i])
-                    self._json(200, convs[i])
-                    return
-            self._json(404, {"error": "conversation not found"})
+            updated = None
+            found = False
+            with CONV_LOCK:  # 整个 RMW 包锁：前端每次发消息后必调，是竞态高频路径
+                convs = list_conversations()
+                for i, c in enumerate(convs):
+                    if c["id"] == cid:
+                        found = True
+                        if "title" in body:
+                            convs[i]["title"] = body["title"]
+                        if "agents" in body:
+                            convs[i]["agents"] = body["agents"]
+                        if "messages" in body:
+                            convs[i]["messages"] = body["messages"]
+                        if "background" in body:
+                            convs[i]["background"] = body["background"]
+                        convs[i]["updated_at"] = _now()
+                        write_conv_file(convs[i])
+                        updated = convs[i]
+                        break
+            if not found:
+                self._json(404, {"error": "conversation not found"})
+            else:
+                self._json(200, updated)
 
         elif re.match(r"^/agents/[^/]+/memory/\d+$", path):
             parts = path.split("/")
@@ -437,17 +469,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
             parts = path.split("/")
             cid = parts[2]
             tid = parts[4]
-            conv = None
-            for c in list_conversations():
-                if c["id"] == cid:
-                    conv = c
-                    break
-            if conv:
-                tasks = conv.get("tasks", [])
-                conv["tasks"] = [t for t in tasks if t["id"] != tid]
-                conv["updated_at"] = _now()
-                write_conv_file(conv)
-                rebuild_task_index()
+            deleted = None
+            with CONV_LOCK:  # 整个 RMW 包锁（traps #20 handler 侧补全）
+                conv = None
+                for c in list_conversations():
+                    if c["id"] == cid:
+                        conv = c
+                        break
+                if conv:
+                    conv["tasks"] = [t for t in conv.get("tasks", []) if t["id"] != tid]
+                    conv["updated_at"] = _now()
+                    write_conv_file(conv)
+                    rebuild_task_index()
+                    deleted = True
+            if deleted:
                 self._json(200, {"deleted": True})
             else:
                 self._json(404, {"error": "conversation not found"})

@@ -112,6 +112,9 @@ class SchedulerService:
                         conv = c
                         break
                 if not conv:
+                    # 对话已删：立即重建索引清掉本条目，否则陈旧条目每秒
+                    # 触发全量 list_conversations()（含图片解析）空转，永不自愈
+                    rebuild_task_index()
                     return
 
                 task = None
@@ -120,6 +123,8 @@ class SchedulerService:
                         task = t
                         break
                 if not task or not task.get("enabled", True):
+                    # 任务已删/停用：同理重建索引自愈（rebuild 只收 enabled 任务）
+                    rebuild_task_index()
                     return
 
                 agent = None
@@ -128,6 +133,9 @@ class SchedulerService:
                         agent = a
                         break
                 if not agent:
+                    # 角色已删但任务还在：记录失败并推进 next_run_time，
+                    # 否则到期条目每 interval 空转一次且用户看不到原因
+                    self._record_task_error(conv_id, task_id, "任务引用的角色不存在（可能已被删除）")
                     return
 
                 messages = []

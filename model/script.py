@@ -1,10 +1,17 @@
 import os
 import re
+import hashlib
 from datetime import datetime
+
+from utils.path_utils import normalize_path
 
 
 class ScriptEntry:
     def __init__(self, name="", content="", model_path="", pid=None, started_at="", port=None, pinned=False):
+        # 脚本绑定模型：未显式给名时，自动由 model_path 推导（用户不可见/不可编辑）
+        # —— 移除独立脚本名后，模型即脚本的唯一标识，name 只是内部稳定 key。
+        if not name and model_path:
+            name = self.derive_name(model_path)
         self.name = name
         self.content = content
         self.saved_at = datetime.now().isoformat()
@@ -21,6 +28,18 @@ class ScriptEntry:
         name = re.sub(r'[<>:"/\\|?*]', '_', name)
         name = re.sub(r'\s+', '_', name).strip()
         return name or "unnamed"
+
+    @staticmethod
+    def derive_name(model_path):
+        """由模型路径推导脚本名（脚本绑定模型的内部稳定 key）。
+
+        格式：`<模型文件名去扩展名>_<归一化路径短hash8>`。
+        短 hash 保证不同目录下的同名 .gguf 不产生 .bat 冲突，且对同一路径稳定可复现。
+        """
+        base = os.path.splitext(os.path.basename(model_path or ""))[0] or "model"
+        base = ScriptEntry.sanitize_filename(base)
+        digest = hashlib.sha1(normalize_path(model_path).encode("utf-8")).hexdigest()[:8]
+        return f"{base}_{digest}"
 
     def save_to_file(self, scripts_dir):
         os.makedirs(scripts_dir, exist_ok=True)

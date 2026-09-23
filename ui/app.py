@@ -2,6 +2,8 @@
 import sys
 import os
 import re
+import time
+import threading
 import subprocess
 import webbrowser
 from datetime import datetime
@@ -9,20 +11,23 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QTextEdit,
-    QTreeWidget, QTreeWidgetItem, QMessageBox,
-    QSplitter, QTabWidget, QFileDialog, QInputDialog, QDialog,
-    QSystemTrayIcon, QMenu, QComboBox, QHeaderView, QToolButton,
+    QMessageBox,
+    QTabWidget, QFileDialog, QSplitter,
+    QSystemTrayIcon, QMenu, QComboBox,
 )
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QTextCursor, QAction, QBrush, QColor, QPixmap, QPainter, QFont, QIcon
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QTextCursor, QAction, QColor, QPixmap, QPainter, QFont, QIcon
 
 from config.config import Settings
 from utils.validator import validate_llamacpp_file, validate_gguf
 from utils.logger import error, info
 from service.script_service import ScriptService
-from service.script_builder import build_bat_content, extract_port, extract_host, find_mmproj
+from service.script_builder import (
+    build_bat_content, extract_port, extract_host, find_mmproj,
+    auto_generate_config, parse_bat_params, parse_model_path_from_bat,
+)
 from service.process_service import ProcessService
-from service.tailscale import get_tailscale_ipv4
+from service.tailscale import get_tailscale_ipv4, is_tailscale_ip
 from service.monitor_service import MonitorService
 from service.path_service import ensure_webui
 from service import autostart_service
@@ -30,17 +35,22 @@ from service.model_scanner import scan_gguf_files
 from chat import start_bridge
 from model.script import ScriptEntry
 from ui.model_tab import ModelTab
-from ui.monitor_tab import MonitorTab, CompactMonitor
+from ui.model_watch_tab import ModelWatchTab
+from ui.monitor_tab import CompactMonitor
+from ui.script_form_widget import ScriptFormWidget
 from ui.update_tab import UpdateTab
-from ui.dialogs.new_script_dialog import NewScriptDialog
 from ui.dialogs.settings_dialog import SettingsDialog
 from ui.workers.log_worker import LogWorker
 from ui.workers.status_worker import StatusPoller
-from ui.workers.update_workers import CheckUpdateWorker, CheckAppUpdateWorker
+from ui.workers.tailscale_worker import TailscaleProbeWorker
+from ui.workers.process_worker import KillAllLlamaWorker
 
 # 日志面板行数上限：保留最近 N 个块（行）；每追加 M 条检查一次，避免刷屏时频繁裁剪
 LOG_PANEL_MAX_BLOCKS = 2000
 LOG_PANEL_TRIM_EVERY = 50
+
+# Tailscale 自动探测的 GUI 侧缓存窗口（与 service.tailscale 的探测缓存同量级）
+TS_PROBE_TTL = 60.0
 
 
 class MainWindow(QMainWindow):
@@ -53,7 +63,6 @@ class MainWindow(QMainWindow):
         self.is_running = False
         self.log_worker = None
         self.log_workers = []  # 多服务器：所有活动 LogWorker（保持引用防 GC）
-        self._script_entries = []
         self._server_urls = {}  # 多服务器：脚本名 -> 服务就绪 URL（按脚本归属，避免串扰）
         self._ts_url = ""
         self._bridge_server = None
@@ -67,13 +76,19 @@ class MainWindow(QMainWindow):
         self._last_alive = set()
         # 旧版本 data/last_pid.pid 恢复的全局进程是否存活（启动时验证一次）
         self._legacy_running = False
+        # Tailscale 自动探测缓存（GUI 只读，探测在后台 TailscaleProbeWorker）
+        self._ts_ip = ""
+        self._ts_ip_probed_at = 0.0
+        self._ts_probe_worker = None
+        # "清理全部llama进程"后台 worker（保引用防 GC）
+        self._killall_worker = None
 
         self.setWindowTitle("llama.cpp GUI Client")
         self.resize(960, 700)
 
         self.monitor_service = MonitorService(self.process_service)
-        self.monitor_tab = MonitorTab(self.monitor_service)
-        # 主控制页嵌入的压缩版监控（与日志并排）：同一数据源，加载模型时边看日志边看负载
+        # 主控制页嵌入压缩版系统监控（与日志并排）：CPU/RAM/GPU/VRAM/温度/TPS，
+        # 加载模型时边看日志边看负载。原独立"性能监控"标签页已并入此处（v1.15.0）。
         self.monitor_compact = CompactMonitor(self.monitor_service)
 
         # 多服务器：后台线程每 2s 轮询 tasklist 刷新脚本列表状态列与控制面板
@@ -101,14 +116,21 @@ class MainWindow(QMainWindow):
             return
         self._status_poller.stop()
         self._status_poller.wait(300)  # 轮询线程正跑 tasklist 时不能运行中被销毁
+        # Tailscale 后台探测线程同理：短暂等待后不再等（进程退出时线程终止）
+        if self._ts_probe_worker and self._ts_probe_worker.isRunning():
+            self._ts_probe_worker.wait(300)
         # 通知所有 LogWorker 退出；readline 可能阻塞，短暂等待后不再等
         # （保留引用防止 QThread 在运行中被销毁导致崩溃，进程退出时线程终止）
         for w in self.log_workers:
             w.stop()
         for w in self.log_workers:
             w.wait(300)
+        # 桥服务 shutdown() 会阻塞等 serve_forever 的 poll 周期（~0.5s）；
+        # serve_forever 是 daemon 线程，进程退出即被 OS 回收并关闭 socket 释放端口，
+        # 故在后台线程触发、不阻塞 GUI，避免拖慢退出/托盘重启。
         if self._bridge_server:
-            self._bridge_server.shutdown()
+            t = threading.Thread(target=self._bridge_server.shutdown, daemon=True)
+            t.start()
         self.monitor_service.stop()
         super().closeEvent(event)
 
@@ -185,12 +207,20 @@ class MainWindow(QMainWindow):
     def _restart_app(self):
         """托盘菜单"重启"：以当前解释器+参数重新启动应用（打包后为 exe），随后退出本实例。
 
-        单实例锁由 main() 的短暂重试兜底：旧实例退出释放锁期间，新实例能拿到锁。
+        给新实例传 LLAMACPP_RESTARTING=1 标记，使其在 main() 抢单实例锁时用更长的
+        重试窗口——旧实例退出释放锁需要一点时间（停 poller/logworker/bridge/monitor），
+        否则新实例会误报"已在运行"。
         """
         self._force_quit = True
         cmd = [sys.executable] + list(sys.argv)
+        env = dict(os.environ)
+        env["LLAMACPP_RESTARTING"] = "1"
         try:
-            subprocess.Popen(cmd, cwd=os.getcwd())
+            # CREATE_NO_WINDOW：pythonw 无控制台运行时避免闪现 cmd 窗口（项目硬性约定）
+            subprocess.Popen(
+                cmd, cwd=os.getcwd(), env=env,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
         except OSError:
             pass  # 启动失败时至少完成退出，不阻塞
         self.close()
@@ -209,15 +239,17 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(10, 10, 10, 10)
 
         tabs = QTabWidget()
+        self.tabs_holder = tabs
+
+        # 脚本参数表单（脚本绑定模型）：常用参数进主控制页，高级参数进独立标签页
+        self.script_form = ScriptFormWidget()
 
         # 主控制标签
         control_widget = QWidget()
         control_layout = QVBoxLayout(control_widget)
 
         control_layout.addWidget(self._create_path_panel())
-        # 脚本面板占更大空间（脚本多时列表能显示更多行）
         control_layout.addWidget(self._create_script_panel(), stretch=2)
-        control_layout.addWidget(self._create_control_panel())
 
         # 日志与压缩系统监控并排：加载模型时边看日志边看负载，免切标签
         bottom_row = QHBoxLayout()
@@ -231,8 +263,11 @@ class MainWindow(QMainWindow):
         self.model_tab = ModelTab()
         tabs.addTab(self.model_tab, "模型搜索与下载")
 
-        # 性能监控标签
-        tabs.addTab(self.monitor_tab, "性能监控")
+        # 模型更新追踪标签（独立卡片）
+        self.model_watch_tab = ModelWatchTab()
+        tabs.addTab(self.model_watch_tab, "模型更新追踪")
+
+        # 性能监控并入主控制页压缩版，不再单设标签页
 
         # 版本管理标签（llama.cpp 检测更新/下载安装/切换）
         self.update_tab = UpdateTab()
@@ -241,7 +276,14 @@ class MainWindow(QMainWindow):
         self.update_tab.restart_requested.connect(self._restart_app)
         tabs.addTab(self.update_tab, "版本管理")
 
+        # 切到"模型更新追踪"时刷新（并入新下载的本地模型 + 后台检查）
+        tabs.currentChanged.connect(self._on_main_tab_changed)
+
         main_layout.addWidget(tabs)
+
+    def _on_main_tab_changed(self, index):
+        if self.tabs_holder.widget(index) is self.model_watch_tab:
+            self.model_watch_tab.recall()
 
     def _on_version_switched(self, new_exe_path):
         """版本管理页切换 llama.cpp 版本后，同步主控制页路径显示。"""
@@ -272,142 +314,171 @@ class MainWindow(QMainWindow):
         row2.addWidget(browse_dir_btn)
         layout.addLayout(row2)
 
-        row2b = QHBoxLayout()
-        row2b.addWidget(QLabel("模型文件 (.gguf):"))
-        self.model_path_edit = QLineEdit()
-        self.model_path_edit.setReadOnly(True)
-        row2b.addWidget(self.model_path_edit)
+        return group
+
+    def _create_script_panel(self):
+        """启动脚本面板：模型即脚本。左右分栏 —— 左侧窄操作区（模型/视觉/动作），
+        右侧宽参数表单（横向利用率高、垂向占用小）。"""
+        group = QGroupBox("启动脚本")
+        root_layout = QHBoxLayout(group)
+        root_layout.setSpacing(6)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # 左：操作区（模型选择、视觉模型、保存/删除/查看原文）
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+
+        # 模型文件：下拉显示文件名 + 浏览/一键生成
+        left_layout.addWidget(QLabel("模型文件 (.gguf):"))
         self.model_combo = QComboBox()
         self.model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.model_combo.setEnabled(False)
         self.model_combo.currentIndexChanged.connect(self._on_model_combo_selected)
-        row2b.addWidget(self.model_combo)
+        left_layout.addWidget(self.model_combo)
+        self.model_path_edit = QLineEdit(self)
+        self.model_path_edit.setReadOnly(True)
+        self.model_path_edit.setPlaceholderText("（模型的完整路径，只读）")
+        left_layout.addWidget(self.model_path_edit)
+        op_row = QHBoxLayout()
         browse_btn2 = QPushButton("浏览...")
         browse_btn2.clicked.connect(self._select_model_file)
-        row2b.addWidget(browse_btn2)
-        layout.addLayout(row2b)
+        op_row.addWidget(browse_btn2)
+        self.gen_script_btn = QPushButton("一键生成")
+        self.gen_script_btn.setToolTip("按当前所选模型自动生成基础参数（已绑定脚本时重新生成）")
+        self.gen_script_btn.clicked.connect(self._generate_script)
+        op_row.addWidget(self.gen_script_btn)
+        left_layout.addLayout(op_row)
 
-        row3 = QHBoxLayout()
-        row3.addWidget(QLabel("外挂视觉模型 (.gguf):"))
-        self.visual_model_path_edit = QLineEdit()
+        left_layout.addSpacing(6)
+        left_layout.addWidget(QLabel("外挂视觉模型 (.gguf):"))
+        self.visual_model_path_edit = QLineEdit(self)
         self.visual_model_path_edit.setReadOnly(True)
-        row3.addWidget(self.visual_model_path_edit)
+        left_layout.addWidget(self.visual_model_path_edit)
         browse_btn3 = QPushButton("选择...")
         browse_btn3.clicked.connect(self._select_visual_model_file)
-        row3.addWidget(browse_btn3)
-        layout.addLayout(row3)
+        left_layout.addWidget(browse_btn3)
 
-        return group
-
-    def _create_script_panel(self):
-        group = QGroupBox("启动脚本")
-        layout = QHBoxLayout(group)
-
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        left_layout = QVBoxLayout()
-        # 三列：脚本名（自动拉伸）+ 状态（按内容）+ 置顶按钮（固定宽度）
-        self.script_list = QTreeWidget()
-        self.script_list.setColumnCount(3)
-        self.script_list.setHeaderLabels(["脚本", "状态", ""])
-        header = self.script_list.header()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.script_list.setColumnWidth(2, 68)
-        self.script_list.setRootIsDecorated(False)
-        self.script_list.setUniformRowHeights(True)
-        self.script_list.currentItemChanged.connect(self._on_script_selected)
-        # 双击脚本 = 直接运行（常用操作的快捷路径）
-        self.script_list.itemDoubleClicked.connect(
-            lambda item: self._run_script()
-        )
-        # 右键菜单：置顶/取消置顶（补充路径，主入口为行内按钮）
-        self.script_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.script_list.customContextMenuRequested.connect(self._show_script_context_menu)
-        left_layout.addWidget(self.script_list)
-
-        btn_layout = QHBoxLayout()
-        new_btn = QPushButton("新建")
-        new_btn.clicked.connect(self._new_script)
+        left_layout.addSpacing(6)
+        # 动作按钮：保存 / 删除该模型脚本 / 查看生成原文
         save_btn = QPushButton("保存")
         save_btn.clicked.connect(self._save_script)
-        delete_btn = QPushButton("删除")
+        left_layout.addWidget(save_btn)
+        delete_btn = QPushButton("删除该模型脚本")
         delete_btn.clicked.connect(self._delete_script)
-        btn_layout.addWidget(new_btn)
-        btn_layout.addWidget(save_btn)
-        btn_layout.addWidget(delete_btn)
-        left_layout.addLayout(btn_layout)
+        left_layout.addWidget(delete_btn)
+        self.view_raw_btn = QPushButton("查看生成的脚本")
+        self.view_raw_btn.setCheckable(True)
+        self.view_raw_btn.toggled.connect(self._toggle_raw_view)
+        left_layout.addWidget(self.view_raw_btn)
 
-        left_panel = QWidget()
-        left_panel.setLayout(left_layout)
+        left_layout.addStretch(1)
 
-        self.script_editor = QTextEdit()
-        self.script_editor.setPlaceholderText("在此输入启动脚本内容。")
+        # Tailscale 独立区块（外网访问配置）
+        ts_box = QGroupBox("Tailscale")
+        ts_lay = QVBoxLayout(ts_box)
+        ts_lay.setSpacing(6)
+        ts_row = QHBoxLayout()
+        ts_row.addWidget(QLabel("IP:"))
+        self.ts_ip_edit = QLineEdit()
+        self.ts_ip_edit.setPlaceholderText("留空自动检测")
+        self.ts_ip_edit.setText(self.settings.tailscale_ip)
+        self.ts_ip_edit.setToolTip("指定 Tailscale 默认 IP（填 100.x.x.x），覆盖自动检测")
+        self.ts_ip_edit.editingFinished.connect(self._on_ts_ip_changed)
+        ts_row.addWidget(self.ts_ip_edit)
+        ts_lay.addLayout(ts_row)
+        ts_hint = QLabel("外网访问用。手动填 IP 覆盖自动检测；留空则自动检测。")
+        ts_hint.setWordWrap(True)
+        ts_lay.addWidget(ts_hint)
+        left_layout.addWidget(ts_box)
 
-        splitter.addWidget(left_panel)
-        splitter.addWidget(self.script_editor)
-        splitter.setStretchFactor(0, 1)
+        # 运行控制（运行/结束/状态/聊天/清理 + 外网地址），左栏最底部
+        left_layout.addWidget(self._build_run_controls())
+
+        splitter.addWidget(left)
+
+        # 右：参数表单（常用参数在上，高级参数收在底部可折叠区）
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self.script_form.widget)
+        splitter.addWidget(right)
+
+        splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 3)
+        splitter.setSizes([280, 900])
+        root_layout.addWidget(splitter, 1)
 
-        layout.addWidget(splitter)
+        # 原文视图（默认隐藏；仅作查看，编辑以表单为准，占满整行宽度）
+        self.script_editor = QTextEdit()
+        self.script_editor.setReadOnly(True)
+        self.script_editor.setPlaceholderText("（生成的 .bat 内容，只读预览）")
+        self.script_editor.setVisible(False)
+        root_layout.addWidget(self.script_editor)
         return group
 
-    def _create_control_panel(self):
-        group = QGroupBox("控制面板")
-        root = QVBoxLayout(group)
-        layout = QHBoxLayout()
-        root.addLayout(layout)
+    def _toggle_raw_view(self, checked):
+        """展开/收起"查看生成的脚本"原文视图。"""
+        self.script_editor.setVisible(checked)
+        if checked:
+            self.script_editor.setPlainText(self._form_to_content())
 
+    def _form_to_content(self):
+        """由表单 + 当前路径配置生成 .bat 内容（脚本渲染的事实源）。"""
+        model_path = self.settings.model_path or parse_model_path_from_bat(
+            self.script_editor.toPlainText())
+        if not model_path:
+            return ""
+        exe_dir = os.path.dirname(self.settings.llamacpp_path) if self.settings.llamacpp_path else ""
+        cfg = self.script_form.get_config()
+        return build_bat_content(
+            exe_dir, model_path, cfg,
+            visual_model_path=self.settings.visual_model_path,
+        )
+
+    def _build_run_controls(self):
+        """构建"运行控制"控件组（运行/结束/状态/聊天/清理 + 外网地址），
+        并入启动脚本左栏（不再作为独立"控制面板"占一行垂向空间）。
+
+        返回承载这些控件的小部件，由调用方加入布局。
+        """
+        box = QGroupBox("运行控制")
+        root = QVBoxLayout(box)
+        root.setSpacing(6)
+
+        btn_row = QHBoxLayout()
         self.run_btn = QPushButton("运行")
         self.run_btn.clicked.connect(self._run_script)
-        layout.addWidget(self.run_btn)
-
+        btn_row.addWidget(self.run_btn)
         self.stop_btn = QPushButton("结束")
         self.stop_btn.clicked.connect(self._stop_script)
-        layout.addWidget(self.stop_btn)
+        btn_row.addWidget(self.stop_btn)
+        root.addLayout(btn_row)
 
         self.status_label = QLabel("\u25cf 就绪")
         self.status_label.setStyleSheet(
             "color: green; font-size: 12px; font-weight: bold;"
         )
-        layout.addWidget(self.status_label)
+        root.addWidget(self.status_label)
 
         self.chat_btn = QPushButton("聊天窗口")
         self.chat_btn.setEnabled(True)
         self.chat_btn.clicked.connect(self._open_chat_window)
-        layout.addWidget(self.chat_btn)
+        root.addWidget(self.chat_btn)
 
-        layout.addStretch()
-
-        self.check_update_btn = QPushButton("检查llama.cpp更新")
-        self.check_update_btn.clicked.connect(self._check_update)
-        layout.addWidget(self.check_update_btn)
-
-        self.update_date_label = QLabel("")
-        self.update_date_label.setStyleSheet("color: gray; font-size: 11px;")
-        layout.addWidget(self.update_date_label)
-
-        self.check_app_update_btn = QPushButton("检查软件更新")
-        self.check_app_update_btn.clicked.connect(self._check_app_update)
-        layout.addWidget(self.check_app_update_btn)
-
-        self.app_update_date_label = QLabel("")
-        self.app_update_date_label.setStyleSheet("color: gray; font-size: 11px;")
-        layout.addWidget(self.app_update_date_label)
-
-        # 显式清理入口：不常用、放右侧不突出位置，避免误触
+        # 显式清理入口：不常用、放不突出位置，避免误触
         self.cleanup_all_btn = QPushButton("清理全部llama进程")
         self.cleanup_all_btn.setToolTip(
             "结束本机所有 llama-server.exe / main.exe 进程"
             "（包括未通过本软件启动的实例），点击需确认。"
         )
         self.cleanup_all_btn.clicked.connect(self._cleanup_all_processes)
-        layout.addWidget(self.cleanup_all_btn)
+        root.addWidget(self.cleanup_all_btn)
 
         # 外网访问地址行（Tailscale）：服务以 0.0.0.0 或 Tailscale IP 监听时显示
         ext_row = QHBoxLayout()
-        ext_row.addWidget(QLabel("外网访问:"))
         self.ts_url_label = QLabel("")
         self.ts_url_label.setStyleSheet(
             "color: #2d8cf0; font-size: 12px; font-weight: bold;"
@@ -420,8 +491,7 @@ class MainWindow(QMainWindow):
         ext_row.addWidget(self.ts_copy_btn)
         ext_row.addStretch()
         root.addLayout(ext_row)
-
-        return group
+        return box
 
     def _create_log_panel(self):
         group = QGroupBox("日志输出")
@@ -445,20 +515,20 @@ class MainWindow(QMainWindow):
             self.llamacpp_path_edit.setText(self.settings.llamacpp_path)
         if self.settings.model_path:
             self.model_path_edit.setText(self.settings.model_path)
+        self.script_form.set_model_path(self.settings.model_path)
         if self.settings.visual_model_path:
             self.visual_model_path_edit.setText(self.settings.visual_model_path)
         if self.settings.model_dir:
             self.model_dir_edit.setText(self.settings.model_dir)
         self._reload_model_combo()
-        self._refresh_script_list()
+        self._on_model_changed()
 
     def _restore_service_state(self):
         # 多服务器恢复：对每个保存了 pid 的脚本探测存活并同步 UI
         alive = self.process_service.restore_all_pids()
         for name, pid in alive.items():
             self._append_log(f"检测到脚本 '{name}' 上次启动的服务仍在运行, PID={pid}")
-            # 同步到监控页状态面板（否则恢复后显示"未运行"，与实际不符）
-            self.monitor_tab.on_server_started(name)
+            # 同步到主控制页压缩状态面板（否则恢复后显示"未运行"，与实际不符）
             self.monitor_compact.on_server_started(name)
         if not alive:
             # 回退：旧版本 data/last_pid.pid（无脚本归属信息，行为与升级前一致）
@@ -468,93 +538,11 @@ class MainWindow(QMainWindow):
                 # 之后 GUI 线程只查缓存，不再同步跑 tasklist）
                 self._legacy_running = True
                 self._append_log(f"检测到上次启动的服务仍在运行, PID={pid}")
-        self._refresh_script_list()
         self._sync_control_panel()
         self._refresh_script_statuses()
 
-    def _runtime_status_text(self, name, runtime):
-        entry = runtime.get(name)
-        if entry and isinstance(entry.get("pid"), int):
-            return f"● 运行中 PID={entry['pid']}"
-        return "已停止"
-
-    def _refresh_script_list(self):
-        self.script_list.clear()
-        self.script_list.setColumnCount(3)
-        scripts = self.script_service.load_scripts()
-        # 置顶脚本排前面（稳定排序：置顶内保持原相对顺序，其余不变）
-        scripts.sort(key=lambda s: not s.pinned)
-        self._script_entries = scripts
-        runtime = self.process_service.load_runtime()
-        for script in scripts:
-            # 合并运行时字段（多服务器：pid/started_at/port 来自 pids.json）
-            rt = runtime.get(script.name) or {}
-            script.pid = rt.get("pid")
-            script.started_at = rt.get("started_at", "")
-            script.port = rt.get("port")
-            item = QTreeWidgetItem()
-            item.setText(0, script.name)
-            item.setText(1, self._runtime_status_text(script.name, runtime))
-            self.script_list.addTopLevelItem(item)
-            self._set_pin_button(item, script)
-
-    def _set_pin_button(self, item, script):
-        """在脚本行内置顶状态按钮：已置顶=橙色"置顶"，未置顶=灰色"未置顶"（点击切换）。
-
-        用文字而非 emoji：QSS color 无法给彩色 emoji 字形着色，emoji 版
-        置顶/非置顶视觉无差别（用户反馈）。
-        """
-        btn = QToolButton()
-        btn.setFixedSize(64, 24)
-        btn.setAutoRaise(True)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        if script.pinned:
-            btn.setText("置顶")
-            btn.setToolTip("已置顶，点击取消置顶")
-            btn.setStyleSheet("QToolButton { color: #e67e22; font-weight: bold; }")
-        else:
-            btn.setText("未置顶")
-            btn.setToolTip("置顶：点击后排在列表前面")
-            btn.setStyleSheet("QToolButton { color: #909090; }")
-        btn.clicked.connect(lambda _, n=script.name: self._toggle_pin(n))
-        self.script_list.setItemWidget(item, 2, btn)
-
-    def _show_script_context_menu(self, pos):
-        """脚本列表右键菜单：置顶/取消置顶。"""
-        item = self.script_list.itemAt(pos)
-        if not item:
-            return
-        self.script_list.setCurrentItem(item)
-        name = item.text(0)
-        entry = next((e for e in self._script_entries if e.name == name), None)
-        if entry is None:
-            return
-        menu = QMenu(self)
-        action = QAction("取消置顶" if entry.pinned else "置顶", self)
-        action.triggered.connect(lambda: self._toggle_pin(name))
-        menu.addAction(action)
-        menu.exec(self.script_list.viewport().mapToGlobal(pos))
-
-    def _toggle_pin(self, name):
-        """切换脚本置顶状态并持久化（写入 scripts.json），随后重排列表并保持选中。
-
-        用磁盘上的脚本内容保存：编辑器未保存的修改不回退（save_script 会写 content）。
-        """
-        entry = next((e for e in self._script_entries if e.name == name), None)
-        if entry is None:
-            return
-        entry.pinned = not entry.pinned
-        entry.content = self.script_service.load_script_content(name) or entry.content
-        entry.model_path = self.settings.model_path
-        self.script_service.save_script(entry)
-        self._refresh_script_list()
-        items = self.script_list.findItems(name, Qt.MatchFlag.MatchExactly)
-        if items:
-            self.script_list.setCurrentItem(items[0])
-        self._append_log(f"脚本已{'置顶' if entry.pinned else '取消置顶'}: {name}")
-
     def _refresh_script_statuses(self):
-        """立即刷新脚本列表状态列与控制面板。
+        """立即刷新控制面板运行状态。
 
         旧实现在这里同步跑 tasklist（阻塞 ~0.6s）导致 GUI 卡顿；现改为
         向后台 StatusPoller 请求一轮探测，探测结果经 _apply_script_statuses 回传。
@@ -562,25 +550,23 @@ class MainWindow(QMainWindow):
         self._status_poller.request_poll()
 
     def _apply_script_statuses(self, runtime, alive_set):
-        """GUI 线程：把后台探测到的存活集合渲染到列表与面板（纯内存操作，不卡顿）。"""
-        # 缓存本轮结果：_sync_control_panel 判断运行状态只查缓存，
-        # 不再经 process_service.is_running 同步跑 tasklist 阻塞 GUI 线程
+        """GUI 线程：缓存后台探测结果并刷新控制面板运行状态（纯内存，不卡顿）。
+
+        同时检测"恢复的服务已退出"（有运行时记录、PID 不在存活集、且无
+        LogWorker 代理其生命周期）：清除运行时记录并同步压缩监控面板——
+        LogWorker 的 finished 路径只覆盖本次会话内启动的服务，恢复的服务
+        退出后若不在此处理，压缩面板会一直显示"运行中"。
+        """
         self._last_runtime = runtime
         self._last_alive = alive_set
-        for i in range(self.script_list.topLevelItemCount()):
-            item = self.script_list.topLevelItem(i)
-            name = item.text(0)
-            entry = runtime.get(name) or {}
-            pid = entry.get("pid")
-            alive = isinstance(pid, int) and pid > 0 and pid in alive_set
-            if alive:
-                item.setText(1, f"● 运行中 PID={entry.get('pid')}")
-                item.setForeground(0, QBrush(QColor("#e67e22")))
-                item.setForeground(1, QBrush(QColor("#e67e22")))
-            else:
-                item.setText(1, "已停止")
-                item.setForeground(0, QBrush(QColor("#999999")))
-                item.setForeground(1, QBrush(QColor("#999999")))
+        worker_names = {getattr(w, "script_name", None) for w in self.log_workers}
+        for name, entry in runtime.items():
+            pid = (entry or {}).get("pid")
+            if (name not in worker_names and isinstance(pid, int)
+                    and pid > 0 and pid not in alive_set):
+                self.process_service.clear_runtime(name)
+                self._last_runtime.pop(name, None)
+                self.monitor_compact.on_server_stopped(name)
         self._sync_control_panel()
 
     def _sync_control_panel(self):
@@ -618,24 +604,49 @@ class MainWindow(QMainWindow):
                 "color: green; font-size: 12px; font-weight: bold;"
             )
 
-    def _on_script_selected(self, current, previous):
-        if current:
-            name = current.text(0)
-            self.current_script_name = name
-            content = self.script_service.load_script_content(name)
-            self.script_editor.setPlainText(content)
-            self.monitor_tab.set_focus_script(name)
-            self.monitor_compact.set_focus_script(name)
-            self._sync_control_panel()
-            # 外网地址/聊天地址按选中脚本重算（多服务器下各脚本 host/port 不同）
-            self._update_external_url()
-        else:
-            # 取消选中 → 控制面板回退全局状态（旧版本启动/last_pid 恢复的进程）
-            self.current_script_name = ""
-            self.monitor_tab.set_focus_script("")
-            self.monitor_compact.set_focus_script("")
-            self._sync_control_panel()
-            self._update_external_url()
+    def _script_name_for(self, model_path):
+        """模型路径 → 脚本名：已有绑定（路径比较大小写不敏感）复用其名，
+        防止同一文件以不同大小写重新选择时派生出重复脚本；未绑定才派生。"""
+        if not model_path:
+            return ""
+        existing = self.script_service.get_script_for_model(model_path)
+        return existing.name if existing else ScriptEntry.derive_name(model_path)
+
+    def _on_model_changed(self):
+        """模型切换后的统一刷新：绑定脚本自动带出；无绑定则自动生成基础参数。
+
+        脚本即模型，无独立脚本名。current_script_name 为模型推导出的内部 key。
+        """
+        self.current_script_name = self._script_name_for(self.settings.model_path)
+        # 先刷新模型信息与 ctx 挡位（GGUF 上限），再回填表单——
+        # set_preset 的整体重置会用到新模型的挡位默认值
+        self.script_form.set_model_path(self.settings.model_path)
+        entry = self.script_service.get_script_for_model(self.settings.model_path)
+        if entry and entry.content:
+            self.script_form.set_preset(parse_bat_params(entry.content))
+            self._append_log(f"已载入该模型的绑定脚本参数")
+        elif self.settings.model_path:
+            # 懒人流：选中模型即自动生成基础参数，用户直接在表单微调
+            self.script_form.set_preset(auto_generate_config(self.settings.model_path))
+            self._append_log("已按该模型自动生成基础参数，可在表单微调后保存")
+        self.script_form.set_alias_auto(self.settings.model_path)
+        self.monitor_compact.set_focus_script(self.current_script_name)
+        self._sync_control_panel()
+        self._update_external_url()
+        # 原文视图展开时统一刷新：绑定脚本原文 / 表单渲染 / 清空（无模型）三种来源
+        if self.view_raw_btn.isChecked():
+            self.script_editor.setPlainText(
+                entry.content if entry and entry.content
+                else self._form_to_content()
+            )
+
+    def _on_ts_ip_changed(self):
+        """Tailscale IP 手动指定/修改后：写入配置、刷新 host 下拉与外网地址。"""
+        v = self.ts_ip_edit.text().strip()
+        self.settings.tailscale_ip = v
+        self.settings.save()
+        self.script_form.refresh_tailscale_ip()
+        self._update_external_url()
 
     def _select_llamacpp_path(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -662,8 +673,9 @@ class MainWindow(QMainWindow):
                 self.model_path_edit.setText(path)
                 self.settings.model_path = path
                 self.settings.save()
-                self._append_log(f"模型文件已设置: {path}")
                 self._auto_bind_visual_model(path)
+                self._on_model_changed()
+                self._append_log(f"模型文件已设置: {path}")
             else:
                 QMessageBox.warning(self, "验证失败", "请选择 .gguf 格式的模型文件。")
 
@@ -705,10 +717,13 @@ class MainWindow(QMainWindow):
             self.model_path_edit.setText(path)
             self.settings.model_path = path
             self.settings.save()
-            self._append_log(f"模型已选择: {path}")
             self._auto_bind_visual_model(path)
+            self._on_model_changed()
+            self._append_log(f"模型已选择: {path}")
         else:
             QMessageBox.warning(self, "验证失败", "请选择 .gguf 格式的模型文件。")
+            # 回滚下拉选中项到当前生效模型，避免显示与实际不一致
+            self._reload_model_combo()
 
     def _auto_bind_visual_model(self, model_path):
         """按所选模型自动填充外挂视觉模型路径；无 mmproj 时清空，避免误绑到非视觉模型。"""
@@ -733,111 +748,71 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "验证失败", "请选择 .gguf 格式的模型文件。")
 
-    def _new_script(self):
-        self.current_script_name = ""
-        self.script_list.clearSelection()
-        llamacpp_path = self.settings.llamacpp_path
+    def _generate_script(self):
+        """一键生成：按当前所选模型用基础模板重新自动推算参数填入表单（可微调后保存）。
+
+        脚本即模型，无需脚本名。懒人流下选中模型已自动生成，此按钮供"想重置回基础参数"时用。
+        """
         model_path = self.settings.model_path
-
-        if not llamacpp_path or not model_path:
-            QMessageBox.warning(
-                self, "提示",
-                "请先设置 llama-server.exe 和模型文件的路径。",
-            )
-            self.script_editor.clear()
-            self.script_editor.setPlaceholderText(
-                "请先在上方路径配置中选择 llama-server.exe 和 .gguf 模型文件。"
-            )
+        if not model_path:
+            QMessageBox.warning(self, "提示", "请先选择模型文件（.gguf）。")
             return
-
-        # 自动命名：默认取所选模型文件名（去扩展名），对话框内可修改
-        default_name = os.path.splitext(os.path.basename(model_path))[0]
-        exe_dir = os.path.dirname(llamacpp_path)
-        dialog = NewScriptDialog(
-            self,
-            visual_model_path=self.settings.visual_model_path,
-            default_name=default_name,
-        )
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            name = dialog.get_name()
-            if not name:
-                QMessageBox.warning(self, "提示", "脚本名称不能为空。")
-                return
-            config = dialog.get_config()
-            bat_content = build_bat_content(
-                exe_dir, model_path, config,
-                visual_model_path=self.settings.visual_model_path,
-            )
-            self.script_editor.setPlainText(bat_content)
-            self.current_script_name = name
-            # 新建脚本默认置顶（用户可右键取消）
-            entry = ScriptEntry(
-                name=name, content=bat_content, model_path=model_path, pinned=True
-            )
-            bat_path = self.script_service.save_script(entry)
-            self._refresh_script_list()
-            item = self.script_list.findItems(name, Qt.MatchFlag.MatchExactly)
-            if item:
-                self.script_list.setCurrentItem(item[0])
-            self._append_log(f"脚本已新建并保存: {bat_path}")
+        if not self.settings.llamacpp_path:
+            QMessageBox.warning(self, "提示", "请先选择 llama-server.exe。")
+            return
+        # 先刷新模型信息与 ctx 挡位，再回填（同 _on_model_changed 的顺序约束）
+        self.script_form.set_model_path(model_path)
+        self.script_form.set_preset(auto_generate_config(model_path))
+        self.script_form.set_alias_auto(model_path)
+        if self.view_raw_btn.isChecked():
+            self.script_editor.setPlainText(self._form_to_content())
+        base = os.path.splitext(os.path.basename(model_path))[0]
+        self._append_log(f"已按模型重新生成基础参数，可微调后保存: {base}")
 
     def _save_script(self):
-        if self.current_script_name:
-            content = self.script_editor.toPlainText()
-            if not content.strip():
-                QMessageBox.warning(self, "提示", "脚本内容为空，无法保存。")
-                return
-            # 保存既有脚本时保留其置顶状态
-            pinned = next(
-                (e.pinned for e in self._script_entries if e.name == self.current_script_name),
-                False,
-            )
-            entry = ScriptEntry(
-                name=self.current_script_name,
-                content=content,
-                model_path=self.settings.model_path,
-                pinned=pinned,
-            )
-            bat_path = self.script_service.save_script(entry)
-            if bat_path:
-                self._append_log(f"脚本已保存: {bat_path}")
-        else:
-            # 保存新脚本：预填所选模型名作为默认名称（可改）；新建默认置顶
-            default_name = os.path.splitext(os.path.basename(self.settings.model_path))[0]
-            name, ok = QInputDialog.getText(
-                self, "保存脚本", "请输入脚本名称:", text=default_name,
-            )
-            if ok and name:
-                content = self.script_editor.toPlainText()
-                entry = ScriptEntry(
-                    name=name, content=content,
-                    model_path=self.settings.model_path, pinned=True,
-                )
-                bat_path = self.script_service.save_script(entry)
-                if bat_path:
-                    self._refresh_script_list()
-                    item = self.script_list.findItems(name, Qt.MatchFlag.MatchExactly)
-                    if item:
-                        self.script_list.setCurrentItem(item[0])
-                    self._append_log(f"脚本已保存: {bat_path}")
+        """从表单生成 .bat 并绑定保存到当前模型（模型即脚本标识）。"""
+        model_path = self.settings.model_path
+        if not model_path:
+            QMessageBox.warning(self, "提示", "请先选择模型文件（.gguf）。")
+            return
+        if not self.settings.llamacpp_path:
+            QMessageBox.warning(self, "提示", "请先选择 llama-server.exe。")
+            return
+        exe_dir = os.path.dirname(self.settings.llamacpp_path)
+        content = build_bat_content(
+            exe_dir, model_path, self.script_form.get_config(),
+            visual_model_path=self.settings.visual_model_path,
+        )
+        if not content.strip():
+            QMessageBox.warning(self, "提示", "请至少勾选一个参数。")
+            return
+        name = self._script_name_for(model_path)
+        bat_path = self.script_service.save_script(
+            ScriptEntry(name=name, content=content, model_path=model_path))
+        if not bat_path:
+            return
+        self.current_script_name = name
+        if self.view_raw_btn.isChecked():
+            self.script_editor.setPlainText(content)
+        self._append_log(f"脚本已绑定保存到该模型: {bat_path}")
 
     def _delete_script(self):
-        current = self.script_list.currentItem()
-        if not current:
-            QMessageBox.warning(self, "提示", "请先选择一个脚本。")
+        """删除当前模型绑定的脚本（不删除模型文件本身）。"""
+        if not self.settings.model_path:
+            QMessageBox.warning(self, "提示", "当前未选择模型。")
             return
-        name = current.text(0)
+        name = self._script_name_for(self.settings.model_path)
         reply = QMessageBox.question(
             self, "确认删除",
-            f"确定要删除脚本 '{name}' 吗？",
+            f"确定要删除当前模型绑定的脚本吗？\n（对模型文件无影响）",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
             self.script_service.delete_script(name)
-            self._refresh_script_list()
+            self.script_form.clear_form()
             self.script_editor.clear()
             self.current_script_name = ""
-            self._append_log(f"脚本已删除: {name}")
+            self._append_log("已删除绑定到当前模型的脚本")
 
     def _run_script(self):
         if self.is_running:
@@ -845,34 +820,24 @@ class MainWindow(QMainWindow):
             return
 
         if not self.current_script_name:
-            if self.script_list.topLevelItemCount() > 0:
-                self.script_list.setCurrentItem(self.script_list.topLevelItem(0))
-                if not self.current_script_name:
-                    return
-            else:
-                QMessageBox.warning(self, "提示", "没有可运行的脚本，请先新建脚本。")
-                return
+            QMessageBox.warning(self, "提示", "请先选择模型文件（脚本绑定模型）。")
+            return
 
-        content = self.script_editor.toPlainText()
+        content = self._form_to_content()
+        m_path = parse_model_path_from_bat(content) or self.settings.model_path
         if not content.strip():
-            QMessageBox.warning(self, "提示", "脚本内容为空，请先编写或生成脚本。")
+            QMessageBox.warning(self, "提示", "请先一键生成或填写脚本内容。")
             return
 
         # 运行前自动保存：编辑器内容与磁盘不一致（或 .bat 不存在）时先落盘，
         # 保证"所见即所执行"——否则执行的是磁盘旧参数而界面显示新参数
         bat_path = self.script_service.get_script_path(self.current_script_name)
         disk_content = self.script_service.load_script_content(self.current_script_name)
-        if content != disk_content:
-            # 保留置顶状态：upsert 会整条目覆盖，漏传 pinned 会把置顶静默取消
-            pinned = next(
-                (e.pinned for e in self._script_entries if e.name == self.current_script_name),
-                False,
-            )
+        if content != disk_content or not disk_content:
             entry = ScriptEntry(
                 name=self.current_script_name,
                 content=content,
-                model_path=self.settings.model_path,
-                pinned=pinned,
+                model_path=m_path,
             )
             bat_path = self.script_service.save_script(entry)
             self._append_log("脚本内容已修改，运行前自动保存")
@@ -900,20 +865,17 @@ class MainWindow(QMainWindow):
                         rf"--port[=\s]+{port}\b", f"--port {next_port}", content
                     )
                     port = next_port
-                    # 端口改写保存同样保留置顶状态（漏传会静默取消置顶）
-                    pinned = next(
-                        (e.pinned for e in self._script_entries
-                         if e.name == self.current_script_name),
-                        False,
-                    )
+                    # 端口改写保存（脚本绑定模型，无置顶概念）
                     entry = ScriptEntry(
                         name=self.current_script_name,
                         content=content,
-                        model_path=self.settings.model_path,
-                        pinned=pinned,
+                        model_path=m_path,
                     )
                     self.script_service.save_script(entry)
-                    self.script_editor.setPlainText(content)
+                    # 端口改写同步回表单，保证表单与运行内容一致
+                    self.script_form.set_preset(parse_bat_params(content))
+                    if self.view_raw_btn.isChecked():
+                        self.script_editor.setPlainText(content)
                     self._append_log(f"端口已自动改为 {next_port} 并保存")
             else:
                 reply = QMessageBox.question(
@@ -936,15 +898,9 @@ class MainWindow(QMainWindow):
         worker.server_ready_signal.connect(
             lambda url, name=self.current_script_name: self._on_server_ready(name, url)
         )
-        worker.tps_signal.connect(self.monitor_tab.update_tps)
         worker.tps_signal.connect(self.monitor_compact.update_tps)
         worker.finished.connect(lambda w=worker: self._on_run_finished(w))
         # 多服务器：退出时带上脚本名，只重置该服务的状态（不顶掉其他服务）
-        worker.finished.connect(
-            lambda w=worker: self.monitor_tab.on_server_stopped(
-                getattr(w, "script_name", "") or "default"
-            )
-        )
         worker.finished.connect(
             lambda w=worker: self.monitor_compact.on_server_stopped(
                 getattr(w, "script_name", "") or "default"
@@ -960,12 +916,14 @@ class MainWindow(QMainWindow):
             "color: orange; font-size: 12px; font-weight: bold;"
         )
         self._refresh_script_statuses()
-        self.monitor_tab.on_server_started(self.current_script_name or "default")
         self.monitor_compact.on_server_started(self.current_script_name or "default")
 
     def _on_server_ready(self, name, url):
-        """服务就绪（按脚本归属）：记录该脚本的 URL 并刷新外网地址显示。"""
-        url = url.replace("0.0.0.0", "127.0.0.1")
+        """服务就绪（按脚本归属）：记录该脚本的 URL 并刷新外网地址显示。
+
+        保留原始 host（可能是 0.0.0.0），由消费方（聊天地址等）统一把
+        0.0.0.0 解析为 Tailscale IP / 127.0.0.1，避免过早丢失"所有接口"信息。
+        """
         self._server_urls[name] = url
         self._append_log(f"检测到服务已就绪: {url}")
         self._update_external_url()
@@ -984,9 +942,9 @@ class MainWindow(QMainWindow):
             name in self._server_urls
             or any(getattr(w, "script_name", None) == name for w in self.log_workers)
         )
-        ts_ip = get_tailscale_ipv4()
+        ts_ip = self._ts_ip_fast()
         if running and ts_ip:
-            content = self.script_editor.toPlainText()
+            content = self._form_to_content()
             host = extract_host(content, default="127.0.0.1")
             if host in ("0.0.0.0", ts_ip):
                 port = extract_port(content, default=8080)
@@ -1001,6 +959,43 @@ class MainWindow(QMainWindow):
         self._ts_url = ""
         self.ts_url_label.setVisible(False)
         self.ts_copy_btn.setVisible(False)
+
+    # ── Tailscale IP（后台探测，GUI 线程只读缓存）──────────────────
+
+    def _ts_ip_fast(self):
+        """GUI 线程快速取 Tailscale IP：手动指定即时生效（无子进程）；
+        自动检测只读上次探测缓存，缓存缺失/超过 TTL 时触发后台探测——
+        绝不在此同步跑 tailscale 子进程（timeout 3s×2，最坏阻塞 GUI ~6s）。
+        """
+        override = (self.settings.tailscale_ip or "").strip()
+        if override and is_tailscale_ip(override):
+            return override
+        if time.monotonic() - self._ts_ip_probed_at >= TS_PROBE_TTL:
+            self._request_ts_probe()
+        return self._ts_ip
+
+    def _request_ts_probe(self):
+        """后台探测 Tailscale IP（探测中不叠加 worker）。"""
+        if self._ts_probe_worker and self._ts_probe_worker.isRunning():
+            return
+        self._ts_ip_probed_at = time.monotonic()
+        worker = TailscaleProbeWorker(parent=self)
+        worker.ip_signal.connect(self._on_ts_ip_probed)
+        worker.finished.connect(lambda w=worker: self._drop_ts_worker(w))
+        self._ts_probe_worker = worker
+        worker.start()
+
+    def _drop_ts_worker(self, worker):
+        """探测线程结束：移出引用并释放（防会话内累积、防悬空引用）。"""
+        if self._ts_probe_worker is worker:
+            self._ts_probe_worker = None
+        worker.deleteLater()
+
+    def _on_ts_ip_probed(self, ip):
+        """探测完成：IP 变化才重算外网地址（未变则保持现状）。"""
+        if ip != self._ts_ip:
+            self._ts_ip = ip
+            self._update_external_url()
 
     def _copy_ts_url(self):
         if self._ts_url:
@@ -1058,6 +1053,9 @@ class MainWindow(QMainWindow):
             # 同步清缓存（不等下一轮轮询），按钮/状态列立即反映
             self._last_runtime.pop(name, None)
             self._server_urls.pop(name, None)
+            if stopped:
+                # 恢复的服务没有 LogWorker 代理 finished 信号，手动同步压缩面板
+                self.monitor_compact.on_server_stopped(name)
         else:
             stopped = self.process_service.stop_by_pid()
             self._legacy_running = False
@@ -1070,7 +1068,11 @@ class MainWindow(QMainWindow):
         self._refresh_script_statuses()
 
     def _cleanup_all_processes(self):
-        """显式清理全部 llama 进程（含手动启动的实例），需确认。"""
+        """显式清理全部 llama 进程（含手动启动的实例），需确认。
+
+        tasklist+taskkill 循环（多实例时秒级）放后台 KillAllLlamaWorker 执行，
+        不阻塞 GUI；完成后回 GUI 线程统一重置状态。
+        """
         reply = QMessageBox.question(
             self, "确认清理全部 llama 进程",
             "此操作将结束本机所有 llama-server.exe / main.exe 进程，"
@@ -1080,7 +1082,16 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        killed = self.process_service.stop_by_name()
+        self.cleanup_all_btn.setEnabled(False)
+        self.cleanup_all_btn.setText("清理中...")
+        self._killall_worker = KillAllLlamaWorker(self.process_service, parent=self)
+        self._killall_worker.killed_signal.connect(self._on_cleanup_all_done)
+        self._killall_worker.start()
+
+    def _on_cleanup_all_done(self, killed):
+        """清理完成（GUI 线程）：记录日志并重置全部运行状态。"""
+        self.cleanup_all_btn.setEnabled(True)
+        self.cleanup_all_btn.setText("清理全部llama进程")
         if killed:
             detail = ", ".join(f"{k['name']}(PID={k['pid']})" for k in killed)
             self._append_log(f"已清理全部 llama 进程: {detail}")
@@ -1094,6 +1105,8 @@ class MainWindow(QMainWindow):
         self._last_alive = set()
         self._legacy_running = False
         self._server_urls.clear()
+        # 恢复的服务没有 LogWorker 代理 finished，这里整体重置压缩面板
+        self.monitor_compact.on_all_servers_stopped()
         self._sync_control_panel()
         self._refresh_script_statuses()
 
@@ -1117,15 +1130,34 @@ class MainWindow(QMainWindow):
         """返回当前运行中模型的 API 地址（供聊天页自动填充）。
 
         优先顺序：选中脚本的就绪 URL → 其他就绪 URL（最近一次）→
-        pids.json 中记录的脚本端口 + host 推导地址（--host 为 Tailscale IP
-        时用该 IP，保证本地浏览器可达）。
+        pids.json 中记录的脚本端口 + host 推导地址。
+        host 解析：0.0.0.0（所有接口）优先用 Tailscale IP（含手动指定），无则
+        127.0.0.1；已是 Tailscale IP / 127.0.0.1 则原样保留，保证本地与远程可达。
         """
+        def resolve(host, port):
+            host = (host or "").strip()
+            if host in ("0.0.0.0", ""):
+                host = get_tailscale_ipv4() or "127.0.0.1"
+            return f"http://{host}:{port}"
+
+        def url_to_host_port(url):
+            m = re.match(r"http://([^:]+):(\d+)", url or "")
+            if m:
+                return m.group(1), int(m.group(2))
+            return None, None
+
+        # 1) 就绪 URL（可能已含 0.0.0.0 / Tailscale IP），统一解析 host
+        candidates = []
         if self.current_script_name:
-            url = self._server_urls.get(self.current_script_name)
-            if url:
-                return url
+            candidates.append(self._server_urls.get(self.current_script_name))
         elif self._server_urls:
-            return next(iter(self._server_urls.values()))
+            candidates.append(next(iter(self._server_urls.values())))
+        for url in candidates:
+            host, port = url_to_host_port(url)
+            if port:
+                return resolve(host, port)
+
+        # 2) 运行时记录（pids.json）
         runtime = self.process_service.load_runtime()
         if self.current_script_name and self.current_script_name in runtime:
             runtime = {self.current_script_name: runtime[self.current_script_name]}
@@ -1133,52 +1165,12 @@ class MainWindow(QMainWindow):
             port = entry.get("port")
             if isinstance(port, int) and port > 0:
                 host = entry.get("host") or "127.0.0.1"
-                if host in ("0.0.0.0", ""):
-                    host = "127.0.0.1"
-                return f"http://{host}:{port}"
+                return resolve(host, port)
         return ""
 
     def _open_settings(self):
         dialog = SettingsDialog(self)
         dialog.exec()
-
-    def _check_update(self):
-        self.check_update_btn.setEnabled(False)
-        self.check_update_btn.setText("检查中...")
-        self.update_date_label.setText("")
-        self.worker = CheckUpdateWorker()
-        self.worker.result_signal.connect(self._on_update_result)
-        self.worker.start()
-
-    def _on_update_result(self, date_str, error_msg):
-        self.check_update_btn.setEnabled(True)
-        self.check_update_btn.setText("检查llama.cpp更新")
-        if date_str:
-            self.update_date_label.setText(f"最后更新: {date_str}")
-            self._append_log(f"llama.cpp 最新版本发布日期: {date_str}")
-        else:
-            self.update_date_label.setText("获取失败")
-            reason = f"检查llama.cpp更新失败: {error_msg}" if error_msg else "检查llama.cpp更新失败，请检查网络连接"
-            self._append_log(reason)
-
-    def _check_app_update(self):
-        self.check_app_update_btn.setEnabled(False)
-        self.check_app_update_btn.setText("检查中...")
-        self.app_update_date_label.setText("")
-        self.app_worker = CheckAppUpdateWorker()
-        self.app_worker.result_signal.connect(self._on_app_update_result)
-        self.app_worker.start()
-
-    def _on_app_update_result(self, date_str, error_msg):
-        self.check_app_update_btn.setEnabled(True)
-        self.check_app_update_btn.setText("检查软件更新")
-        if date_str:
-            self.app_update_date_label.setText(f"最新发行: {date_str}")
-            self._append_log(f"软件最新版本发布日期: {date_str}")
-        else:
-            self.app_update_date_label.setText("获取失败")
-            reason = f"检查软件更新失败: {error_msg}" if error_msg else "检查软件更新失败，请检查网络连接"
-            self._append_log(reason)
 
     def _append_log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1211,7 +1203,6 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    import time
     from PyQt6.QtWidgets import QApplication, QMessageBox
     from PyQt6.QtGui import QFont
     from PyQt6.QtCore import QLockFile
@@ -1220,24 +1211,27 @@ def main():
     app.setFont(QFont())
 
     # 单实例锁：防止多个 GUI 并发运行（旧实例占用桥端口、
-    # Windows SO_REUSEADDR 重叠绑定导致"新代码不生效"假象，见 traps #7）
-    os.makedirs("data", exist_ok=True)
-    lock = QLockFile(os.path.join("data", "app.lock"))
-    if not lock.tryLock():
-        # 托盘"重启"时新实例可能先于旧实例退出启动：短暂重试等旧实例释放锁
-        locked = False
-        for _ in range(10):
-            time.sleep(0.15)
-            if lock.tryLock():
-                locked = True
-                break
-        if not locked:
-            QMessageBox.warning(
-                None, "已在运行",
-                "LlamaCPP GUI 已在运行。\n请使用已有窗口（或从系统托盘唤起），"
-                "或先退出旧实例后再启动。",
-            )
-            return
+    # Windows SO_REUSEADDR 重叠绑定导致"新代码不生效"假象，见 traps #7）。
+    # 托盘"重启"拉起的实例跳过此锁：重启是用户显式意图，旧实例很快退出，
+    # 锁若被残留/僵尸实例占住会误拦重启。普通首次启动仍受单实例保护。
+    if os.environ.get("LLAMACPP_RESTARTING") != "1":
+        os.makedirs("data", exist_ok=True)
+        lock = QLockFile(os.path.join("data", "app.lock"))
+        if not lock.tryLock():
+            # 普通手动重复启动：短暂重试后仍占用则提示，尽快返回避免假死
+            locked = False
+            for _ in range(3):
+                time.sleep(0.15)
+                if lock.tryLock():
+                    locked = True
+                    break
+            if not locked:
+                QMessageBox.warning(
+                    None, "已在运行",
+                    "LlamaCPP GUI 已在运行。\n请使用已有窗口（或从系统托盘唤起），"
+                    "或先退出旧实例后再启动。",
+                )
+                return
 
     window = MainWindow()
     window.show()

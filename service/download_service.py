@@ -8,6 +8,7 @@ from model.download_entry import DownloadEntry, DownloadQueue
 from service import model_sources
 from service.download_client import download_file
 from utils.logger import error
+from utils.path_utils import normalize_path
 
 
 class PauseException(Exception):
@@ -109,7 +110,8 @@ class DownloadManager(QObject):
 
         filename = os.path.basename(file_path)
         # 下载目录可能已变更，本地文件存在性基于新算出的 dest_path 判断
-        dest_path = os.path.join(dl_path, filename)
+        # （归一化为正斜线，与队列持久化/移除按钮的键保持一致）
+        dest_path = normalize_path(os.path.join(dl_path, filename))
         local_size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
 
         if existing and existing.status in ("paused", "downloading", "pending"):
