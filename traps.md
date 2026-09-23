@@ -741,6 +741,38 @@ model_watch_tab 曾残留旧同步 `refresh()` 覆盖了后台版）；`migrate_
 
 ***
 
+## #36 搜索页手动追踪的模型在追踪页消失——后台 worker 持内存旧快照整体覆盖写盘
+
+**现象**：在模型搜索页对未下载的模型点"追踪"（提示成功），切到"模型更新追踪"
+标签页却看不到它；检查 data/model_watchlist.json 里只剩 added_by=local 的条目，
+手动追踪的条目彻底消失（数据丢失，不只是不显示）。
+
+**根因**：关注列表有多个写入入口（搜索页 add_manual_model / 追踪页 merge_local_models
+与 check_updates / 移除），而后台 worker 拿的都是 UI 传入的**内存旧快照**：
+1. `ModelWatchTab._request_merge` 把 `self._watchlist`（不含刚追踪的条目）传给
+   WatchMergeWorker；
+2. worker 扫描完调 `merge_local_models(dir, 旧快照)` → `_save_watchlist(旧快照
+   +本地新增)` **整体覆盖写盘**——磁盘上 add_manual_model 刚写入的 manual 条目
+   被冲掉；
+3. WatchCheckWorker 同样吃旧快照写盘（检查耗时 15s+，窗口更大）。
+
+**解决方案**（双层防御，service 层收口）：
+1. `_save_watchlist` 改**合并语义**：写盘前重读磁盘，磁盘有而内存没有的条目
+   保留（按 model_id 去重，内存优先），并统一剔除 ignored 条目（防"移除"被
+   旧快照复活）；所有写路径返回合并后的全量列表；
+2. worker 一律磁盘重读（`merge_local_models(dir)`/`check_updates(load_watchlist())`），
+   不再信任 UI 快照；
+3. `remove_model` 顺序调整：先写 ignored 再删条目写盘（否则合并语义会把刚删
+   的从磁盘捞回）。
+补 3 例回归测试（stale 快照保 manual / 检查期间写入不丢 / 移除不被旧快照复活）。
+
+**教训**：多入口读改写同一 JSON 文件时，任何"用读时快照整体覆盖写盘"的后台
+耗时操作（扫描/网络检查）都是数据丢失源——写盘必须合并（或加锁 + 重读），
+快照只用于展示层。UI 向 worker 传"当前状态"前先问：执行期间别的入口会不会
+已经改了磁盘？
+
+***
+
 ## #34 聊天页取不到正在运行模型的地址——provider 两层来源都只查"当前选中"
 
 **现象**：运行 A 模型后切到 B 模型调参，点"聊天窗口"打开聊天页，模型 API 地址

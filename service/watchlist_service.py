@@ -40,9 +40,22 @@ def load_watchlist() -> list[dict]:
     return _load_watchlist()
 
 
-def _save_watchlist(watchlist: list[dict]):
+def _save_watchlist(watchlist: list[dict]) -> list[dict]:
+    """合并磁盘后写盘（traps #36）：扫描/检查是后台耗时操作，期间其他入口
+    （搜索页"追踪"、设置页移除）可能已写盘——用旧快照整体覆盖会把这些写入
+    冲掉。统一按 model_id 去重（本次内存列表优先），并剔除 ignored 条目
+    （防"移除"被旧快照复活）。返回合并后的列表（调用方继续用全量结果）。"""
+    watchlist = [w for w in watchlist if isinstance(w, dict) and w.get("model_id")]
+    ids = {w["model_id"] for w in watchlist}
+    for d in _load_watchlist():
+        if d["model_id"] not in ids:
+            watchlist.append(d)
+    ignored = _load_ignored()
+    if ignored:
+        watchlist = [w for w in watchlist if w["model_id"] not in ignored]
     os.makedirs(os.path.dirname(WATCHLIST_FILE) or ".", exist_ok=True)
     atomic_write_json(WATCHLIST_FILE, watchlist, ensure_ascii=False, indent=2)
+    return watchlist
 
 
 def _load_ignored() -> set[str]:
@@ -103,8 +116,7 @@ def merge_local_models(model_dir: str, watchlist: list[dict] | None = None) -> l
             "last_updated": None,  # 待首次检查填充基线
             "last_checked": "",
         })
-    _save_watchlist(watchlist)
-    return watchlist
+    return _save_watchlist(watchlist)
 
 
 def add_manual_model(model_id: str, watchlist: list[dict] | None = None) -> list[dict]:
@@ -123,19 +135,21 @@ def add_manual_model(model_id: str, watchlist: list[dict] | None = None) -> list
         "last_updated": None,
         "last_checked": "",
     })
-    _save_watchlist(watchlist)
-    return watchlist
+    return _save_watchlist(watchlist)
 
 
 def remove_model(model_id: str, watchlist: list[dict] | None = None):
-    """从关注列表移除，并标记为忽略（本地模型不再被自动加回）。"""
-    watchlist = watchlist if watchlist is not None else _load_watchlist()
-    watchlist = [w for w in watchlist if w["model_id"] != model_id]
-    _save_watchlist(watchlist)
+    """从关注列表移除，并标记为忽略（本地模型不再被自动加回）。
+
+    先写 ignored 再写列表：_save_watchlist 是合并语义（磁盘条目不丢），
+    若先删后写 ignored，合并会把刚移除的条目从磁盘捞回来。
+    """
     ignored = _load_ignored()
     ignored.add(model_id)
     _save_ignored(ignored)
-    return watchlist
+    watchlist = watchlist if watchlist is not None else _load_watchlist()
+    watchlist = [w for w in watchlist if w["model_id"] != model_id]
+    return _save_watchlist(watchlist)
 
 
 def fetch_last_updated(model_id: str) -> int:

@@ -12,13 +12,16 @@ from utils.logger import error
 class WatchCheckWorker(QThread):
     finished_signal = pyqtSignal(list)  # check_updates 结果列表
 
-    def __init__(self, watchlist, parent=None):
+    def __init__(self, watchlist=None, parent=None):
         super().__init__(parent)
-        self._watchlist = watchlist or []
+        # watchlist 参数仅为调用兼容保留：检查以磁盘为准（见 run）
 
     def run(self):
         try:
-            results = watchlist_service.check_updates(self._watchlist)
+            # 磁盘重读（不信任 UI 快照）：检查耗时 15s+，期间搜索页"追踪"
+            # 等入口可能已写盘，用旧快照检查并写盘会把它们冲掉（traps #36）
+            results = watchlist_service.check_updates(
+                watchlist_service.load_watchlist())
         except Exception as e:
             error(f"模型更新检查异常: {e}")
             results = []
@@ -38,8 +41,10 @@ class WatchMergeWorker(QThread):
 
     def run(self):
         try:
-            merged = watchlist_service.merge_local_models(self._model_dir, self._current)
+            # 磁盘重读（不信任 UI 快照）：扫描耗时期间其他入口的写入
+            # 不能被旧快照覆盖（traps #36）
+            merged = watchlist_service.merge_local_models(self._model_dir)
         except Exception as e:
             error(f"本地模型并入关注列表异常: {e}")
-            merged = list(self._current or [])
+            merged = watchlist_service.load_watchlist() or list(self._current or [])
         self.merged_signal.emit(merged)

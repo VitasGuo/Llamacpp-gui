@@ -56,9 +56,11 @@ class ModelWatchTab(QWidget):
         self._merge_worker.start()
 
     def _on_merged(self, merged):
-        """扫描完成：有新增才重渲染；按意图触发网络检查。"""
-        if len(merged) != len(self._watchlist):
-            self._watchlist = merged
+        """扫描完成：内存列表总是更新（磁盘可能含其他入口加入的条目）；
+        长度变化才重渲染（避免已有高亮被"待检查"覆盖，随后检查会重渲染）。"""
+        length_changed = len(merged) != len(self._watchlist)
+        self._watchlist = merged
+        if length_changed:
             self._refresh_watch_table()
         if self._pending_check:
             self._pending_check = False

@@ -126,5 +126,56 @@ class TestIgnoreRemove(unittest.TestCase):
                 self.assertEqual(sum(1 for w in wl if w["model_id"] == mid), 1)
 
 
+class TestMergeSaveSemantics(unittest.TestCase):
+    """写盘合并语义（traps #36）：后台扫描/检查用旧快照写盘时，
+    其他入口（搜索页"追踪"/手动移除）已写入磁盘的条目不能丢。"""
+
+    def setUp(self):
+        fd, self.cfg = tempfile.mkstemp()
+        os.close(fd)
+        self.ign_cfg = self.cfg + ".ign"
+
+    def _patch(self):
+        stack = ExitStack()
+        stack.enter_context(mock.patch.object(ws, "WATCHLIST_FILE", self.cfg))
+        stack.enter_context(mock.patch.object(ws, "WATCHLIST_IGNORED_FILE", self.ign_cfg))
+        return stack
+
+    def test_merge_with_stale_snapshot_keeps_manual_entry(self):
+        # 复现用户 bug：搜索页追踪（写盘）→ 追踪页 merge 持旧快照写盘
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_local_model(tmp, "org", "local-model")
+            with self._patch():
+                stale = ws.merge_local_models(tmp)  # tab 内存快照（不含 manual）
+                ws.add_manual_model("org/manual-model")  # 搜索页写入磁盘
+                # merge 用旧快照跑（修复前：manual 条目被整体覆盖冲掉）
+                merged = ws.merge_local_models(tmp, stale)
+                ids = {w["model_id"] for w in merged}
+                self.assertIn("org/manual-model", ids)
+                self.assertIn("org/local-model", ids)
+
+    def test_check_with_stale_snapshot_keeps_manual_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._patch():
+                stale = [{"model_id": "a/b", "last_updated": 100}]
+                ws._save_watchlist(stale)
+                ws.add_manual_model("x/y")  # 检查期间其他入口写入
+                with mock.patch.object(ws, "fetch_last_updated", return_value=100):
+                    ws.check_updates(stale)  # 用旧快照检查并写盘
+                ids = {w["model_id"] for w in ws._load_watchlist()}
+                self.assertIn("a/b", ids)
+                self.assertIn("x/y", ids)
+
+    def test_remove_survives_concurrent_merge_save(self):
+        # 移除后，另一个入口持旧快照写盘：被移除条目不得复活
+        with tempfile.TemporaryDirectory() as tmp:
+            mid = _make_local_model(tmp, "org", "repo")
+            with self._patch():
+                stale = ws.merge_local_models(tmp)  # 旧快照（含 repo）
+                ws.remove_model(mid)  # 用户移除（ignored + 磁盘删除）
+                ws._save_watchlist(stale)  # 旧快照写盘（合并语义 + ignored 过滤）
+                self.assertEqual(ws._load_watchlist(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
