@@ -4,12 +4,13 @@
 
 - **目标**：在本地 Windows 环境运行 LlamaCPP GUI（PyQt6 桌面客户端），用于管理本地 llama.cpp 推理服务器。
 
-- **当前版本**：v1.16.2（2026-09-23，ctx 挡位补充 200K 细分挡）
+- **当前版本**：v1.16.3（2026-09-23，修复聊天页自动填充运行中模型地址）
 
 ## 版本历史
 
 | 版本     | 日期         | 说明                                                                                                                                                       |
 | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| v1.16.3 | 2026-09-23 | 修复聊天页取不到正在运行模型的 API 地址（traps #34）：`_current_llm_url` 两层来源（就绪 URL/pids.json）都只查"当前选中脚本"，切到其他模型调参时返回空——改为"选中名优先、回退任意运行中记录"（纯函数 `_pick_llm_url`，7 例回归测试）；伴生修复：host 解析不再在桥服务 HTTP 线程同步跑 `get_tailscale_ipv4()` 探测子进程（最坏阻塞 ~6s，R12 后台化漏改点），改读手动指定/探测缓存；另整合 fork 上游 merge（转义字符/主线程卡死两提交，冲突取本地版）并移植 GBK 回退解码（cmd 中文报错不再变问号）；139 全绿 |
 | v1.16.2 | 2026-09-23 | ctx 基础挡位补充 **200K (204800)** 细分挡（不作为默认值，仅手选；1M 挡 v1.16.1 已有）；默认值规则不变（上限<128K 取最大、≥128K 默认 128K）；132 全绿 |
 | v1.16.1 | 2026-09-23 | **ctx-size 挡位化（解决 128K 约束矛盾）**：新增 `read_gguf_context_length` 解析 GGUF 元数据 `*.context_length`（只扫文件头 KV 区、命中即停，遇超大 tokenizer 数组防御性放弃）；`ctx_options_for` 统一生成挡位与默认值——模型上限 <128K 默认取模型最大值、≥128K 默认 128K（更高挡手选/手填），读不到元数据回退文件大小分级；表单 ctx 控件改**可编辑下拉**（挡位点选 8K~1M + 任意值手填，NoInsert + IntValidator），挡位随选中模型动态刷新；解决 v1.16.0 遗留的"ctx≥128000 硬性约束 vs auto_generate 按文件大小分级"矛盾（traps #33：可编辑下拉必须读 currentText 而非 currentData）；实测本机模型全部正确解析（MiniCPM5→128K、Qwen3.8-27B→256K 上限默认 128K）；测试新增 9 例（132 全绿） |
 | v1.16.0 | 2026-09-23 | **全量审查修复 16 项 + misc**（R1-R16）：表单切模型残留参数污染（set_preset 整体重置）；chat handlers 4 处读改写包 CONV_LOCK；chat.js 非流式多角色回复错位（记 msgIdx）+ 轮询 isSending 守卫；清理旧版本排除运行中进程 exe 目录；下载队列移除按 UserRole 现查行号；追踪按钮 lambda 默认参数防循环变量捕获；scheduler not-found 自愈 rebuild_task_index；parse_bat_params 引号值 + 短 flag 词边界；恢复服务停止后 CompactMonitor 状态同步；**五处 GUI 线程阻塞挪后台**（Tailscale 探测 60s TTL 缓存 / 清理全部 llama 进程 / 模型目录 merge / 旧版本清理规划 / 图片迁移）；misc：托盘重启 Popen 补 CREATE_NO_WINDOW、get_script_for_model 大小写不敏感、Settings.load 读侧路径归一、dest_path 归一、表单原文视图统一刷新、下拉校验失败回滚、print→logger；**死代码清理约 450 行**（MonitorTab/TpsChart/HistoryChart、NewScriptDialog、CheckUpdateWorker/CheckAppUpdateWorker、history_worker、update_workers→compare_semver 迁 utils/semver.py、validator.sanitize_filename），移除 PyQt6-Charts 依赖；CompactMonitor.update_tps 补 t/s 历史落盘；traps 新增 #24-#32；测试新增 6 例（123 全绿） |

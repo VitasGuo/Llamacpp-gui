@@ -715,3 +715,31 @@ model_watch_tab 曾残留旧同步 `refresh()` 覆盖了后台版）；`migrate_
 
 ***
 
+## #34 聊天页取不到正在运行模型的地址——provider 两层来源都只查"当前选中"
+
+**现象**：运行 A 模型后切到 B 模型调参，点"聊天窗口"打开聊天页，模型 API 地址
+没有自动填充（须手动填）。选中 A 时正常，切走即失效。
+
+**根因**：`ui/app.py` `_current_llm_url`（注入桥服务、由 `/bridge/info` 调用）
+两层来源都以"当前选中脚本"为唯一候选：
+1. 就绪 URL 层：`if current_script_name: candidates.append(_server_urls.get(当前名))`
+   ——取到 `None` 也**不回退**到其他就绪 URL（回退分支挂在 `elif` 上，
+   选中名非空永远走不到）；
+2. pids.json 层：先把 runtime 筛成只剩选中名的记录——选中模型不在运行时
+   dict 变空，循环体不执行，整体返回 `""`。
+脚本绑定模型（v1.15.0）后"切模型调参"是高频操作，选中名 ≠ 运行中模型成为常态。
+另有一处伴生隐患：host 解析里同步调 `get_tailscale_ipv4()`，而 provider 跑在
+**桥服务 HTTP 线程**——探测子进程最坏阻塞 ~6s，且绕过 GUI 侧的探测缓存
+（v1.16.0 R12 后台化改造的漏改点）。
+
+**解决方案**：候选逻辑抽成模块级纯函数 `_pick_llm_url(current_name,
+server_urls, runtime, override, ts_cache)`：两层统一"选中名优先 → 回退任意
+运行中记录"；host 解析 `_resolve_llm_host` 只读手动指定/探测缓存（普通属性，
+GIL 下读安全），绝不跑子进程/建 QThread（跨线程不安全）。补 7 例回归测试。
+
+**教训**：多实体（多脚本/多模型）场景下，"按当前选中项过滤"的代码要始终
+回答"选中项不存在时回退到谁"；跨线程注入的回调（HTTP handler → GUI provider）
+内部只能做无副作用的纯读，任何"探测/刷新"类动作都必须留在 GUI 线程。
+
+***
+

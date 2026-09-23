@@ -27,7 +27,7 @@ from service.script_builder import (
     auto_generate_config, parse_bat_params, parse_model_path_from_bat,
 )
 from service.process_service import ProcessService
-from service.tailscale import get_tailscale_ipv4, is_tailscale_ip
+from service.tailscale import is_tailscale_ip
 from service.monitor_service import MonitorService
 from service.path_service import ensure_webui
 from service import autostart_service
@@ -51,6 +51,49 @@ LOG_PANEL_TRIM_EVERY = 50
 
 # Tailscale 自动探测的 GUI 侧缓存窗口（与 service.tailscale 的探测缓存同量级）
 TS_PROBE_TTL = 60.0
+
+
+def _resolve_llm_host(host, tailscale_override, ts_cache):
+    """聊天地址 host 解析（线程安全，纯读）：0.0.0.0/空 → 手动指定的
+    Tailscale IP → 自动探测缓存 → 127.0.0.1。绝不跑探测子进程（该方法会
+    被桥服务 HTTP 线程调用，探测/QThread 都只能在 GUI 线程发起）。"""
+    host = (host or "").strip()
+    if host in ("0.0.0.0", ""):
+        if tailscale_override and is_tailscale_ip(tailscale_override):
+            return tailscale_override
+        return ts_cache or "127.0.0.1"
+    return host
+
+
+def _pick_llm_url(current_name, server_urls, runtime, tailscale_override, ts_cache):
+    """挑选聊天页自动填充的模型 API 地址（纯函数，便于回归测试）。
+
+    两层来源，每层都"选中脚本的记录优先，否则回退任意运行中记录"：
+    1. 本会话服务就绪 URL（LogWorker 报告，可能含 0.0.0.0/Tailscale host）；
+    2. pids.json 运行时记录（跨会话恢复的服务）。
+    脚本绑定模型后用户常切到其他模型调参——回退保证聊天页仍指向
+    正在运行的那个模型（否则两层都只查选中名，切走即取不到，traps #34）。
+    """
+    urls = []
+    if current_name and current_name in server_urls:
+        urls.append(server_urls[current_name])
+    urls.extend(u for k, u in server_urls.items() if k != current_name)
+    entries = []
+    if current_name and current_name in runtime:
+        entries.append(runtime[current_name])
+    entries.extend(v for k, v in runtime.items() if k != current_name)
+    for url in urls:
+        m = re.match(r"http://([^:]+):(\d+)", url or "")
+        if m:
+            host = _resolve_llm_host(m.group(1), tailscale_override, ts_cache)
+            return f"http://{host}:{m.group(2)}"
+    for entry in entries:
+        port = entry.get("port")
+        if isinstance(port, int) and port > 0:
+            host = _resolve_llm_host(entry.get("host") or "127.0.0.1",
+                                     tailscale_override, ts_cache)
+            return f"http://{host}:{port}"
+    return ""
 
 
 class MainWindow(QMainWindow):
@@ -1129,44 +1172,18 @@ class MainWindow(QMainWindow):
     def _current_llm_url(self):
         """返回当前运行中模型的 API 地址（供聊天页自动填充）。
 
-        优先顺序：选中脚本的就绪 URL → 其他就绪 URL（最近一次）→
-        pids.json 中记录的脚本端口 + host 推导地址。
-        host 解析：0.0.0.0（所有接口）优先用 Tailscale IP（含手动指定），无则
-        127.0.0.1；已是 Tailscale IP / 127.0.0.1 则原样保留，保证本地与远程可达。
+        委托模块级 _pick_llm_url：选中脚本的记录优先，回退任意运行中记录
+        （脚本绑定模型后用户常切到其他模型调参，此时聊天页仍应指向
+        正在运行的那个）。host 解析读手动指定/探测缓存，不跑子进程——
+        该方法由桥服务 HTTP 线程调用，须线程安全（traps #34）。
         """
-        def resolve(host, port):
-            host = (host or "").strip()
-            if host in ("0.0.0.0", ""):
-                host = get_tailscale_ipv4() or "127.0.0.1"
-            return f"http://{host}:{port}"
-
-        def url_to_host_port(url):
-            m = re.match(r"http://([^:]+):(\d+)", url or "")
-            if m:
-                return m.group(1), int(m.group(2))
-            return None, None
-
-        # 1) 就绪 URL（可能已含 0.0.0.0 / Tailscale IP），统一解析 host
-        candidates = []
-        if self.current_script_name:
-            candidates.append(self._server_urls.get(self.current_script_name))
-        elif self._server_urls:
-            candidates.append(next(iter(self._server_urls.values())))
-        for url in candidates:
-            host, port = url_to_host_port(url)
-            if port:
-                return resolve(host, port)
-
-        # 2) 运行时记录（pids.json）
-        runtime = self.process_service.load_runtime()
-        if self.current_script_name and self.current_script_name in runtime:
-            runtime = {self.current_script_name: runtime[self.current_script_name]}
-        for entry in runtime.values():
-            port = entry.get("port")
-            if isinstance(port, int) and port > 0:
-                host = entry.get("host") or "127.0.0.1"
-                return resolve(host, port)
-        return ""
+        return _pick_llm_url(
+            self.current_script_name,
+            self._server_urls,
+            self.process_service.load_runtime(),
+            (self.settings.tailscale_ip or "").strip(),
+            self._ts_ip,
+        )
 
     def _open_settings(self):
         dialog = SettingsDialog(self)
