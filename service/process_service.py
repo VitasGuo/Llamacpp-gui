@@ -35,15 +35,15 @@ class ProcessService:
             # 破坏路径。bat 路径经 ScriptEntry.sanitize_filename 保证不含双引号，
             # 可直接用双引号包裹（外层 cmd 引号与内层路径引号不冲突）。
             cmdline = f'cmd /d /s /c "chcp 65001>nul && call "{bat_path}""'
+            # 输出按字节读（不设 text/encoding）：chcp 65001 对无控制台+管道
+            # 重定向场景不生效，cmd 自身报错/回显仍按 GBK 输出——固定 utf-8
+            # 解码会把中文变问号。解码推迟到 read_output/_decode_line（UTF-8
+            # 优先、失败回退 GBK），llama-server 的 UTF-8 输出不受影响。
             process = subprocess.Popen(
                 cmdline,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | NO_WINDOW,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                encoding="utf-8",
-                errors="replace",
             )
             self.current_process = process
             self.current_pid = process.pid
@@ -141,8 +141,18 @@ class ProcessService:
         if process and process.stdout:
             line = process.stdout.readline()
             if line:
-                return line.rstrip("\n\r")
+                return self._decode_line(line)
         return None
+
+    @staticmethod
+    def _decode_line(data: bytes) -> str:
+        """按行解码子进程输出：优先 UTF-8（llama-server 输出）；解码失败回退
+        GBK（无控制台且输出重定向到管道时 chcp 65001 对 cmd 无效，中文系统
+        下 cmd 报错/回显按 GBK 输出，强解 UTF-8 会出乱码）。"""
+        try:
+            return data.decode("utf-8").rstrip("\n\r")
+        except UnicodeDecodeError:
+            return data.decode("gbk", errors="replace").rstrip("\n\r")
 
     def is_process_alive(self, process=None):
         process = process if process is not None else self.current_process
