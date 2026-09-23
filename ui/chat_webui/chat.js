@@ -1,7 +1,7 @@
 /* ===== State ===== */
 const state = {
   llamaUrl: '',
-  llamaUrlManual: false,  // 用户是否在设置中手动保存过 API 地址（手动保存后不再自动覆盖）
+  llamaUrlManual: false,  // 仅记录上次地址是否手动填写（自动检测始终优先，手动值只作无服务时回退）
   conversations: [],
   currentConvId: null,
   messages: [],
@@ -45,15 +45,11 @@ async function init() {
   } catch {}
 
   const saved = loadLocalSettings();
-  if (saved.llamaUrlManual) {
-    // 用户手动保存过 → 尊重用户配置
-    state.llamaUrl = saved.llamaUrl || '';
-    state.llamaUrlManual = true;
-  } else {
-    // 未手动保存 → 优先自动填充桥服务检测到的地址，其次回退本地保存值
-    state.llamaUrl = defaultLlmUrl || saved.llamaUrl || '';
-    state.llamaUrlManual = false;
-  }
+  // 自动检测优先：有运行中的服务就用它的地址（切换模型/端口后打开聊天页
+  // 始终跟随当前服务）；手动保存的地址仅在无运行服务时作为回退。
+  // （设置弹窗里也提供"自动检测"按钮，随时手动刷新。）
+  state.llamaUrl = defaultLlmUrl || saved.llamaUrl || '';
+  state.llamaUrlManual = !!saved.llamaUrlManual && !defaultLlmUrl;
   if (saved.reasoningDisplay) state.reasoningDisplay = saved.reasoningDisplay;
   if (saved.maxContextRounds != null) state.maxContextRounds = saved.maxContextRounds;
   if (saved.theme) state.theme = saved.theme;
@@ -1733,9 +1729,33 @@ function bindEvents() {
     if (!url) { document.getElementById('conn-test-result').textContent = '请输入 API 地址'; return; }
     state.llamaUrl = url; await checkConnection();
   });
+  // 自动检测当前运行服务的地址（清手动标记，检测不到时保留输入框现值）
+  document.getElementById('btn-detect-llm').addEventListener('click', async () => {
+    const el = document.getElementById('conn-test-result');
+    try {
+      const info = await api('GET', 'bridge/info');
+      const url = (info && info.llm_url) || '';
+      if (!url) {
+        el.textContent = '未检测到正在运行的 llama-server（先在 GUI 启动服务）';
+        el.style.color = '#e74c5c';
+        return;
+      }
+      document.getElementById('setting-api-url').value = url;
+      state.llamaUrl = url;
+      state.llamaUrlManual = false;
+      saveLocalSettings();
+      try { await api('PUT', 'settings', { llm_url: url }); } catch {}
+      el.textContent = '已检测到运行中服务: ' + url;
+      el.style.color = '#2ecc71';
+      await checkConnection();
+    } catch {
+      el.textContent = '检测失败：桥服务不可达';
+      el.style.color = '#e74c5c';
+    }
+  });
   document.getElementById('btn-save-settings').addEventListener('click', async () => {
     state.llamaUrl = document.getElementById('setting-api-url').value.trim();
-    // 手动保存后不再被自动检测覆盖；清空地址并保存则恢复自动检测
+    // 记录"本次为手动填写"；下次打开页面时若有运行中服务，仍会被自动检测优先
     state.llamaUrlManual = state.llamaUrl !== '';
     state.reasoningDisplay = document.getElementById('setting-reasoning-display').value;
     state.maxContextRounds = parseInt(document.getElementById('setting-max-rounds').value) || 10;
