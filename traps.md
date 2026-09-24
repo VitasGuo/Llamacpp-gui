@@ -914,3 +914,147 @@ json 里的派生字段（`model_path`）必须能从 .bat 重建，否则一定
 
 ***
 
+## #40 进程秒退时 LogWorker 丢掉最后几行——报错信息恰好就在被丢的那批
+
+**现象**：运行 `Ternary-Bonsai-2-27B-PQ2_0.gguf`，界面日志只有
+"进程已启动 → initializing ... → verbosity = 3 → CORS 警告 → **进程已结束**"，
+一句报错都没有；而手工在 cmd 里跑同一个 `.bat`，完整可见
+`E gguf_init_from_reader: tensor 'output.weight' has invalid ggml type 142`
+与 `E srv llama_server: exiting due to model loading error`（退出码 1）。
+
+**根因**：`ui/workers/log_worker.py` 的 `run()` 主循环每轮只读**一行**
+（`read_output`），读完立刻 `is_process_alive` 检查，进程已死就 `break`。
+llama-server 加载失败会在 0.3~1 秒内退出并把错误行集中在最后，
+管道缓冲区里尚未读取的行全部丢失；随后循环照样 emit "进程已结束"，
+界面呈现为"正常启动中突然结束"的假日志，把真正的失败原因藏掉了。
+
+**解决方案**：新增 `_drain_remaining()`——进程已退出后再把管道读到 EOF
+（`read_output` 返回 None），上限 `LOG_DRAIN_MAX_LINES = 500` 行，然后才
+emit "进程已结束"/`finished_signal`。**仅在进程已断开时读**：进程仍存活时
+（如 `stop()` 收尾）不做阻塞读，避免卡住线程。回归测试
+`tests/test_log_worker_drain.py`（桩进程服务：存活 N 次后死亡；
+断言残余行不丢、顺序为 `…错误行 → 进程已结束`、进程存活时一次都不读）。
+
+**教训**：读子进程输出的循环里，"检查存活"与"读完缓冲"是两个独立条件——
+用存活状态提前 `break` 等于主动放弃管道里已到达的数据。凡是"退出前才打印"
+的信息（错误行、退出原因）都在最后几行，收尾必须 drain 到 EOF 才能看见。
+
+***
+
+## #41 厂商私有量化的 GGUF：stock llama.cpp 拒载（type 142），需厂商 fork
+
+**现象**：`Ternary-Bonsai-2-27B-PQ2_0.gguf`（ModelScope `prism-ml/Ternary-Bonsai-2-27B-gguf`）
+在本机多个 llama.cpp 版本（b11139、b11149 = 当前最新）上均加载失败：
+
+```
+E gguf_init_from_reader: tensor 'output.weight' has invalid ggml type 142. should be in [0, 43)
+E llama_model_load: error loading model: failed to load model
+E srv llama_server: exiting due to model loading error      （退出码 1）
+```
+
+GGUF 元数据可佐证这是厂商自定义格式：`general.architecture = qwen35`、
+`prism.hadamard.block_size/transform/axis/sign_mode`（旋转基底 Hadamard，
+运行时需配套激活变换）。
+
+**根因**：这是 PrismML 的三值（ternary）量化包（PQ2_0 / PTQ1_0），
+张量类型号 **142/143 超出 mainline llama.cpp 的类型范围（0~42）**——mainline 不认识
+该类型，必然拒载；模型卡明确写"stock llama.cpp will not run these files，
+需用 PrismML-Eng/llama.cpp fork 的二进制"。
+
+**实测类型号**（2026-09-24 用 HTTP Range 只抓 GGUF 头部、逐张量解析 851 条 tensor info）：
+
+| 包 | 大小 | general.file_type | 张量类型直方图 | 官方 llama.cpp 结局 |
+| --- | --- | --- | --- | --- |
+| PQ2_0 | 6.71 GB | 142 | 402 个张量为 **142**、其余合法 | 拒载（`invalid ggml type 142`） |
+| PTQ1_0 | 5.54 GB | 143 | 402 个张量为 **143**、96 个 30（BF16）、353 个 0（F32） | 拒载（143 同样 >42） |
+| F16 | 50.11 GB | 1 | 全部合法（498 个 F16 + 353 个 F32） | **能加载但会静默胡说**：权重已折入 Hadamard 旋转（`general.basename=folded`、`prism.hadamard.*`），官方版不认这些元数据、不做激活端逆变换 |
+
+所以"换官方 llama.cpp 的更新版本"或"改用全精度包"都不是出路——
+**要跑这个模型必须用厂商 fork**。
+
+**解决方案**（运行方式，非本仓库代码问题）：
+- 用厂商 fork 的预编译包：`https://github.com/PrismML-Eng/llama.cpp/releases/latest`
+  解压后，在"路径配置 → 选择 llama-server.exe"里指到该 fork 的 `llama-server.exe`
+  （本软件的版本管理只拉 ggml-org/llama.cpp 官方 release，不覆盖 fork 版本；
+  放在 `data/llamacpp/` 之外即可避免被"清理旧版本"清理）。
+- fork 侧推荐参数（模型卡）：`-ngl 99 -fa on -c 32768`，采样
+  `temp 1.0 / top-p 0.95 / top-k 20`（思考模式）；PQ2_0 在 Blackwell/Ada 上表现见模型卡表格。
+- 本机（RTX 5070 Ti Laptop 12GB = Blackwell sm_120）：按模型卡的选包规则
+  **PQ2_0 更优**（Blackwell/H100/A100 世代解码更快、预填充各平台都更快），已下载；
+  ctx 建议按模型卡用 **32768** 起步——131072 的 q8_0 KV（约 4GB）叠 7.2GB 权重会顶爆 12GB 显存。
+- 本机注意：`--mmproj` 配套文件为 `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`（非必需，仅图像输入）。
+
+**教训**：ModelScope/HF 上"某模型的 GGUF"不等于"任何 llama.cpp 都能跑"——
+厂商自定义量化（新张量类型、私有元数据）必须用其配套 runtime。
+判据：报错含 `invalid ggml type N` 且 N ≥ 43（超出 mainline 类型表）时，
+先去看模型卡的 Quickstart/Requirements，别在换 llama.cpp 版本上白折腾；
+**反过来也要警惕"能加载"**——类型合法但元数据含私有变换（如 `prism.hadamard.*`）时，
+官方版会安静地跑出垃圾结果，比直接拒载更危险。
+
+***
+
+## #42 模型下拉重启后停在第一项——扫描路径是反斜线、配置存的是正斜线
+
+**现象**：软件重启后"启动脚本"的模型下拉总停在**第一项**，而下方只读的模型路径
+（以及右侧表单参数）仍是上次用的模型——下拉与路径显示打架，容易误判"马上要运行哪个模型"。
+
+**根因**：`ui/app.py` 的 `_reload_model_combo()` 用
+`self.model_combo.findData(self.settings.model_path)` 定位当前项，而 `findData`
+是**精确字符串匹配**，两侧形式天然不同：
+- 下拉项 userData 来自 `service/model_scanner.scan_gguf_files()` 的
+  `os.path.join(root_dir, f)` → Windows 下是**反斜线**；又因为 `root_dir` 来自配置
+  （已是正斜线），实际产物是 `C:/modelscope\MiniCPM5-2B-F16.gguf` 这种**混用**形式；
+- `settings.model_path` 经 config 的 setter 收口，统一为**正斜线**
+  （`C:/modelscope/…`，见 `utils/path_utils` 约定）。
+
+匹配失败 → `idx = -1` → 跳过 `setCurrentIndex` → 下拉停留在索引 0（第一项）。
+
+**解决方案**：`ui/app.py` 新增纯函数 `combo_index_for(paths, target)`
+（两侧都过 `normalize_path` + `lower()` 比较；Windows 路径不区分大小写），
+`_reload_model_combo` 改走它，下拉 userData 也统一存 `normalize_path(f)`。
+另加兜底：当前模型不在模型目录里（被删/移走）时，在下拉顶部插入
+"（不在模型目录）<文件名>"并选中——保证下拉与路径/表单**永不打架**，
+而不是默默停在第一项。回归测试 `tests/test_script_model_binding.py::TestComboIndexFor` 4 例。
+实测真实数据：旧实现 `index = -1`、新实现 `index = 2`（正确命中
+`Qwen3.8-27B-UD-IQ2_XXS.gguf`）。
+
+**教训**：**凡是"按路径匹配 UI 项"，两侧字符串必须先过同一个规范化函数**——
+`findData` / `==` 这类精确比较在 Windows 上会因 `\` vs `/`、大小写差异**静默失败**，
+而且失败表现是"停在第 0 项"而不是报错，极难被发现。
+另注：路径混用形式（`C:/a\b`）本身也是隐患，扫描输出应尽早 `normalize_path`。
+**v1.20.0 补充**：删本地模型文件后清空 `settings.model_path` 时，`saved` 为空也要
+插入「（未选择模型）」占位项并选中——否则下拉又会退回显示第一项、与空路径打架
+（同一坑的第二种触发路径）。
+
+***
+
+## #43 手删本地模型留下死绑定 + 运行中的 .gguf 被 Windows 锁
+
+**现象**：用户想删掉不合适的本地模型，只能自己开资源管理器进模型目录手删。
+手删有两个隐患：
+1. `.gguf` 删了，但指向它的启动脚本还在（`data/scripts/*.bat` + `scripts.json` 条目）
+   → 变成"脚本有、模型无"的死绑定，模型下拉/绑定查询里还留着这条幽灵；
+2. 模型正在运行时 `.gguf` 被 llama-server 以 mmap 持有，Windows 拒绝删除
+   （`PermissionError [WinError 32]`），报错信息与"删不掉"的原因不直观。
+
+**根因**：此前 App 只提供"远端搜索/下载/更新追踪"，没有本地文件的查看与删除入口；
+而 `ScriptService` 也只在 v1.19.2 之前有 `delete_script`（已删），没有"按模型移除绑定"
+的入口——`migrate_bindings()` 只清"`.bat` 已不存在"的条目，不管"模型文件已不存在"。
+
+**解决方案**（v1.20.0）：
+- 新增"本地模型"视图（`ui/model_tab.py` 栈索引 3，搜索栏右侧入口）：列出模型目录下
+  全部 `.gguf`（大小/修改时间/视觉投影标记），勾选或单行删除。
+- `service/model_scanner.list_local_models`（列表）+ `service/model_file_service`
+  （`pair_mmproj` 配对视觉投影、`delete_model_files` 逐项容错删除）。
+- `ScriptService.remove_binding_for_model(model_path, names)`：`.bat` 移入
+  `data/scripts_replaced`（不物理删，可找回）+ 清 `scripts.json` 条目；匹配覆盖
+  "json 条目（含 .bat 已不存在的过期条目）/ 孤儿 .bat / derive_name 兜底"三路来源。
+- **运行中拦下**：删除 worker 先查 `ProcessService.is_running(绑定脚本名)`（该调用内部
+  跑 `tasklist`，约 0.6s，故必须在 worker 里），命中则整体不删并提示先去"运行控制"结束。
+- 删除后主窗口按信号清理已失效的当前选择（显式 `setText("")` + 重刷下拉，见 traps #42）。
+
+**教训**：**删文件类功能必须同时处理"关联数据"与"占用状态"**——只删文件会留下
+死绑定（比删不掉更隐蔽），只看 `os.remove` 的报错会把"文件被占用"说成"删除失败"。
+
+***
+

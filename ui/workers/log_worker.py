@@ -3,6 +3,11 @@ import re
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+# 进程退出后继续读残余输出的行数上限：llama-server 加载失败等场景会把
+# 错误行集中在退出前一刻（如 GGUF 张量类型不支持），不读完界面只剩
+# "进程已结束"，用户只能看到无关的 CORS 警告（traps #40）
+LOG_DRAIN_MAX_LINES = 500
+
 
 class LogWorker(QThread):
     log_signal = pyqtSignal(str)
@@ -68,5 +73,24 @@ class LogWorker(QThread):
                 break
             self.msleep(200)
 
+        self._drain_remaining()
         self.log_signal.emit("进程已结束")
         self.finished_signal.emit()
+
+    def _drain_remaining(self):
+        """进程已退出时，把管道里剩余输出读完再收尾。
+
+        主循环每轮只读一行、读到就检查存活，进程秒退时循环在管道仍有缓冲区
+        数据时 break——最后那批行（恰恰是报错行）全部丢失。这里在确认进程
+        已死后一直读到 EOF（read_output 返回 None）为止；只在进程已退出时
+        调用，避免对仍在运行的服务做阻塞读。
+        """
+        if self._process is None:
+            return
+        if self.process_service.is_process_alive(self._process):
+            return
+        for _ in range(LOG_DRAIN_MAX_LINES):
+            line = self.process_service.read_output(self._process)
+            if not line:
+                break
+            self.log_signal.emit(line)

@@ -7,15 +7,21 @@ from PyQt6.QtWidgets import (
     QMessageBox, QProgressBar, QStackedWidget, QCheckBox, QSplitter, QComboBox,
     QAbstractItemView,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QSystemTrayIcon
 
 from config.config import Settings
+from service import model_file_service
 from service import model_sources
 from service import watchlist_service
 from service.download_service import DownloadManager
+from service.script_service import ScriptService
 from ui.workers.search_worker import SearchWorker, FileListWorker
+from ui.workers.local_model_workers import (
+    LocalModelDeleteWorker, LocalModelScanWorker,
+)
 from ui.model_watch_tab import ModelWatchView
+from utils.logger import info
 
 
 def _format_size(size_bytes):
@@ -28,6 +34,26 @@ def _format_size(size_bytes):
     if size_bytes >= 10 ** 6:
         return f"{size_bytes / 10 ** 6:.1f}MB"
     return f"{size_bytes / 10 ** 3:.1f}KB"
+
+
+def _format_mtime(ts):
+    """文件修改时间戳 → 'YYYY-MM-DD HH:MM'；None/异常返回 '-'。"""
+    if not ts:
+        return "-"
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, OSError, TypeError):
+        return "-"
+
+
+def _local_model_row(model):
+    """本地模型表格行的显示文本（纯函数，便于回归测试）。"""
+    name = model.get("name", "")
+    return {
+        "display_name": f"{name}（视觉投影）" if model.get("is_mmproj") else name,
+        "size": _format_size(model.get("size", 0)) or "-",
+        "mtime": _format_mtime(model.get("mtime")),
+    }
 
 
 def _format_params(params):
@@ -84,6 +110,9 @@ def _set_progress_cell(cell, value):
 
 
 class ModelTab(QWidget):
+    # 本地模型文件被删除（携带被删路径）→ 宿主主窗口据此清理已失效的当前选择
+    local_models_changed = pyqtSignal(list)
+
     def __init__(self):
         super().__init__()
         self.settings = Settings.get_instance()
@@ -100,6 +129,10 @@ class ModelTab(QWidget):
         # 文件列表"返回"目标：0=追踪视图 1=搜索结果页
         self._filelist_back_index = 0
         self._watchlist = []          # 关注列表（watchlist_service 读入，供搜索结果追踪按钮判断）
+        # "本地模型"视图（索引 3）：最近一次扫描结果 + 后台 worker 引用（防 GC）
+        self._local_models = []
+        self._local_worker = None
+        self._local_delete_workers = []
         self.watch_view = ModelWatchView()  # 更新追踪视图（默认视图）
         self._init_ui()
         self._connect_download_signals()
@@ -125,6 +158,7 @@ class ModelTab(QWidget):
         self.stack.addWidget(self.watch_view)              # 0: 更新追踪（默认视图）
         self.stack.addWidget(self._build_results_page())   # 1: 搜索结果
         self.stack.addWidget(self._build_filelist_page())  # 2: 文件列表
+        self.stack.addWidget(self._build_local_models_page())  # 3: 本地模型
         self.stack.setCurrentIndex(0)
         top_layout.addWidget(self.stack)
         splitter.addWidget(top_widget)
@@ -189,6 +223,13 @@ class ModelTab(QWidget):
         bar.addWidget(self.search_input)
         bar.addWidget(self.clear_search_btn)
         bar.addWidget(self.search_btn)
+        bar.addStretch(1)
+        self.local_models_btn = QPushButton("本地模型管理")
+        self.local_models_btn.setToolTip(
+            "查看并删除模型目录里的本地 .gguf 文件（含视觉投影）"
+        )
+        self.local_models_btn.clicked.connect(self._show_local_models)
+        bar.addWidget(self.local_models_btn)
         w = QWidget()
         w.setLayout(bar)
         return w
@@ -488,6 +529,244 @@ class ModelTab(QWidget):
     def _back_to_results(self):
         # 按进入文件列表时的来源返回：搜索查看→搜索结果页，追踪查看→追踪视图
         self.stack.setCurrentIndex(self._filelist_back_index)
+
+    # ── 本地模型文件管理（索引 3：扫描 / 查看 / 删除）────────────────────────
+
+    def _build_local_models_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        top_bar = QHBoxLayout()
+        back_btn = QPushButton("\u2190 返回")
+        back_btn.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+        top_bar.addWidget(back_btn)
+        self.local_dir_label = QLabel("")
+        self.local_dir_label.setStyleSheet("font-weight: bold;")
+        top_bar.addWidget(self.local_dir_label)
+        top_bar.addStretch()
+        self.local_refresh_btn = QPushButton("刷新")
+        self.local_refresh_btn.clicked.connect(self._load_local_models)
+        top_bar.addWidget(self.local_refresh_btn)
+        w = QWidget()
+        w.setLayout(top_bar)
+        layout.addWidget(w)
+
+        self.local_table = QTableWidget(0, 5)
+        self.local_table.setHorizontalHeaderLabels(
+            ["", "文件名", "大小", "修改时间", "操作"])
+        self.local_table.horizontalHeader().setStretchLastSection(False)
+        self.local_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.local_table.setColumnWidth(0, 30)
+        self.local_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.local_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.local_table.setColumnWidth(2, 100)
+        self.local_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.local_table.setColumnWidth(3, 140)
+        self.local_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.local_table.setColumnWidth(4, 80)
+        self.local_table.verticalHeader().setVisible(False)
+        self.local_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.local_table)
+
+        bottom_bar = QHBoxLayout()
+        self.local_summary_label = QLabel("")
+        self.local_summary_label.setStyleSheet("color: gray; font-size: 12px;")
+        bottom_bar.addWidget(self.local_summary_label, stretch=1)
+        self.local_delete_btn = QPushButton("删除选中项")
+        self.local_delete_btn.clicked.connect(self._delete_local_selected)
+        bottom_bar.addWidget(self.local_delete_btn)
+        w2 = QWidget()
+        w2.setLayout(bottom_bar)
+        layout.addWidget(w2)
+        return page
+
+    def _show_local_models(self):
+        """进入"本地模型"视图并后台扫描模型目录（os.walk 大库较慢，不进 GUI 线程）。"""
+        self.local_dir_label.setText(
+            f"模型目录：{self.settings.model_dir or '（未配置）'}")
+        self.stack.setCurrentIndex(3)
+        self._load_local_models()
+
+    def _load_local_models(self):
+        self.local_refresh_btn.setEnabled(False)
+        self.local_delete_btn.setEnabled(False)
+        self.local_table.setRowCount(0)
+        self.local_table.insertRow(0)
+        self.local_table.setItem(0, 1, QTableWidgetItem("扫描中..."))
+        self.local_summary_label.setText("")
+        self._local_worker = LocalModelScanWorker(self.settings.model_dir)
+        self._local_worker.scanned.connect(
+            lambda models, w=self._local_worker: self._on_local_scan(models, w))
+        self._local_worker.start()
+
+    def _on_local_scan(self, models, worker):
+        # 过期保护：连续刷新/重进视图后，旧 worker 的迟到结果不得覆盖新结果
+        if worker is not self._local_worker:
+            return
+        self._local_refresh_btn_enable()
+        self._local_models = models or []
+        self._fill_local_table(self._local_models)
+
+    def _local_refresh_btn_enable(self):
+        self.local_refresh_btn.setEnabled(True)
+        self.local_delete_btn.setEnabled(True)
+
+    def _fill_local_table(self, models):
+        self.local_table.setRowCount(0)
+        for m in models:
+            row = self.local_table.rowCount()
+            self.local_table.insertRow(row)
+            cb = QCheckBox()
+            cw = QWidget()
+            cl = QHBoxLayout(cw)
+            cl.addWidget(cb)
+            cl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cl.setContentsMargins(0, 0, 0, 0)
+            self.local_table.setCellWidget(row, 0, cw)
+
+            disp = _local_model_row(m)
+            name_item = QTableWidgetItem(disp["display_name"])
+            # 原始路径（正斜线）存 UserRole：删除与配对 mmproj 都按它定位，
+            # 不从显示文本反解析（traps #42：路径比对必须走同一规范形式）
+            name_item.setData(Qt.ItemDataRole.UserRole, m.get("path", ""))
+            self.local_table.setItem(row, 1, name_item)
+            self.local_table.setItem(row, 2, QTableWidgetItem(disp["size"]))
+            self.local_table.setItem(row, 3, QTableWidgetItem(disp["mtime"]))
+
+            del_btn = QPushButton("删除")
+            del_btn.clicked.connect(
+                lambda _, p=m.get("path", ""): self._delete_local_paths([p]))
+            self.local_table.setCellWidget(row, 4, del_btn)
+
+        total = sum(m.get("size", 0) for m in models)
+        self.local_summary_label.setText(
+            f"共 {len(models)} 个文件，合计 {_format_size(total) or '0KB'}"
+            if models else "模型目录里没有 .gguf 文件")
+
+    def _checked_local_paths(self):
+        """勾选的模型文件路径（去重保序）。"""
+        paths = []
+        for row in range(self.local_table.rowCount()):
+            cell = self.local_table.cellWidget(row, 0)
+            item = self.local_table.item(row, 1)
+            cb = cell.findChild(QCheckBox) if cell else None
+            if not (cb and cb.isChecked() and item):
+                continue
+            p = item.data(Qt.ItemDataRole.UserRole)
+            if p and p not in paths:
+                paths.append(p)
+        return paths
+
+    def _delete_local_selected(self):
+        paths = self._checked_local_paths()
+        if not paths:
+            QMessageBox.warning(self, "提示", "请先勾选要删除的模型文件。")
+            return
+        self._delete_local_paths(paths)
+
+    def _delete_local_paths(self, paths):
+        """确认后永久删除指定 .gguf（含配对 mmproj）+ 清理脚本绑定。
+
+        删除不可恢复，故确认框列出实际文件与合计大小、默认按钮为"取消"；
+        配对 mmproj 也一并列出（同目录多个 mmproj 时只配首个，用户可取消）。
+        """
+        by_path = {m.get("path", ""): m for m in self._local_models}
+        targets = list(paths)
+        main_models = [p for p in paths if not by_path.get(p, {}).get("is_mmproj")]
+        for p in main_models:
+            pair = model_file_service.pair_mmproj(p, self._local_models)
+            if pair and pair not in targets:
+                targets.append(pair)
+
+        if not self._confirm_local_delete(targets, by_path, main_models):
+            return
+
+        self.local_delete_btn.setEnabled(False)
+        self.local_delete_btn.setText("删除中...")
+        worker = LocalModelDeleteWorker(targets, model_paths=main_models)
+        self._local_delete_workers.append(worker)
+        worker.done.connect(self._on_local_delete_done)
+        worker.finished.connect(
+            lambda w=worker: self._drop_local_delete_worker(w))
+        worker.start()
+
+    def _confirm_local_delete(self, targets, by_path, main_models):
+        """删除确认框：列出实际将删的文件与合计大小，默认按钮"取消"。"""
+        lines = []
+        total = 0
+        for p in targets:
+            m = by_path.get(p, {})
+            size = m.get("size", 0)
+            total += size
+            mark = "（视觉投影）" if m.get("is_mmproj") else ""
+            lines.append(f"• {os.path.basename(p)}{mark}　{_format_size(size) or '大小未知'}")
+
+        bindings = [self._script_binding_name(p) for p in main_models]
+        bindings = [b for b in bindings if b]
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("确认删除模型文件")
+        msg.setIcon(QMessageBox.Icon.Warning)
+        text = ("将永久删除以下文件（不进回收站，删除后无法恢复）：\n\n"
+                + "\n".join(lines)
+                + f"\n\n合计约 {_format_size(total) or '未知'}。")
+        if bindings:
+            text += (f"\n同时清理启动脚本绑定：{'、'.join(bindings)}"
+                     "（原 .bat 会备份到 data/scripts_replaced，可人工找回）。")
+        text += "\n确定继续吗？"
+        msg.setText(text)
+        ok_btn = msg.addButton("删除", QMessageBox.ButtonRole.AcceptRole)
+        cancel_btn = msg.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(cancel_btn)
+        msg.exec()
+        return msg.clickedButton() is ok_btn
+
+    @staticmethod
+    def _script_binding_name(model_path):
+        """该模型当前绑定的脚本名（仅用于确认框展示绑定将被清理）。"""
+        try:
+            entry = ScriptService().get_script_for_model(model_path)
+        except Exception:
+            return ""
+        return entry.name if entry else ""
+
+    def _drop_local_delete_worker(self, worker):
+        if worker in self._local_delete_workers:
+            self._local_delete_workers.remove(worker)
+
+    def _on_local_delete_done(self, result):
+        self.local_delete_btn.setEnabled(True)
+        self.local_delete_btn.setText("删除选中项")
+
+        if result.get("blocked"):
+            QMessageBox.warning(
+                self, "模型正在运行",
+                f"{result['blocked']} 正在运行，未执行删除。\n\n"
+                "请先在主控制页「运行控制」里结束该模型再删除"
+                "（运行中的文件被占用，删除也会失败）。")
+            return
+
+        deleted = result.get("deleted", [])
+        bindings = [b for b in (result.get("bindings") or []) if b]
+        binding_names = [n for b in bindings for n in b.get("names", [])]
+        parts = [f"已删除 {len(deleted)} 个文件，释放 {_format_size(result.get('freed', 0)) or '0KB'}"]
+        if binding_names:
+            parts.append(f"清理脚本绑定 {len(binding_names)} 条（{'、'.join(binding_names)}）"
+                         f"，原 .bat 已备份到 {bindings[0].get('backup_dir', '')}")
+        if result.get("errors"):
+            parts.append("失败：" + "；".join(result["errors"]))
+        text = "；".join(parts)
+        self.local_summary_label.setText(text)
+        info(f"本地模型删除: {text}")
+
+        if result.get("errors"):
+            QMessageBox.warning(self, "部分文件未能删除", text)
+
+        if deleted:
+            self.local_models_changed.emit(deleted)
+        # 整表重扫：禁止按旧行号 removeRow（删除后行号会漂移）
+        self._load_local_models()
 
     def _select_dl_path(self):
         path = QFileDialog.getExistingDirectory(self, "选择模型下载目录")

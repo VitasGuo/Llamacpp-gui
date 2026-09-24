@@ -166,6 +166,60 @@ class ScriptService:
         os.replace(src, dst)
         return self.replaced_dir
 
+    def remove_binding_for_model(self, model_path, names=None):
+        """移除某模型的全部绑定（删除本地模型文件时调用）。
+
+        只清 `.bat` 是不够的：json 条目、以及**孤儿 .bat**（目录里有 .bat
+        但 json 无登记）都要清，否则删完模型仍留下指向不存在文件的死绑定。
+        因此匹配分两路来源：
+        - `scripts.json` 原始条目（**含 .bat 已不存在的过期条目**，`load_scripts`
+          会跳过它们，只按它匹配会漏清）；
+        - `load_scripts()`（覆盖孤儿 .bat，其 model_path 由 .bat 内容解析）。
+        命中条件：model_path 归一化相同 / 名字在 names 里 / 名字等于
+        derive_name(model_path)（历史脏数据兜底）。
+
+        .bat 不物理删除，统一 `_backup_bat` 移入 data/scripts_replaced（可人工
+        找回，与 migrate_bindings 的淘汰策略一致）。返回
+        {"names": 被移除的脚本名, "removed": json 条目清除数, "backup_dir": 备份目录}。
+        """
+        norm = normalize_path(model_path or "").lower()
+        wanted = {n for n in (names or []) if n}
+        if model_path:
+            wanted.add(ScriptEntry.derive_name(model_path))
+
+        def _hits(entry_name, entry_model_path):
+            if norm and entry_model_path and normalize_path(entry_model_path).lower() == norm:
+                return True
+            return any(self._matches(entry_name, n) for n in wanted)
+
+        data = self._load_config_data()
+        raw = [item for item in data.get("scripts", []) if isinstance(item, dict)]
+        targets = {
+            e.name for e in self.load_scripts()
+            if e.name and _hits(e.name, e.model_path)
+        }
+        targets.update(
+            item.get("name", "") for item in raw
+            if item.get("name") and _hits(item.get("name", ""), item.get("model_path") or "")
+        )
+        if not targets:
+            return {"names": [], "removed": 0, "backup_dir": ""}
+
+        backup_dir = ""
+        for name in sorted(targets):
+            backup_dir = self._backup_bat(name) or backup_dir
+
+        kept = [
+            item for item in raw
+            if not (_hits(item.get("name", ""), item.get("model_path") or "")
+                    or any(self._matches(item.get("name", ""), n) for n in targets))
+        ]
+        removed = len(raw) - len(kept)
+        if removed:
+            data["scripts"] = kept
+            atomic_write_json(self.config_file, data, indent=4, ensure_ascii=False)
+        return {"names": sorted(targets), "removed": removed, "backup_dir": backup_dir}
+
     def load_scripts(self):
         """scripts.json 条目（.bat 仍存在的）+ 目录里的孤儿 .bat（不在 json 中）。
 

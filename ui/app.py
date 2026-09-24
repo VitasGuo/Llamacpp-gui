@@ -20,6 +20,7 @@ from PyQt6.QtGui import QTextCursor, QAction, QColor, QPixmap, QPainter, QFont, 
 
 from config.config import Settings
 from utils.validator import validate_llamacpp_file, validate_gguf
+from utils.path_utils import normalize_path
 from utils.logger import error, info
 from service.script_service import ScriptService
 from service.script_builder import (
@@ -96,6 +97,22 @@ def _pick_llm_url(current_name, server_urls, runtime, tailscale_override, ts_cac
                                      tailscale_override, ts_cache)
             return f"http://{host}:{port}"
     return ""
+
+
+def combo_index_for(paths, target):
+    """在路径列表里找目标项下标（规范化 + 大小写不敏感；找不到返回 -1）。
+
+    Windows 路径不区分大小写；且扫描结果来自 os.path.join（反斜线），
+    配置里存的却是 normalize_path 后的正斜线——不归一就永远匹配不上，
+    下拉会停在第一项而下方路径/表单仍是原模型（traps #42）。
+    """
+    want = normalize_path(target or "").lower()
+    if not want:
+        return -1
+    for i, p in enumerate(paths):
+        if normalize_path(p or "").lower() == want:
+            return i
+    return -1
 
 
 def stop_all_targets(run_rows, runtime, legacy_running):
@@ -329,6 +346,7 @@ class MainWindow(QMainWindow):
 
         # 模型搜索与下载标签（内含更新追踪默认视图）
         self.model_tab = ModelTab()
+        self.model_tab.local_models_changed.connect(self._on_local_models_deleted)
         tabs.addTab(self.model_tab, "模型搜索与下载")
 
         # 版本管理标签（llama.cpp 检测更新/下载安装/切换）
@@ -610,6 +628,30 @@ class MainWindow(QMainWindow):
                 detail += f"；同步 {moved} 条运行中记录的脚本名"
             info(detail)
 
+    def _on_local_models_deleted(self, deleted_paths):
+        """"本地模型"页删除了文件 → 同步主控制页的模型选择。
+
+        当前模型（或外挂视觉模型）正是被删文件时必须清空配置并**显式清空**
+        两个只读路径框——`_load_saved_paths` 只在值非空时 setText，不清会
+        残留旧文本、与下拉/表单显示打架（同 traps #42 的"两处显示不一致"）。
+        未删到当前模型时只刷新下拉项，不重载表单（避免抹掉未保存的微调）。
+        """
+        gone = {normalize_path(p).lower() for p in (deleted_paths or []) if p}
+        cleared = False
+        for attr, edit in (("model_path", self.model_path_edit),
+                           ("visual_model_path", self.visual_model_path_edit)):
+            cur = normalize_path(getattr(self.settings, attr) or "").lower()
+            if cur and cur in gone:
+                setattr(self.settings, attr, "")
+                edit.setText("")
+                cleared = True
+        if cleared:
+            self.settings.save()
+            self._append_log("当前模型文件已被删除，已清空模型选择")
+        self._reload_model_combo()
+        if cleared:
+            self._on_model_changed()
+
     def _load_saved_paths(self):
         if self.settings.llamacpp_path:
             self.llamacpp_path_edit.setText(self.settings.llamacpp_path)
@@ -867,18 +909,35 @@ class MainWindow(QMainWindow):
         self._append_log(f"模型目录已设置: {path}")
 
     def _reload_model_combo(self):
-        """扫描已保存的模型目录，填充下拉（显示文件名、存完整路径）并同步当前选中项。"""
+        """扫描已保存的模型目录，填充下拉（显示文件名、存规范化完整路径）并同步当前选中项。
+
+        比较统一走 `combo_index_for`（normalize_path + 大小写不敏感）：
+        扫描结果来自 `os.path.join`（Windows 下是反斜线），配置里存的却是
+        正斜线，直接 findData 永远匹配不上——重启后下拉停在第一项、而下方
+        路径/表单仍是原模型，两边显示打架（traps #42）。
+        """
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
         files = scan_gguf_files(self.settings.model_dir)
         for f in files:
             # 下拉显示友好文件名，完整路径存 userData（避免超长路径撑爆下拉）
-            self.model_combo.addItem(os.path.basename(f), f)
-        self.model_combo.setEnabled(bool(files))
-        # 当前已选模型若存在于列表则定位到对应项（按完整路径精确匹配）
-        idx = self.model_combo.findData(self.settings.model_path)
+            self.model_combo.addItem(os.path.basename(f), normalize_path(f))
+        saved = normalize_path(self.settings.model_path or "")
+        idx = combo_index_for(
+            [self.model_combo.itemData(i) for i in range(self.model_combo.count())],
+            saved,
+        )
+        if idx < 0 and (files or saved):
+            # 无当前模型（清空选择后）或它不在模型目录里（被删/移走/配置指向
+            # 别处）：插入占位项并选中，保证下拉与下方路径一致，而不是默默
+            # 停在第一项（traps #42）
+            label = (f"（不在模型目录）{os.path.basename(saved)}" if saved
+                     else "（未选择模型）")
+            self.model_combo.insertItem(0, label, saved)
+            idx = 0
         if idx >= 0:
             self.model_combo.setCurrentIndex(idx)
+        self.model_combo.setEnabled(bool(files))
         self.model_combo.blockSignals(False)
 
     def _on_model_combo_selected(self, index):

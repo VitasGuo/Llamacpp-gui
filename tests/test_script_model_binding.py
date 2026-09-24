@@ -1,4 +1,5 @@
-"""脚本绑定模型（核心改动）测试：derive_name 自动命名 + get_script_for_model 按模型查脚本。"""
+"""脚本绑定模型（核心改动）测试：derive_name 自动命名 + get_script_for_model 按模型查脚本
++ 模型下拉与当前模型路径的一致性（combo_index_for）。"""
 import json
 import os
 import shutil
@@ -7,6 +8,7 @@ import unittest
 
 from model.script import ScriptEntry
 from service.script_service import ScriptService, name_model_score
+from ui.app import combo_index_for
 
 
 class TestDeriveName(unittest.TestCase):
@@ -292,6 +294,26 @@ class TestResetScript(unittest.TestCase):
         self.assertEqual(len(svc._load_config_data()["scripts"]), 1)
         self.assertEqual(svc.load_script_content(svc.get_script_for_model(mp).name),
                          "第二版")
+
+
+class TestComboIndexFor(unittest.TestCase):
+    """模型下拉定位：重启后下拉必须落在当前模型上（traps #42）。"""
+
+    def test_backslash_scan_matches_forward_slash_config(self):
+        # 真因：扫描结果是 os.path.join 的反斜线，配置存的是正斜线
+        scan = ["C:\\modelscope\\a.gguf", "C:\\modelscope\\b.gguf"]
+        self.assertEqual(combo_index_for(scan, "C:/modelscope/b.gguf"), 1)
+
+    def test_case_insensitive(self):
+        self.assertEqual(combo_index_for(["C:/Models/A.gguf"], "c:/models/a.gguf"), 0)
+
+    def test_not_in_list_returns_minus_one(self):
+        self.assertEqual(combo_index_for(["C:/m/a.gguf"], "C:/m/other.gguf"), -1)
+
+    def test_blank_targets(self):
+        self.assertEqual(combo_index_for(["C:/m/a.gguf"], ""), -1)
+        self.assertEqual(combo_index_for(["C:/m/a.gguf"], None), -1)
+        self.assertEqual(combo_index_for([], "C:/m/a.gguf"), -1)
 
 
 if __name__ == "__main__":

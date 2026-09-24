@@ -4,12 +4,15 @@
 
 - **目标**：在本地 Windows 环境运行 LlamaCPP GUI（PyQt6 桌面客户端），用于管理本地 llama.cpp 推理服务器。
 
-- **当前版本**：v1.19.4（2026-09-24，下载队列进度列数字改由 QLabel 显示，修乱码）
+- **当前版本**：v1.20.0（2026-09-24，新增本地模型文件管理：查看 + 删除 + 连带清理）
 
 ## 版本历史
 
 | 版本     | 日期         | 说明                                                                                                                                                       |
 | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| v1.20.0 | 2026-09-24 | **新增「本地模型」文件管理**（traps #43）：模型搜索与下载标签页搜索栏右侧新增入口，进栈索引 3 的视图列出模型目录下全部 `.gguf`（文件名/大小/修改时间/视觉投影标记，按名排序），支持勾选批量或单行**永久删除**。删除时：① 确认框列出实际将删文件 + 合计大小、默认按钮"取消"；② 连带删除同目录**配对 mmproj**（`pair_mmproj`）；③ 清理该模型**启动脚本绑定**（`ScriptService.remove_binding_for_model`：`.bat` 移入 `data/scripts_replaced` 备份 + 清 `scripts.json` 条目，匹配覆盖 json 原始条目（含过期条目）/孤儿 .bat/derive_name 兜底三路）；④ **模型正在运行时整体拦下**（删除 worker 内查 `ProcessService.is_running`，避免 Windows 锁文件与"服务在跑但脚本已没"的错位）；⑤ 删除后主窗口按 `local_models_changed` 信号清理已失效的当前选择（显式清空路径框 + 重刷下拉）。新增 `service/model_file_service.py`、`ui/workers/local_model_workers.py`、`model_scanner.list_local_models`；顺带补 #42 第二种触发路径（清空选择后下拉插「（未选择模型）」占位项）；测试新增 25 例（174→199 全绿） |
+| v1.19.6 | 2026-09-24 | 修复**重启后模型下拉停在第一项、与下方路径不一致**（traps #42）：`_reload_model_combo` 用 `findData` 精确匹配，而下拉项来自 `scan_gguf_files` 的 `os.path.join`（Windows 反斜线，实际是 `C:/modelscope\MiniCPM5-2B-F16.gguf` 这种混用形式）、配置里存的是正斜线 → 匹配必失败 → 跳过 `setCurrentIndex` → 停在索引 0；新增纯函数 `combo_index_for`（两侧 `normalize_path` + 大小写不敏感），下拉 userData 统一存规范化路径；兜底：当前模型不在模型目录（被删/移走）时插入"（不在模型目录）<文件名>"并选中，保证下拉与路径/表单永不打架；实测真实数据 旧 `-1` → 新 `2`；测试新增 4 例（170→174 全绿） |
+| v1.19.5 | 2026-09-24 | 修复**进程秒退时日志丢掉最后几行（恰恰是报错行）**（traps #40）：`ui/workers/log_worker.py` 主循环每轮只读一行、读完即查存活并 break，llama-server 加载失败在 0.3~1s 内退出、缓冲区内未读的错误行全丢，界面只剩"CORS 警告 → 进程已结束"的假日志（用户运行 Ternary-Bonsai 时被此坑住）；新增 `_drain_remaining()`——进程已退出后继续读到 EOF（上限 `LOG_DRAIN_MAX_LINES=500`），且**进程存活时不读**（避免阻塞读卡住线程）；实测同一 .bat 由"只到 CORS 警告"变为完整 19 行（含 `invalid ggml type 142` + `exiting due to model loading error`）；新增 `tests/test_log_worker_drain.py` 3 例（桩进程服务）；167→170 全绿 |
 | v1.19.4 | 2026-09-24 | 修复下载队列"进度"列数字乱码（traps #2 **复发**，用户描述"百分比数字好像是用中文写的"）：`ui/model_tab.py` 的 QProgressBar 一直没关条内建文本，`%p%` 在本环境渲染成乱码字形；新增模块级 `_make_progress_cell`（条 `setTextVisible(False)` + 右侧 QLabel 显示阿拉伯数字 `NN%`，列宽 160px 容纳）与 `_set_progress_cell`，`_add_queue_row`/`_update_queue_row` 改走这对函数；新增 offscreen 回归测试 `tests/test_download_progress_cell.py` 5 例（条内文本关闭 / 文本仅 ASCII 数字 / 数值同步 / 容错 None）；162→167 全绿 |
 | v1.19.3 | 2026-09-24 | 启动脚本区去掉模型"浏览..."按钮（模型只从"路径配置"里模型目录的递归扫描下拉中选）：模型来源已由 `Settings.model_dir` 规定，浏览任意路径属重复入口，还让"选模型即生成脚本"的主流程多一条旁路；删除 `_select_model_file`（其设置 model_path/save/自动绑视觉/`_on_model_changed` 的链路已被 `_on_model_combo_selected` 完全覆盖）+ 相应按钮；保留"外挂视觉模型 选择..."（`find_mmproj` 只在模型同目录找 mmproj，异目录时是唯一兜底）与路径配置里的 llama-server.exe 选择；162 全绿 |
 | v1.19.2 | 2026-09-24 | 脚本区按钮合并：**「一键生成」+「删除该模型脚本」→「重置参数」**。根因：懒人流（选模型即自动生成参数）下两个按钮都只服务"回到默认状态"——一键生成只剩重置作用、删除脚本是它的前置清理，实际是同一诉求的两半（且"请先一键生成或填写脚本内容"等提示已成过时文案）。新按钮一次性完成：清掉该模型已保存的脚本参数 → 按 `auto_generate_config` 重新生成一版默认脚本并落盘（带确认框，不影响模型文件）；`ScriptService.reset_script(model_path, content)` 复用**现有绑定名**重建（无绑定才用 `derive_name`）——改名会让运行中清单/`pids.json` 记录错位；布局：`保存｜重置参数` 同行 + `查看生成的脚本`，模型路径行只留"浏览..."；清除死代码 `ScriptService.delete_script` / `_remove_config_entry`（合并后无调用方）；测试新增 3 例（162 全绿） |
@@ -57,6 +60,34 @@
 | v1.0.0 | 2026-09-02 | 首次克隆并配置运行环境，GUI 启动验证通过                                                                                                                                   |
 
 ## 当前任务
+
+- [x] v1.20.0 新增「本地模型」文件管理（2026-09-24）：
+  - 起因：用户要删掉不合适的本地模型只能自己去文件夹手删；手删还会留下指向已删文件的死绑定
+  - `service/model_scanner.py`：新增 `list_local_models(dir)`（path 正斜线 / name / size / mtime / is_mmproj，按名排序，单文件 stat 失败不影响其余）
+  - `service/model_file_service.py`（新）：`pair_mmproj(path, models)`（在已扫描结果里配同目录 mmproj）+ `delete_model_files(paths)`（逐项容错、幂等、被占用时点明"可能正在运行"）
+  - `service/script_service.py`：新增 `remove_binding_for_model(model_path, names)`（`.bat` → `data/scripts_replaced` 备份 + 清 json 条目；匹配三路来源：json 原始条目含过期条目 / `load_scripts()` 含孤儿 .bat / `derive_name` 兜底）
+  - `ui/workers/local_model_workers.py`（新）：`LocalModelScanWorker`（扫描）+ `LocalModelDeleteWorker`（**先查 `is_running` 拦下运行中的模型**——该调用内部跑 tasklist 必须留在 worker；再删文件、逐个清绑定）
+  - `ui/model_tab.py`：搜索栏右侧"本地模型"入口 → 栈索引 3 视图（复选框列 30px / 文件名 / 大小 / 修改时间 / 操作，底部合计 + 删除选中项 + 刷新）；`_confirm_local_delete` 独立方法（对齐 update_tab 的确认框模式，默认"取消"）；删除后整表重扫；新增信号 `local_models_changed(list)`
+  - `ui/app.py`：`_on_local_models_deleted` —— 当前模型/视觉模型正是被删文件时清空配置 + **显式** `setText("")` + `settings.save()`，然后重刷下拉（未删到当前模型时不重载表单，避免抹掉未保存微调）；顺带补"（未选择模型）"占位项（traps #42 第二种触发路径）
+  - `tests/`：新增 `test_local_model_files.py`(13) / `test_script_binding_removal.py`(6) / `test_local_model_view.py`(6)
+  - 验证：199 例全绿；offscreen 端到端冒烟（临时目录 3 文件 → 扫描 3 行/合计正确 → 删主模型连带 mmproj、无关文件保留、信号带被删路径）；桩注入验证运行中拦截（文件未动 + 提示脚本名）；桩对象复用真实 `_reload_model_combo` 验证三种下拉定位（命中 / 未选择占位 / 不在目录占位）
+
+- [x] v1.19.6 修复模型下拉与路径显示不一致（2026-09-24）：
+  - 用户报告：重启后"启动脚本"模型下拉变成第一项，下面只读路径却不变
+  - 根因（traps #42）：`_reload_model_combo` 用 `findData`（精确字符串匹配）定位当前项；下拉项来自 `scan_gguf_files` 的 `os.path.join`（Windows 反斜线，且因 root 是正斜线而呈 `C:/modelscope\X.gguf` 混用形式），配置里存的是正斜线 → 必失败 → `idx=-1` → 跳过 `setCurrentIndex` → 停在索引 0
+  - `ui/app.py`：新增纯函数 `combo_index_for(paths, target)`（两侧 `normalize_path` + `lower()`，Windows 大小写不敏感）；`_reload_model_combo` 改走它、userData 统一存规范化路径；兜底"当前模型不在模型目录"时插入"（不在模型目录）<文件名>"并选中（下拉与路径/表单永不打架）
+  - `tests/test_script_model_binding.py`：新增 `TestComboIndexFor` 4 例（反斜线扫描 vs 正斜线配置 / 大小写不敏感 / 未命中 -1 / 空目标）
+  - 真实数据实测：旧实现 `index = -1`（复现 bug）→ 新实现 `index = 2`，正确命中 `Qwen3.8-27B-UD-IQ2_XXS.gguf`
+  - 验证：174 例全绿；`py_compile` 通过
+
+- [x] v1.19.5 修复进程秒退时日志丢失错误行（2026-09-24）：
+  - 起因：用户运行 `Ternary-Bonsai-2-27B-PQ2_0.gguf` 失败，界面日志只有 CORS 警告 + "进程已结束"，无任何报错
+  - 根因（traps #40）：`ui/workers/log_worker.py` 主循环每轮只读一行、读完即查存活并 `break`；llama-server 加载失败在 0.3~1s 内退出，缓冲区未读的错误行全丢
+  - `ui/workers/log_worker.py`：新增模块常量 `LOG_DRAIN_MAX_LINES = 500` 与 `_drain_remaining()`（进程已退出才读，读到 EOF 为止），在 emit "进程已结束" 之前调用
+  - `tests/test_log_worker_drain.py`（新）：3 例桩测试——残余行不丢且顺序为 `…错误行 → 进程已结束`、进程存活时一次都不读
+  - 实测：同一 .bat 现在完整输出 19 行，结尾为 `invalid ggml type 142 … / exiting due to model loading error`
+  - 顺带排查结论（traps #41）：该模型是 PrismML 三值量化（PQ2_0，张量类型 142 超出 mainline 类型表 0~42），本机 b11139/b11149 均拒载；须用厂商 fork `PrismML-Eng/llama.cpp` 的二进制（模型卡明确 "stock llama.cpp will not run these files"）
+  - 验证：170 例全绿；`py_compile` 通过
 
 - [x] v1.19.4 下载队列"进度"列数字乱码修复（2026-09-24）：
   - 根因：traps #2 复发——`ui/model_tab.py` 队列进度条的条内建文本（`%p%`）在本环境渲染为乱码字形，看着像中文；用户报"百分比的数字好像是用中文写的"
