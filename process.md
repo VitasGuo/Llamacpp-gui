@@ -4,12 +4,14 @@
 
 - **目标**：在本地 Windows 环境运行 LlamaCPP GUI（PyQt6 桌面客户端），用于管理本地 llama.cpp 推理服务器。
 
-- **当前版本**：v1.20.0（2026-09-24，新增本地模型文件管理：查看 + 删除 + 连带清理）
+- **当前版本**：v1.20.2（2026-09-24，本地模型管理入口 toggle 化：进入后同按钮位变"← 返回"）
 
 ## 版本历史
 
 | 版本     | 日期         | 说明                                                                                                                                                       |
 | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| v1.20.2 | 2026-09-24 | 「本地模型管理」入口按钮 toggle 化：用户反馈"进入视图后还要去左边点返回按钮太折腾"，改为**同一按钮位在视图 3 时变成"← 返回"**——`stack.currentChanged` 信号统一切文字 + tooltip，再点切回追踪视图（索引 0）；删除本地模型视图顶部的"← 返回"按钮（功能被搜索栏按钮收编，UI 更简洁）；`_show_local_models` 改为 toggle 行为（已在视图 3 时点击 → 返回 0；否则进入 3）；新增 `tests/test_local_models_toggle.py` 4 例（199→203 全绿） |
+| v1.20.1 | 2026-09-24 | 「本地模型」按钮文字改为「**本地模型管理**」（更贴合实际功能：含查看 + 删除 + 连带清理绑定） |
 | v1.20.0 | 2026-09-24 | **新增「本地模型」文件管理**（traps #43）：模型搜索与下载标签页搜索栏右侧新增入口，进栈索引 3 的视图列出模型目录下全部 `.gguf`（文件名/大小/修改时间/视觉投影标记，按名排序），支持勾选批量或单行**永久删除**。删除时：① 确认框列出实际将删文件 + 合计大小、默认按钮"取消"；② 连带删除同目录**配对 mmproj**（`pair_mmproj`）；③ 清理该模型**启动脚本绑定**（`ScriptService.remove_binding_for_model`：`.bat` 移入 `data/scripts_replaced` 备份 + 清 `scripts.json` 条目，匹配覆盖 json 原始条目（含过期条目）/孤儿 .bat/derive_name 兜底三路）；④ **模型正在运行时整体拦下**（删除 worker 内查 `ProcessService.is_running`，避免 Windows 锁文件与"服务在跑但脚本已没"的错位）；⑤ 删除后主窗口按 `local_models_changed` 信号清理已失效的当前选择（显式清空路径框 + 重刷下拉）。新增 `service/model_file_service.py`、`ui/workers/local_model_workers.py`、`model_scanner.list_local_models`；顺带补 #42 第二种触发路径（清空选择后下拉插「（未选择模型）」占位项）；测试新增 25 例（174→199 全绿） |
 | v1.19.6 | 2026-09-24 | 修复**重启后模型下拉停在第一项、与下方路径不一致**（traps #42）：`_reload_model_combo` 用 `findData` 精确匹配，而下拉项来自 `scan_gguf_files` 的 `os.path.join`（Windows 反斜线，实际是 `C:/modelscope\MiniCPM5-2B-F16.gguf` 这种混用形式）、配置里存的是正斜线 → 匹配必失败 → 跳过 `setCurrentIndex` → 停在索引 0；新增纯函数 `combo_index_for`（两侧 `normalize_path` + 大小写不敏感），下拉 userData 统一存规范化路径；兜底：当前模型不在模型目录（被删/移走）时插入"（不在模型目录）<文件名>"并选中，保证下拉与路径/表单永不打架；实测真实数据 旧 `-1` → 新 `2`；测试新增 4 例（170→174 全绿） |
 | v1.19.5 | 2026-09-24 | 修复**进程秒退时日志丢掉最后几行（恰恰是报错行）**（traps #40）：`ui/workers/log_worker.py` 主循环每轮只读一行、读完即查存活并 break，llama-server 加载失败在 0.3~1s 内退出、缓冲区内未读的错误行全丢，界面只剩"CORS 警告 → 进程已结束"的假日志（用户运行 Ternary-Bonsai 时被此坑住）；新增 `_drain_remaining()`——进程已退出后继续读到 EOF（上限 `LOG_DRAIN_MAX_LINES=500`），且**进程存活时不读**（避免阻塞读卡住线程）；实测同一 .bat 由"只到 CORS 警告"变为完整 19 行（含 `invalid ggml type 142` + `exiting due to model loading error`）；新增 `tests/test_log_worker_drain.py` 3 例（桩进程服务）；167→170 全绿 |

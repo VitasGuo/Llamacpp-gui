@@ -142,6 +142,9 @@ class ModelTab(QWidget):
             lambda mid: self._show_file_list(
                 mid, source=model_sources.SOURCE_MODELSCOPE, back_index=0)
         )
+        # 搜索栏"本地模型管理"按钮文字随视图切换（toggle 进入/返回）
+        self.stack.currentChanged.connect(self._update_local_btn_text)
+        self._update_local_btn_text(self.stack.currentIndex())
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -538,9 +541,6 @@ class ModelTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         top_bar = QHBoxLayout()
-        back_btn = QPushButton("\u2190 返回")
-        back_btn.clicked.connect(lambda: self.stack.setCurrentIndex(0))
-        top_bar.addWidget(back_btn)
         self.local_dir_label = QLabel("")
         self.local_dir_label.setStyleSheet("font-weight: bold;")
         top_bar.addWidget(self.local_dir_label)
@@ -582,11 +582,26 @@ class ModelTab(QWidget):
         return page
 
     def _show_local_models(self):
-        """进入"本地模型"视图并后台扫描模型目录（os.walk 大库较慢，不进 GUI 线程）。"""
-        self.local_dir_label.setText(
-            f"模型目录：{self.settings.model_dir or '（未配置）'}")
-        self.stack.setCurrentIndex(3)
-        self._load_local_models()
+        """搜索栏按钮点击：在本地模型视图与默认视图之间切换。
+        同一按钮位置实现"进入/返回"，避免视线焦点移动。"""
+        if self.stack.currentIndex() == 3:
+            self.stack.setCurrentIndex(0)  # 返回到追踪视图
+        else:
+            self.local_dir_label.setText(
+                f"模型目录：{self.settings.model_dir or '（未配置）'}")
+            self.stack.setCurrentIndex(3)
+            self._load_local_models()
+
+    def _update_local_btn_text(self, idx):
+        """stack.currentChanged 回调：同步搜索栏按钮文字。
+        视图 3（本地模型）显示「← 返回」；其余视图显示「本地模型管理」。"""
+        if idx == 3:
+            self.local_models_btn.setText("\u2190 返回")
+            self.local_models_btn.setToolTip("返回追踪视图")
+        else:
+            self.local_models_btn.setText("本地模型管理")
+            self.local_models_btn.setToolTip(
+                "查看并删除模型目录里的本地 .gguf 文件（含视觉投影）")
 
     def _load_local_models(self):
         self.local_refresh_btn.setEnabled(False)
