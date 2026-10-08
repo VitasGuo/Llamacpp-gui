@@ -218,6 +218,10 @@ class MainWindow(QMainWindow):
             t.start()
         self.monitor_service.stop()
         super().closeEvent(event)
+        # 关键：托盘场景下窗口早已隐藏，close() 被接受后 Qt 不会发 lastWindowClosed
+        # （该信号只在"可见窗口被关闭"时触发），app.exec() 永不返回——表现为
+        # "托盘点退出没反应 / 点重启旧实例不退"。故显式退出事件循环。
+        QApplication.instance().quit()
 
     def _init_tray(self):
         """初始化系统托盘图标（系统不支持时静默跳过）。"""
