@@ -1,5 +1,7 @@
 # LlamaCPP GUI
 
+> **🌐 English:** [README.en.md](README.en.md) · [traps.en.md](traps.en.md)（踩坑记录英文版）
+
 一个基于 PyQt6 的桌面客户端，专为 [llama.cpp](https://github.com/ggml-org/llama.cpp) 打造。无需命令行即可管理本地大语言模型推理服务。
 
 仅支持 **Windows 10/11**。
